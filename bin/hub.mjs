@@ -36,6 +36,14 @@ const IDLE_TIMEOUT_MS = parseInt(process.env.HUB_DAEMON_IDLE_TIMEOUT ?? '300000'
 if (process.env.HUB_DAEMON === 'true') {
   globalThis.__HubDaemonMode = true;
 
+  // Catch uncaught errors so the daemon doesn't silently crash.
+  process.on('uncaughtException', (err) => {
+    process.stderr.write("[hub-daemon] uncaughtException: " + (err?.stack ?? err) + "\n");
+  });
+  process.on('unhandledRejection', (err) => {
+    process.stderr.write("[hub-daemon] unhandledRejection: " + (err?.stack ?? err) + "\n");
+  });
+
   const { createServer } = await import('node:http');
   const { UnifiedBrowserFactory } = await import('../src/factory.ts');
   const { createProgram } = await import('../src/opencli-engine/cli.js');
@@ -147,11 +155,20 @@ if (process.env.HUB_DAEMON === 'true') {
         }
 
         const program = createProgram(BUILTIN_CLIS, USER_CLIS);
-        // exitOverride: prevent commander from calling process.exit on --help or errors
-        // Use a custom handler that captures output instead of throwing
-        program.exitOverride({
-          output: { write: (str) => stdoutChunks.push(Buffer.from(str)) },
-          error: { write: (str) => stderrChunks.push(Buffer.from(str)) },
+        // exitOverride: re-throw CommanderError so catch block can extract exitCode.
+        // Apply to program AND all subcommands recursively (subcommands inherit settings
+        // at creation time, before exitOverride is set, so they still have null _exitCallback).
+        const exitHandler = (err) => { throw err; };
+        program.exitOverride(exitHandler);
+        const applyExitOverride = (cmd) => {
+          cmd._exitCallback = exitHandler;
+          cmd.commands?.forEach(applyExitOverride);
+        };
+        program.commands.forEach(applyExitOverride);
+        // configureOutput: redirect commander help/error text into capture buffers.
+        program.configureOutput({
+          writeOut: (str) => stdoutChunks.push(Buffer.from(str)),
+          writeErr: (str) => stderrChunks.push(Buffer.from(str)),
         });
         await program.parseAsync(['node', 'hub', ...rewritten]);
       } catch (err) {
