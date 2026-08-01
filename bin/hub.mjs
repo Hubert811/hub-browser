@@ -40,12 +40,15 @@ if (process.env.HUB_DAEMON === 'true') {
   const { UnifiedBrowserFactory } = await import('../src/factory.ts');
   const { createProgram } = await import('../src/opencli-engine/cli.js');
   const { rewriteBrowserArgv, escapeLeadingDashPositional } = await import('../src/opencli-engine/cli-argv-preprocess.js');
+  const { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdapters } = await import('../src/opencli-engine/discovery.js');
+  const { emitHook } = await import('../src/opencli-engine/hooks.js');
 
   const BUILTIN_CLIS = join(PROJECT_ROOT, 'clis');
   const USER_CLIS = join(os.homedir(), '.opencli', 'clis');
 
   let factory = null;
   let idleTimer = null;
+  let discoveryDone = false;
 
   async function getFactory() {
     if (!factory) {
@@ -54,6 +57,23 @@ if (process.env.HUB_DAEMON === 'true') {
       globalThis.__HubBrowserFactory = factory;
     }
     return factory;
+  }
+
+  // Run adapter discovery once (mirrors main.js startup sequence)
+  async function ensureDiscovery() {
+    if (discoveryDone) return;
+    discoveryDone = true;
+    try {
+      const [, ,] = await Promise.all([
+        ensureUserCliCompatShims(),
+        ensureUserAdapters(),
+        discoverClis(BUILTIN_CLIS),
+      ]);
+      await discoverClis(USER_CLIS);
+      await discoverPlugins();
+    } catch (err) {
+      process.stderr.write('[hub-daemon] discovery error: ' + (err?.message ?? String(err)) + '\n');
+    }
   }
 
   function resetIdleTimer() {
@@ -87,7 +107,6 @@ if (process.env.HUB_DAEMON === 'true') {
       }
 
       // Capture stdout/stderr so we can return output to the CLI caller.
-      // Override console methods too because bun's console.log may bypass process.stdout.write.
       const stdoutChunks = [];
       const stderrChunks = [];
       const origLog = console.log;
@@ -105,7 +124,9 @@ if (process.env.HUB_DAEMON === 'true') {
 
       let exitCode = 0;
       try {
-        await getFactory();
+        // Run adapter discovery before parsing (mirrors main.js)
+        await ensureDiscovery();
+        await emitHook('onStartup', { command: '__startup__', args: {} });
 
         // Rewrite argv: browser <session> <cmd> -> browser --session <name> <cmd>
         let rewritten = rewriteBrowserArgv(args);
@@ -118,11 +139,25 @@ if (process.env.HUB_DAEMON === 'true') {
           }
         } catch { /* manifest unavailable; skip */ }
 
+        // Create factory lazily (only needed for browser commands, not for list/init/etc)
+        // We check if this is a browser command to avoid unnecessary CDP connection
+        const isBrowserCmd = rewritten[0] === 'browser';
+        if (isBrowserCmd) {
+          await getFactory();
+        }
+
         const program = createProgram(BUILTIN_CLIS, USER_CLIS);
-        program.exitOverride();
+        // exitOverride: prevent commander from calling process.exit on --help or errors
+        // Use a custom handler that captures output instead of throwing
+        program.exitOverride({
+          output: { write: (str) => stdoutChunks.push(Buffer.from(str)) },
+          error: { write: (str) => stderrChunks.push(Buffer.from(str)) },
+        });
         await program.parseAsync(['node', 'hub', ...rewritten]);
       } catch (err) {
+        // CommanderError from --help has exitCode 0; real errors have exitCode 1+
         exitCode = err.exitCode ?? (err.code ?? 1);
+        // Don't add commander help output to stderr (it was already captured via output.write)
         if (err.message && !err.code?.startsWith?.('commander.')) {
           stderrChunks.push(Buffer.from(err.message + '\n'));
         }

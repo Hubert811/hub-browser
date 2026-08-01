@@ -85,11 +85,18 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
         deviceScaleFactor: 1,
       });
     }
-    const result = await this.cdp('Page.captureScreenshot', {
-      format: options.format ?? 'jpeg',
-      quality: options.quality ?? 80,
-      captureBeyondViewport: options.fullPage ?? false,
-    }) as { data: string };
+    // P1 fix: Page.captureScreenshot can hang in some CDP backends. Add 10s timeout.
+    const SCREENSHOT_TIMEOUT_MS = 10_000;
+    const result = await Promise.race([
+      this.cdp('Page.captureScreenshot', {
+        format: options.format ?? 'jpeg',
+        quality: options.quality ?? 80,
+        captureBeyondViewport: options.fullPage ?? false,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Screenshot timed out after ' + SCREENSHOT_TIMEOUT_MS + 'ms')), SCREENSHOT_TIMEOUT_MS)
+      ),
+    ]) as { data: string };
     if (overrideWidth !== undefined || overrideHeight !== undefined) {
       await this.cdp('Emulation.clearDeviceMetricsOverride', {});
     }
