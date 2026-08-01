@@ -1,0 +1,3 @@
+[submodule "vendor/browseros"]
+	path = vendor/browseros
+	url = https://github.com/browseros-ai/BrowserOS.git

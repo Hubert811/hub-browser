@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "declaration": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "paths": {
+      "@browseros/browser-core": [
+        "./vendor/browseros/packages/browseros-agent/packages/browser-core/src"
+      ],
+      "@browseros/cdp-protocol": [
+        "./vendor/browseros/packages/browseros-agent/packages/cdp-protocol/src"
+      ],
+      "@browseros/shared": [
+        "./vendor/browseros/packages/browseros-agent/packages/shared/src"
+      ]
+    },
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "vendor"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "@hub/browser",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "hub": "bin/hub.cjs"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./page": "./src/page.ts",
+    "./factory": "./src/factory.ts"
+  },
+  "workspaces": [
+    "vendor/browseros/packages/browseros-agent/packages/*"
+  ],
+  "dependencies": {
+    "@browseros/browser-core": "workspace:*",
+    "@browseros/cdp-protocol": "workspace:*",
+    "@browseros/shared": "workspace:*",
+    "@jackwener/opencli": "latest",
+    "ws": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^7.0.0"
+  }
+}
