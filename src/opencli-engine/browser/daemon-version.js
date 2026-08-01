@@ -1,12 +1,4 @@
-export function isDaemonStale(status, cliVersion) {
-    if (!status || !cliVersion)
-        return false;
-    return !status.daemonVersion || status.daemonVersion !== cliVersion;
-}
-export function formatDaemonVersion(status) {
-    return status?.daemonVersion ? `v${status.daemonVersion}` : 'version unknown';
-}
-export function staleDaemonIssue(status, cliVersion) {
-    return `Stale daemon detected: daemon ${formatDaemonVersion(status)} != CLI v${cliVersion}.\n` +
-        '  Run: opencli daemon restart';
-}
+// hub-browser stub: daemon version check removed
+export function isDaemonStale(status, cliVersion) { return false; }
+export function formatDaemonVersion(status) { return 'stub'; }
+export function staleDaemonIssue(status, cliVersion) { return null; }
