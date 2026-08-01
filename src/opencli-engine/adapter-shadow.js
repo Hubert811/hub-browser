@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { findPackageRoot, getCliManifestPath } from './package-paths.js';
 function defaultBuiltinClisDir() {
-    return path.join(findPackageRoot(fileURLToPath(import.meta.url)), 'clis');
+    return path.join(process.cwd(), 'clis');
 }
 function safeReaddir(dir) {
     try {

@@ -91,112 +91,16 @@ function buildUpdateNotices({ cliVersion, cache, now }) {
  * Skipped during --get-completions to avoid polluting shell completion output.
  */
 export function registerUpdateNoticeOnExit() {
-    if (isCI())
-        return;
-    if (process.argv.includes('--get-completions'))
-        return;
-    process.on('exit', (code) => {
-        if (code !== 0)
-            return; // Don't show update notice on error exit
-        const { cli, extension } = buildUpdateNotices({
-            cliVersion: PKG_VERSION,
-            cache: _cache,
-            now: Date.now(),
-        });
-        if (!cli && !extension)
-            return;
-        try {
-            process.stderr.write(`${cli ?? ''}${extension ?? ''}\n`);
-        }
-        catch {
-            // Ignore broken pipe (stderr closed before process exits)
-        }
-    });
+    // hub-browser: update check disabled (vendored, no npm package to check)
+    return;
 }
-function extractLatestExtensionVersionFromReleases(releases) {
-    for (const release of releases) {
-        for (const asset of release.assets ?? []) {
-            const assetMatch = asset.name.match(/^opencli-extension-v(.+)\.zip$/);
-            if (assetMatch)
-                return assetMatch[1];
-        }
-        const tagMatch = release.tag_name.match(/^ext-v(.+)$/);
-        if (tagMatch)
-            return tagMatch[1];
-    }
-    return undefined;
-}
-/** Fetch the latest extension version from GitHub Releases. */
-async function fetchLatestExtensionVersion() {
-    try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 3000);
-        const res = await fetch(GITHUB_RELEASES_URL, {
-            signal: controller.signal,
-            headers: { 'User-Agent': `opencli/${PKG_VERSION}`, Accept: 'application/vnd.github+json' },
-        });
-        clearTimeout(timer);
-        if (!res.ok)
-            return undefined;
-        const releases = await res.json();
-        return extractLatestExtensionVersionFromReleases(releases);
-    }
-    catch {
-        return undefined;
-    }
-}
+
+
 /**
  * Kick off a background fetch to npm registry. Writes to cache for next run.
  * Fully non-blocking — never awaited.
  */
 export function checkForUpdateBackground() {
-    if (isCI())
-        return;
-    if (_cache?.lastCheck && Date.now() - _cache.lastCheck < CHECK_INTERVAL_MS)
-        return;
-    void (async () => {
-        try {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 3000);
-            const res = await fetch(NPM_REGISTRY_URL, {
-                signal: controller.signal,
-                headers: { 'User-Agent': `opencli/${PKG_VERSION}` },
-            });
-            clearTimeout(timer);
-            if (!res.ok)
-                return;
-            const data = await res.json();
-            if (typeof data.version === 'string') {
-                const extVersion = await fetchLatestExtensionVersion();
-                const updates = { lastCheck: Date.now(), latestVersion: data.version };
-                if (extVersion)
-                    updates.latestExtensionVersion = extVersion;
-                writeCacheMerge(updates);
-            }
-        }
-        catch {
-            // Network error: silently skip, try again next run
-        }
-    })();
+    // hub-browser: update check disabled (vendored, no npm package to check)
+    return;
 }
-/**
- * Stash the current extension version into the shared cache. Called by the
- * daemon on each hello handshake. Lets the next CLI process compare against
- * the latest known release and print an exit notice without any extra I/O.
- */
-export function recordExtensionVersion(version) {
-    if (typeof version !== 'string' || !version.trim())
-        return;
-    writeCacheMerge({
-        currentExtensionVersion: version.trim(),
-        extensionLastSeenAt: Date.now(),
-    });
-}
-/**
- * Get the cached latest extension version (if available).
- * Used by `opencli doctor` to report extension updates.
- */
-export function getCachedLatestExtensionVersion() {
-    return _cache?.latestExtensionVersion;
-}
-export { extractLatestExtensionVersionFromReleases as _extractLatestExtensionVersionFromReleases, buildUpdateNotices as _buildUpdateNotices, EXTENSION_STALE_MS as _EXTENSION_STALE_MS, };
