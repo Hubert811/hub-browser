@@ -14,6 +14,7 @@
     "vendor/browseros/packages/browseros-agent/packages/*"
   ],
   "scripts": {
+    "postinstall": "node scripts/apply-patches.mjs",
     "build": "tsc --outDir dist --declaration false",
     "typecheck": "tsc --noEmit",
     "test": "BROWSEROS_CDP_PORT=9110 bun run tests/test-phase2a.ts"
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "patch-package": "^8.0.1",
     "typescript": "^7.0.0"
   }
 }

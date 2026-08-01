@@ -1,0 +1,16 @@
+diff --git a/node_modules/@jackwener/opencli/dist/src/runtime.js b/node_modules/@jackwener/opencli/dist/src/runtime.js
+index 1234567..abcdefg 100644
+--- a/node_modules/@jackwener/opencli/dist/src/runtime.js
++++ b/node_modules/@jackwener/opencli/dist/src/runtime.js
+@@ -10,6 +10,10 @@ export function getBrowserFactory(site) {
+  * Uses CDPBridge for registered Electron apps, otherwise BrowserBridge.
+  */
+ export function getBrowserFactory(site) {
++    // hub-browser patch: use UnifiedBrowserFactory when OPENCLI_BROWSER=claw
++    if (process.env.OPENCLI_BROWSER === 'claw') {
++        return globalThis.__HubBrowserFactory ?? BrowserBridge;
++    }
+     if (site && isElectronApp(site))
+         return CDPBridge;
+     return BrowserBridge;
+ }
