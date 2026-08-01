@@ -298,8 +298,10 @@ private async ensureRuntimeEnabled(): Promise<void> {
       }
     }
   );
-  // 必须先订阅再 enable（以 2b.4.1 修正为准）
-  await session.Runtime.enable();
+ // 必须先订阅再 enable（以 2b.4.1 修正为准）
+ // P0 fix: disable first to force CDP to resend all existing contexts
+ await session.Runtime.disable().catch(() => {});
+ await session.Runtime.enable();
 }
 
 // selectTab 时清理（以 2b.4.1 为准：用 UnifiedPage 私有方法，不改 base-page.ts）
@@ -630,9 +632,11 @@ private async ensureRuntimeEnabled(): Promise<void> {
       }
     }
   );
-  // 必须先订阅再 enable，否则 executionContextCreated 事件可能在订阅前发出并被丢弃
-  // BrowserOS 的 ensureSession() 已调用 Runtime.enable()，重复调用是幂等的（会重发事件）
-  await session.Runtime.enable();
+ // 必须先订阅再 enable，否则 executionContextCreated 事件可能在订阅前发出并被丢弃
+ // P0 fix: 如果 Runtime 已被其他调用方 enable，单独 enable 不会重发 context
+ // 必须 disable 再 enable 强制 CDP 重发所有已有 execution context
+ await session.Runtime.disable().catch(() => {});
+ await session.Runtime.enable();
 }
 
 async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
