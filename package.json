@@ -14,7 +14,6 @@
     "vendor/browseros/packages/browseros-agent/packages/*"
   ],
   "scripts": {
-    "postinstall": "node scripts/apply-patches.mjs",
     "build": "tsc --outDir dist --declaration false",
     "typecheck": "tsc --noEmit",
     "test": "BROWSEROS_CDP_PORT=9110 bun run tests/test-phase2a.ts"
@@ -23,12 +22,17 @@
     "@browseros/browser-core": "workspace:*",
     "@browseros/cdp-protocol": "workspace:*",
     "@browseros/shared": "workspace:*",
-    "@jackwener/opencli": "latest",
+    "@mozilla/readability": "^0.6.0",
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.3",
+    "js-yaml": "^4.1.0",
+    "turndown": "^7.2.2",
+    "turndown-plugin-gfm": "^1.0.2",
+    "undici": "^6.27.0",
     "ws": "^8.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "patch-package": "^8.0.1",
     "typescript": "^7.0.0"
   }
 }

@@ -1,0 +1,22 @@
+{
+  "name": "@jackwener/opencli",
+  "version": "1.8.6",
+  "type": "module",
+  "exports": {
+    ".": "./main.js",
+    "./registry": "./registry-api.js",
+    "./errors": "./errors.js",
+    "./types": "./types.js",
+    "./utils": "./utils.js",
+    "./logger": "./logger.js",
+    "./launcher": "./launcher.js",
+    "./browser/cdp": "./browser/index.js",
+    "./browser/page": "./browser/index.js",
+    "./browser/utils": "./browser/utils.js",
+    "./download": "./download/index.js",
+    "./download/article-download": "./download/article-download.js",
+    "./download/media-download": "./download/media-download.js",
+    "./download/progress": "./download/progress.js",
+    "./pipeline": "./pipeline/index.js"
+  }
+}
