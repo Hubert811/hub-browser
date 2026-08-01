@@ -18,8 +18,6 @@ import { executePipeline } from './pipeline/index.js';
 import { adapterLoadError, ArgumentError, CommandExecutionError, attachTraceReceipt, getErrorMessage } from './errors.js';
 import { shouldUseBrowserSession } from './capabilityRouting.js';
 import { getBrowserFactory, browserSession, runWithTimeout, DEFAULT_BROWSER_COMMAND_TIMEOUT } from './runtime.js';
-import { profileRouteParams, resolveProfileSelection } from './browser/profile.js';
-import { setDaemonCommandTimeoutSeconds } from './browser/daemon-client.js';
 import { emitHook } from './hooks.js';
 import { log } from './logger.js';
 import { isElectronApp } from './electron-apps.js';
@@ -183,11 +181,6 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
         throw new ArgumentError(getErrorMessage(err));
     }
     const userTimeoutSec = readUserTimeoutSeconds(cmd, kwargs);
-    // Propagate --timeout to the daemon transport so its per-command deadline
-    // (and the derived extension/HTTP deadlines) honor the user's value instead
-    // of the default. Set unconditionally so a previous command's value never
-    // leaks into this one.
-    setDaemonCommandTimeoutSeconds(userTimeoutSec);
     const traceMode = normalizeTraceMode(opts.trace);
     const hookCtx = {
         command: fullName(cmd),
@@ -217,8 +210,8 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
             const BrowserFactory = getBrowserFactory(cmd.site);
             // Requirement vs preference: --profile / OPENCLI_PROFILE route strictly;
             // the config default is a soft preference the daemon arbitrates.
-            const profileSelection = resolveProfileSelection(opts.profile);
-            const profileRouting = profileRouteParams(profileSelection);
+            const profileSelection = null;
+            const profileRouting = {};
             const contextId = profileSelection?.contextId;
             const internal = cmd;
             const siteSession = resolveSiteSession(cmd, opts.siteSession);

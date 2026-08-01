@@ -32,14 +32,13 @@ import { buildHtmlTreeJs } from './browser/html-tree.js';
 import { buildExtractHtmlJs, runExtractFromHtml } from './browser/extract.js';
 import { analyzeSite } from './browser/analyze.js';
 import { registerAuthCommands } from './commands/auth.js';
-import { daemonRestart, daemonStatus, daemonStop } from './commands/daemon.js';
 import { log } from './logger.js';
-import { bindTab, BrowserCommandError, sendCommand } from './browser/daemon-client.js';
-import { fetchDaemonStatus } from './browser/daemon-transport.js';
-import { aliasForContextId, loadProfileConfig, profileRouteParams, renameProfile, resolveProfileSelection, setDefaultProfile } from './browser/profile.js';
-import { formatDaemonVersion, isDaemonStale } from './browser/daemon-version.js';
 import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from './browser/config.js';
 const CLI_FILE = fileURLToPath(import.meta.url);
+/** Error class for browser command failures (inlined from removed daemon-client.js). */
+class BrowserCommandError extends Error {
+    constructor(message) { super(message); this.name = 'BrowserCommandError'; }
+}
 const BROWSER_TAB_OPTION_DESCRIPTION = 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"';
 const FOLLOW_POLL_MS = 1_000;
 function parseDurationMs(raw, flagName) {
@@ -437,7 +436,6 @@ async function getBrowserPage(session, targetPage, profileSelection, opts = {}) 
         timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT,
         session,
         surface: 'browser',
-        ...profileRouteParams(profileSelection),
         ...(idleTimeout && idleTimeout > 0 && { idleTimeout }),
         windowMode: opts.windowMode ?? getBrowserWindowMode(undefined, 'foreground'),
     });
@@ -498,7 +496,8 @@ function getBrowserSession(command) {
 }
 function getBrowserProfileSelection(command) {
     const raw = getCommandOption(command, 'profile');
-    return resolveProfileSelection(typeof raw === 'string' && raw.trim() ? raw.trim() : undefined);
+    // Profile selection removed in hub-browser (no daemon/BrowserBridge contexts).
+    return null;
 }
 function getPageSession(page) {
     const session = page.session;
@@ -939,9 +938,9 @@ Examples:
             const contextId = profileSelection?.contextId;
             try {
                 const { BrowserBridge } = await import('./browser/index.js');
-                const bridge = new BrowserBridge();
-                await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser', ...profileRouteParams(profileSelection) });
-                await fn({ session, contextId });
+            const bridge = new BrowserBridge();
+            await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser' });
+            await fn({ session, contextId });
             }
             catch (err) {
                 if (err instanceof BrowserCommandError) {
@@ -958,16 +957,12 @@ Examples:
     browser.command('bind')
         .description('Bind the current Chrome tab/window to the browser session named by <session>')
         .action(browserSessionCommandAction(async ({ session, contextId }) => {
-        const data = await bindTab(session, { ...(contextId && { contextId }) });
-        saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
-        console.log(JSON.stringify({ session, ...((data && typeof data === 'object') ? data : { data }) }, null, 2));
+        throw new Error('browser bind not available in hub-browser (use opencli adapters instead)');
     }));
     browser.command('unbind')
         .description('Detach the bound browser session named by <session> without closing the user tab/window')
         .action(browserSessionCommandAction(async ({ session, contextId }) => {
-        await sendCommand('close-window', { session, surface: 'browser', ...(contextId && { contextId }) });
-        saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
-        console.log(JSON.stringify({ unbound: true, session }, null, 2));
+        throw new Error('browser unbind not available in hub-browser (use opencli adapters instead)');
     }));
     const browserTab = browser
         .command('tab')
@@ -2727,17 +2722,7 @@ cli({
         await page.closeWindow?.();
         console.log('Browser session tab lease released');
     }));
-    // ── Built-in: doctor / completion ──────────────────────────────────────────
-    program
-        .command('doctor')
-        .description('Diagnose opencli browser bridge connectivity')
-        .option('-v, --verbose', 'Debug output')
-        .action(async (opts) => {
-        applyVerbose(opts);
-        const { runBrowserDoctor, renderBrowserDoctorReport } = await import('./doctor.js');
-        const report = await runBrowserDoctor({ cliVersion: PKG_VERSION });
-        console.log(renderBrowserDoctorReport(report));
-    });
+    // ── Built-in: completion ──────────────────────────────────────────
     program
         .command('completion')
         .description('Output shell completion script')
@@ -3043,101 +3028,6 @@ cli({
             ? `✅ Reset "${site}". Now using official baseline.`
             : `✅ Removed custom site "${site}".`);
     });
-    // ── Built-in: browser profile selection ──────────────────────────────────
-    const profileCmd = program.command('profile').description('Manage Browser Bridge Chrome profiles');
-    // Snapshot before applyRootSubcommandSummaries() rewrites .description() to a child-name listing.
-    const originalProfileDescription = profileCmd.description();
-    profileCmd
-        .command('list')
-        .description('List Chrome profiles connected through the Browser Bridge extension')
-        .action(async () => {
-        const status = await fetchDaemonStatus();
-        const config = loadProfileConfig();
-        const profiles = status?.profiles ?? [];
-        if (!status) {
-            console.log('Daemon is not running. Run opencli doctor after opening Chrome.');
-            return;
-        }
-        if (isDaemonStale(status, PKG_VERSION) || !Array.isArray(status.profiles)) {
-            console.log(`Daemon ${formatDaemonVersion(status)} is stale for CLI v${PKG_VERSION}.`);
-            console.log('Run: opencli daemon restart');
-            return;
-        }
-        if (profiles.length === 0) {
-            console.log('No Browser Bridge profiles connected.');
-            console.log('Open a Chrome profile with the OpenCLI extension installed, then run opencli profile list again.');
-            return;
-        }
-        const knownContextIds = new Set(profiles.map((profile) => profile.contextId));
-        console.log('Connected Browser Bridge profiles');
-        console.log();
-        for (const profile of profiles) {
-            const alias = aliasForContextId(config, profile.contextId);
-            const defaultMark = config.defaultContextId === profile.contextId ? ' default' : '';
-            const aliasText = alias ? ` ${alias}` : '';
-            const version = profile.extensionVersion ? ` v${profile.extensionVersion}` : ' version unknown';
-            console.log(`  ${profile.contextId}${aliasText}${defaultMark} — connected${version}`);
-        }
-        const disconnectedAliases = Object.entries(config.aliases)
-            .filter(([, contextId]) => !knownContextIds.has(contextId));
-        if (disconnectedAliases.length > 0 || (config.defaultContextId && !knownContextIds.has(config.defaultContextId))) {
-            console.log();
-            console.log('Disconnected saved profiles:');
-            const shown = new Set();
-            for (const [alias, contextId] of disconnectedAliases) {
-                shown.add(contextId);
-                console.log(`  ${contextId} ${alias} — not connected`);
-            }
-            if (config.defaultContextId && !shown.has(config.defaultContextId) && !knownContextIds.has(config.defaultContextId)) {
-                console.log(`  ${config.defaultContextId} — default, not connected`);
-            }
-        }
-    });
-    profileCmd
-        .command('rename')
-        .description('Assign a local alias to a connected Browser Bridge profile')
-        .argument('<contextId>', 'Profile contextId from opencli profile list')
-        .argument('<alias>', 'Local alias, e.g. work or personal')
-        .action((contextId, alias) => {
-        try {
-            renameProfile(contextId, alias);
-            console.log(`Profile ${contextId} is now aliased as ${alias}.`);
-        }
-        catch (err) {
-            console.error(`Error: ${getErrorMessage(err)}`);
-            process.exitCode = EXIT_CODES.USAGE_ERROR;
-        }
-    });
-    profileCmd
-        .command('use')
-        .description('Set the default Browser Bridge profile for future commands')
-        .argument('<profile>', 'Profile alias or contextId')
-        .action((profile) => {
-        try {
-            const config = setDefaultProfile(profile);
-            console.log(`Default Browser Bridge profile: ${config.defaultContextId ?? profile}`);
-        }
-        catch (err) {
-            console.error(`Error: ${getErrorMessage(err)}`);
-            process.exitCode = EXIT_CODES.USAGE_ERROR;
-        }
-    });
-    // ── Built-in: daemon ──────────────────────────────────────────────────────
-    const daemonCmd = program.command('daemon').description('Manage the opencli daemon');
-    // Snapshot before applyRootSubcommandSummaries() rewrites .description() to a child-name listing.
-    const originalDaemonDescription = daemonCmd.description();
-    daemonCmd
-        .command('status')
-        .description('Show daemon status')
-        .action(async () => { await daemonStatus(); });
-    daemonCmd
-        .command('stop')
-        .description('Stop the daemon')
-        .action(async () => { await daemonStop(); });
-    daemonCmd
-        .command('restart')
-        .description('Restart the daemon')
-        .action(async () => { await daemonRestart(); });
     // ── External CLIs ─────────────────────────────────────────────────────────
     const externalClis = loadExternalClis();
     const externalCmd = program
@@ -3257,10 +3147,8 @@ cli({
     const adapterNameSet = new Set([...externalNames, ...siteNames]);
     installCommanderNamespaceStructuredHelp(browser, { globalCommand: program, description: originalBrowserDescription });
     installCommanderNamespaceStructuredHelp(authCmd, { globalCommand: program, description: 'Inspect website login status' });
-    installCommanderNamespaceStructuredHelp(daemonCmd, { globalCommand: program, description: originalDaemonDescription });
     installCommanderNamespaceStructuredHelp(pluginCmd, { globalCommand: program, description: originalPluginDescription });
     installCommanderNamespaceStructuredHelp(adapterCmd, { globalCommand: program, description: originalAdapterDescription });
-    installCommanderNamespaceStructuredHelp(profileCmd, { globalCommand: program, description: originalProfileDescription });
     program.configureHelp({
         visibleCommands: (command) => command.commands.filter(child => command !== program || !adapterNameSet.has(child.name())),
     });
