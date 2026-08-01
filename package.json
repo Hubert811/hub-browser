@@ -13,6 +13,11 @@
   "workspaces": [
     "vendor/browseros/packages/browseros-agent/packages/*"
   ],
+  "scripts": {
+    "build": "tsc --outDir dist --declaration false",
+    "typecheck": "tsc --noEmit",
+    "test": "BROWSEROS_CDP_PORT=9110 bun run tests/test-phase2a.ts"
+  },
   "dependencies": {
     "@browseros/browser-core": "workspace:*",
     "@browseros/cdp-protocol": "workspace:*",

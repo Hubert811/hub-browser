@@ -6,9 +6,11 @@ import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, Snapsho
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
 
 export class UnifiedPage extends BasePage {
-  private _stealthInjected = false;
-  private _console: ConsoleCollector | null = null;
-  private _network: NetworkCollector | null = null;
+ private _stealthInjected = false;
+ private _console: ConsoleCollector | null = null;
+ private _network: NetworkCollector | null = null;
+ private _executionContexts = new Map<string, number>();
+ private _ctxEventSub: (() => void) | null = null;
 
   constructor(
     private session: BrowserSession,
@@ -108,9 +110,10 @@ export class UnifiedPage extends BasePage {
     this._stealthInjected = false;
     this._console?.stop();
     this._console = null;
-    await this._network?.stop();
-    this._network = null;
-    // Re-register stealth for the new tab's CDP session
+   await this._network?.stop();
+   this._network = null;
+   this.clearExecutionContexts();
+   // Re-register stealth for the new tab's CDP session
     const { session } = await this.session.pages.getSession(this.pageId);
     await session.Page.addScriptToEvaluateOnNewDocument({ source: generateStealthJs() });
   }
@@ -144,15 +147,17 @@ export class UnifiedPage extends BasePage {
     await this.session.input(this.pageId).handleDialog(accept, promptText);
   }
 
-  // ── snapshot (P2: opts.source routing) ──
-  async snapshot(opts?: SnapshotOptions): Promise<unknown> {
-    if (opts?.source === 'dom') {
-      return super.snapshot(opts);
-    }
-    const result = await this.session.observe(this.pageId).snapshot();
-    this.populateAxRefs(result.refs);
-    return result.text;
-  }
+ // ── snapshot (P2: opts.source routing) ──
+ async snapshot(opts?: SnapshotOptions): Promise<unknown> {
+   if (opts?.source === 'dom') {
+     return super.snapshot(opts);
+   }
+   const result = await this.session.observe(this.pageId).snapshot();
+   this.populateAxRefs(result.refs);
+   // 2b.1: compound 后处理
+   const compound = await this.collectCompoundInfo();
+   return this.mergeCompoundIntoSnapshot(result.text, compound);
+ }
 
   async diff(): Promise<unknown> {
     return this.session.observe(this.pageId).diff();
@@ -203,28 +208,198 @@ export class UnifiedPage extends BasePage {
     return list;
   }
 
-  // ── evaluateInFrame (wujie iframe support) ──
-  // Uses contentWindow.eval for same-origin iframes — no executionContextCreated
-  // tracking needed. Cross-origin OOPIF requires a dedicated CDP session (future).
-  async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
-    const { buildEvaluateExpression } = await import('./opencli/utils.js');
-    const expression = buildEvaluateExpression(js, []);
-    const wrapper = `(function() {
-      const iframe = document.querySelectorAll('iframe')[${frameIndex}];
-      if (!iframe) throw new Error('Frame ${frameIndex} not found');
-      if (!iframe.contentWindow) throw new Error('Frame ${frameIndex} has no contentWindow');
-      try {
-        return iframe.contentWindow.eval(${JSON.stringify(expression)});
-      } catch (e) {
-        throw new Error('Frame ${frameIndex} eval failed: ' + e.message);
-      }
-    })()`;
-    return this.evaluate(wrapper);
-  }
+ // ── evaluateInFrame (wujie iframe support) ──
+ async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
+   const frames = await this.frames();
+   const frame = frames[frameIndex];
+   if (!frame) throw new Error(`Frame ${frameIndex} not found`);
+   await this.ensureRuntimeEnabled();
+   const ctxId = this._executionContexts.get(frame.frameId);
+   const { buildEvaluateExpression } = await import('./opencli/utils.js');
+   const expression = buildEvaluateExpression(js, []);
+   // 优先用 executionContextId（支持跨域 OOPIF）
+   if (ctxId !== undefined) {
+     const { session } = await this.session.pages.getSession(this.pageId);
+     const result = await session.Runtime.evaluate({
+       expression,
+       contextId: ctxId,
+       returnByValue: true,
+       awaitPromise: true,
+     });
+     if (result.exceptionDetails) throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
+     return result.result?.value;
+   }
+   // fallback: contentWindow.eval（仅同源 iframe，跨域会抛 SecurityError）
+   const wrapper = `(function() {
+     const iframe = document.querySelectorAll('iframe')[${frameIndex}];
+     if (!iframe) throw new Error('Frame ${frameIndex} not found');
+     if (!iframe.contentWindow) throw new Error('Frame ${frameIndex} has no contentWindow');
+     try {
+       return iframe.contentWindow.eval(${JSON.stringify(expression)});
+     } catch (e) {
+       if (e instanceof DOMException && e.name === 'SecurityError')
+         throw new Error('Frame ${frameIndex} is cross-origin (OOPIF). executionContextCreated not yet received. Retry after navigation completes.');
+       throw new Error('Frame ${frameIndex} eval failed: ' + e.message);
+     }
+   })()`;
+   return this.evaluate(wrapper);
+ }
 
-  // ── private helpers ──
+ // ── private helpers ──
+ // 2b.2: UnifiedPage 覆写 annotatedScreenshot — visual ref overlay by coordinates
+ async annotatedScreenshot(options: ScreenshotOptions = {}): Promise<string> {
+   const snapResult = await this.session.observe(this.pageId).snapshot();
+   this.populateAxRefs(snapResult.refs);
+   const { session } = await this.session.pages.getSession(this.pageId);
+   const refCoords = await this.getRefCoordinates(session, snapResult.refs);
+   await this.evaluate(this.installCoordOverlayJs(refCoords));
+   try {
+     return await this.screenshot({ ...options });
+   } finally {
+     const { removeVisualRefOverlayJs } = await import('./opencli/visual-refs.js');
+     await this.evaluate(removeVisualRefOverlayJs()).catch(() => {});
+   }
+ }
+ 
+ private async getRefCoordinates(
+   session: any, refs: any
+ ): Promise<Array<{ref: string; x: number; y: number; w: number; h: number}>> {
+   const entries = [...refs.byRef].slice(0, 120);
+   const results = await Promise.all(entries.map(async ([ref, entry]: [string, any]) => {
+     try {
+       const r = await session.DOM.getBoxModel({ backendNodeId: entry.backendNodeId });
+       const quad = r.model?.content ?? r.model?.border;
+       if (!quad || quad.length < 8) return null;
+       const xs = [quad[0], quad[2], quad[4], quad[6]];
+       const ys = [quad[1], quad[3], quad[5], quad[7]];
+       const x1 = Math.min(...xs), x2 = Math.max(...xs);
+       const y1 = Math.min(...ys), y2 = Math.max(...ys);
+       return { ref, x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+     } catch { return null; }
+   }));
+   return results.filter(Boolean) as any;
+ }
+ 
+ private installCoordOverlayJs(coords: Array<{ref: string; x: number; y: number; w: number; h: number}>): string {
+   return `
+     (() => {
+       const OVERLAY_ID = '__opencli_visual_ref_overlay';
+       document.getElementById(OVERLAY_ID)?.remove();
+       const overlay = document.createElement('div');
+       overlay.id = OVERLAY_ID;
+       overlay.setAttribute('aria-hidden', 'true');
+       Object.assign(overlay.style, {
+         position: 'fixed', inset: '0', zIndex: '2147483647',
+         pointerEvents: 'none',
+         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+       });
+       const coords = ${JSON.stringify(coords)};
+       for (const c of coords) {
+         if (c.w < 2 || c.h < 2) continue;
+         const box = document.createElement('div');
+         Object.assign(box.style, {
+           position: 'fixed', left: c.x + 'px', top: c.y + 'px',
+           width: c.w + 'px', height: c.h + 'px',
+           border: '2px solid #ff3b30', borderRadius: '4px',
+           boxSizing: 'border-box',
+           background: 'rgba(255,59,48,.08)',
+         });
+         const badge = document.createElement('div');
+         badge.textContent = c.ref;
+         Object.assign(badge.style, {
+           position: 'fixed', left: c.x + 'px', top: Math.max(0, c.y - 20) + 'px',
+           minWidth: '18px', height: '18px', padding: '0 5px',
+           borderRadius: '999px', border: '1px solid rgba(255,255,255,.95)',
+           background: '#ff3b30', color: '#fff', fontSize: '12px',
+           fontWeight: '700', lineHeight: '18px', textAlign: 'center',
+         });
+         overlay.appendChild(box);
+         overlay.appendChild(badge);
+       }
+       document.documentElement.appendChild(overlay);
+     })()
+   `;
+ }
+ 
+ // 2b.1: compound 后处理
+private async collectCompoundInfo(): Promise<Map<string, any>> {
+  const { COMPOUND_INFO_JS } = await import('./opencli/compound.js');
+  // COMPOUND_INFO_JS 声明 compoundInfoOf 函数，需要包在 IIFE 中执行
+  // 不能用 this.evaluate（会过 buildEvaluateExpression/wrapForEval，把 function 声明变成 IIFE 导致作用域丢失）
+  const collectJs = '(function() {\n' + COMPOUND_INFO_JS + '\n' +
+    '  var results = [];\n' +
+    '  var sel = "input[type=date],input[type=time],input[type=datetime-local],input[type=month],input[type=week],input[type=file],select";\n' +
+    '  var els = document.querySelectorAll(sel);\n' +
+    '  for (var i = 0; i < els.length; i++) {\n' +
+    '    var info = compoundInfoOf(els[i]);\n' +
+    '    if (!info) continue;\n' +
+    '    var name = (els[i].getAttribute("aria-label") || els[i].getAttribute("name") || els[i].getAttribute("title") || (els[i].tagName === "SELECT" ? "" : els[i].getAttribute("type") || "")).trim();\n' +
+    '    results.push({ name: name, info: info });\n' +
+    '  }\n' +
+    '  return JSON.stringify(results);\n' +
+    '})()';
+  const { session } = await this.session.pages.getSession(this.pageId);
+  const r = await session.Runtime.evaluate({
+    expression: collectJs,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (r.exceptionDetails) throw new Error('CompoundInfo: ' + (r.exceptionDetails.exception?.description ?? ''));
+  const result = r.result?.value as string;
+  const items = JSON.parse(result || '[]');
+   const map = new Map();
+   for (const { name, info } of items) {
+     for (const [ref, entry] of this._axRefs) {
+       if (entry.name === name || name === '') { map.set(ref, info); break; }
+     }
+   }
+   return map;
+ }
+ 
+ private mergeCompoundIntoSnapshot(text: string, compound: Map<string, any>): string {
+   if (compound.size === 0) return text;
+   return text.replace(/\[ref=(e\d+)\]/g, (match, ref) => {
+     const info = compound.get(ref);
+     if (!info) return match;
+     let desc = '';
+     if (info.control === 'select') {
+       const opts = info.options?.slice(0, 5).map(o => o.label).join('/') ?? '';
+       desc = `select, ${info.options_total} options${info.multiple ? ' (multi)' : ''}, current: ${info.current || 'none'}${opts ? ', e.g. ' + opts : ''}`;
+     } else if (info.control === 'file') {
+       desc = `file${info.multiple ? ' (multi)' : ''}${info.accept ? ', accept: ' + info.accept : ''}`;
+     } else {
+       desc = `${info.control}, format: ${info.format}, current: ${info.current || 'none'}`;
+     }
+     return `${match} [compound: ${desc}]`;
+   });
+ }
+ 
+ // 2b.4.1: executionContext tracking for cross-origin OOPIF eval
+ private async ensureRuntimeEnabled(): Promise<void> {
+   if (this._ctxEventSub) return;
+   const { sessionId, session } = await this.session.pages.getSession(this.pageId);
+   // 先订阅，确保不遗漏事件
+   this._ctxEventSub = this.cdpBackend.onSessionEvent(
+     'Runtime.executionContextCreated',
+     (params: any, sid: string) => {
+       if (sid !== sessionId) return;
+       const ctx = params;
+       if (ctx.context?.auxData?.frameId) {
+         this._executionContexts.set(ctx.context.auxData.frameId, ctx.context.id);
+       }
+     }
+   );
+   // 再 enable（触发事件重发）
+   await session.Runtime.enable();
+ }
+ 
+ private clearExecutionContexts(): void {
+   this._executionContexts.clear();
+   this._ctxEventSub?.();
+   this._ctxEventSub = null;
+ }
 
-  private populateAxRefs(refs: any): void {
+ private populateAxRefs(refs: any): void {
     for (const [ref, entry] of refs.byRef) {
       this._axRefs.set(ref, {
         ref,

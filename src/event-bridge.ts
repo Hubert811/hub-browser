@@ -98,26 +98,30 @@ export class NetworkCollector {
       }
     }));
 
-    this.unsub.push(onSessionEvent(this.cdp, this.sessionId, 'Network.loadingFinished', async (p) => {
-      const params = p as { requestId: string };
-      const idx = this.pending.get(params.requestId);
-      if (idx !== undefined) {
-        try {
-          const bodyResult = await this.cdp.rawSendJson(
-            'Network.getResponseBody',
-            JSON.stringify({ requestId: params.requestId }),
-            this.sessionId,
-          );
-          const r = bodyResult as { body?: string; base64Encoded?: boolean };
-          if (typeof r?.body === 'string') {
-            this.entries[idx].responsePreview = r.base64Encoded
-              ? `base64:${r.body.slice(0, 8192)}`
-              : r.body.slice(0, 8192);
-          }
-        } catch { /* body unavailable */ }
-        this.pending.delete(params.requestId);
-      }
+    this.unsub.push(onSessionEvent(this.cdp, this.sessionId, 'Network.loadingFinished', (p) => {
+      void this.handleLoadingFinished(p as { requestId: string });
     }));
+
+  }
+
+  // try-catch 不可移除：void 不防止 unhandledRejection，try-catch 是唯一保障
+  private async handleLoadingFinished(params: { requestId: string }): Promise<void> {
+    const idx = this.pending.get(params.requestId);
+    if (idx === undefined) return;
+    try {
+      const bodyResult = await this.cdp.rawSendJson(
+        'Network.getResponseBody',
+        JSON.stringify({ requestId: params.requestId }),
+        this.sessionId,
+      );
+      const r = bodyResult as { body?: string; base64Encoded?: boolean };
+      if (typeof r?.body === 'string') {
+        this.entries[idx].responsePreview = r.base64Encoded
+          ? `base64:${r.body.slice(0, 8192)}`
+          : r.body.slice(0, 8192);
+      }
+    } catch { /* body unavailable */ }
+    this.pending.delete(params.requestId);
   }
 
   read(): Array<Record<string, unknown>> {

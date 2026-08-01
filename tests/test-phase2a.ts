@@ -197,6 +197,9 @@ async function test6_fillText(): Promise<void> {
 // ─── Test 7: screenshot ───
 async function test7_screenshot(): Promise<void> {
   try {
+    // Navigate to example.com first (wikipedia is too heavy for screenshot)
+    await page!.goto('https://example.com', { waitUntil: 'load' });
+    await sleep(500);
     const screenshotPath = '/tmp/hub-test-screenshot.jpg';
     const data = await page!.screenshot({ format: 'jpeg', quality: 80, path: screenshotPath });
 
