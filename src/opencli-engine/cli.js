@@ -911,9 +911,7 @@ Examples:
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
             }
             finally {
-                // Close CDP connection so the process can exit cleanly.
-                // Without this, the WebSocket handle keeps the event loop alive
-                // and the process hangs indefinitely after every browser command.
+                if (globalThis.__HubDaemonMode) return;
                 if (page?.close) {
                     try { await page.close(); } catch {}
                 }
@@ -943,6 +941,7 @@ Examples:
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
             }
             finally {
+                if (globalThis.__HubDaemonMode) return;
                 if (bridge?.close) {
                     try { await bridge.close(); } catch {}
                 }

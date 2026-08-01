@@ -23,6 +23,16 @@ export class UnifiedBrowserFactory implements IBrowserFactory {
     pageId?: number;
     session?: string;
   }): Promise<IPage> {
+    // Daemon mode: reuse singleton connection from globalThis.__HubBrowserFactory
+    const singleton = (globalThis as any).__HubBrowserFactory;
+    if (singleton && singleton !== this && singleton._cdp && singleton._session) {
+      const pages = await singleton._session.pages.list();
+      const pageId = opts?.pageId
+        ?? pages.find((p: any) => p.isActive)?.pageId
+        ?? 1;
+      return new UnifiedPage(singleton._session, singleton._cdp, pageId);
+    }
+
     if (this._cdp && this._session) {
       const pageId = opts?.pageId ?? 1;
       return new UnifiedPage(this._session, this._cdp, pageId);
