@@ -215,15 +215,16 @@ async function test7_screenshot(): Promise<void> {
 // ─── Test 8: getCookies ───
 async function test8_getCookies(): Promise<void> {
   try {
-    // Navigate to a site that sets cookies
-    await page!.goto('https://example.com', { waitUntil: 'load' });
+    // Navigate to wikipedia which sets cookies
+    await page!.goto('https://www.wikipedia.org', { waitUntil: 'load' });
     await sleep(500);
 
-    const cookies = await page!.getCookies({ url: 'https://example.com' });
+    const cookies = await page!.getCookies({ url: 'https://www.wikipedia.org' });
     const isArray = Array.isArray(cookies);
+    const hasCookies = isArray && cookies.length > 0;
 
-    record('getCookies', isArray,
-      `isArray=${isArray}, count=${isArray ? cookies.length : 0}`);
+    record('getCookies', isArray && hasCookies,
+      `isArray=${isArray}, count=${isArray ? cookies.length : 0}, hasCookies=${hasCookies}`);
   } catch (e) {
     record('getCookies', false, (e as Error).message);
   }
@@ -335,22 +336,32 @@ async function test12_diff(): Promise<void> {
     await page!.snapshot();
     await sleep(300);
 
-    // Modify the page
+   // Modify the page
+   await page!.evaluate(`
+     const div = document.createElement('div');
+     div.id = 'hub-test-diff-marker';
+     div.textContent = 'Added by test';
+     document.body.appendChild(div);
+   `);
+   await sleep(500);
+    // Add a visible button (has AX role) to ensure Observer.diff detects the change
     await page!.evaluate(`
-      const div = document.createElement('div');
-      div.id = 'hub-test-diff-marker';
-      div.textContent = 'Added by test';
-      document.body.appendChild(div);
+      const btn = document.createElement('button');
+      btn.id = 'hub-test-diff-btn';
+      btn.textContent = 'Diff Test Button';
+      btn.setAttribute('aria-label', 'Diff Test Button');
+      document.body.appendChild(btn);
     `);
     await sleep(500);
 
     // Get diff
-    const diff = await page!.diff();
-    const diffStr = typeof diff === 'string' ? diff : JSON.stringify(diff);
-    const hasDiff = diffStr !== '{}' && diffStr !== '' && diffStr !== 'null';
+   const diff = await page!.diff();
+   const diffStr = typeof diff === 'string' ? diff : JSON.stringify(diff);
+    const diffObj = typeof diff === 'object' ? diff as any : null;
+    const hasDiff = diffObj ? (diffObj.changed === true || (diffObj.added ?? 0) > 0 || (diffObj.removed ?? 0) > 0) : (diffStr !== '{}' && diffStr !== '' && diffStr !== 'null');
 
-    record('diff (Observer.diff)', hasDiff,
-      `diff length=${diffStr.length}, preview=${diffStr.slice(0, 100)}`);
+   record('diff (Observer.diff)', hasDiff,
+      `diff length=${diffStr.length}, changed=${diffObj?.changed}, added=${diffObj?.added}, removed=${diffObj?.removed}, preview=${diffStr.slice(0, 100)}`);
   } catch (e) {
     record('diff (Observer.diff)', false, (e as Error).message);
   }

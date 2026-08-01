@@ -2,7 +2,6 @@ import { BasePage } from './opencli/base-page.js';
 import { generateStealthJs } from './opencli/stealth.js';
 import type { BrowserSession } from '@browseros/browser-core';
 import type { CdpBackend } from '@browseros/browser-core';
-import type { ProtocolApi } from '@browseros/cdp-protocol/protocol-api';
 import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, SnapshotOptions } from './opencli/types.js';
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
 
@@ -10,6 +9,7 @@ export class UnifiedPage extends BasePage {
   private _stealthInjected = false;
   private _console: ConsoleCollector | null = null;
   private _network: NetworkCollector | null = null;
+  private _stealthRegistered = false;
 
   constructor(
     private session: BrowserSession,
@@ -56,13 +56,16 @@ export class UnifiedPage extends BasePage {
   async getCookies(opts?: { domain?: string; url?: string }): Promise<BrowserCookie[]> {
     const params = opts?.url ? JSON.stringify({ urls: [opts.url] }) : '{}';
     const result = await this.session.cdpJsonForPage(this.pageId, 'Network.getCookies', params);
-    const cookies = (result as { cookies?: BrowserCookie[] })?.cookies ?? [];
+    let cookies = (result as { cookies?: BrowserCookie[] })?.cookies ?? [];
+    if (opts?.domain) {
+      const d = opts.domain.toLowerCase();
+      cookies = cookies.filter(c => (c.domain ?? '').toLowerCase().includes(d));
+    }
     return cookies;
   }
 
   // ── screenshot (P1-5: fullPage/width/height/path) ──
   async screenshot(options: ScreenshotOptions = {}): Promise<string> {
-    const { session } = await this.session.pages.getSession(this.pageId);
     const overrideWidth = options.width && options.width > 0 ? Math.ceil(options.width) : undefined;
     const overrideHeight = !options.fullPage && options.height && options.height > 0 ? Math.ceil(options.height) : undefined;
     if (overrideWidth !== undefined || overrideHeight !== undefined) {
@@ -78,7 +81,7 @@ export class UnifiedPage extends BasePage {
       quality: options.quality ?? 80,
       captureBeyondViewport: options.fullPage ?? false,
     }) as { data: string };
-    if (overrideWidth !== undefined) {
+    if (overrideWidth !== undefined || overrideHeight !== undefined) {
       await this.cdp('Emulation.clearDeviceMetricsOverride', {});
     }
     if (options.path) {
@@ -98,15 +101,21 @@ export class UnifiedPage extends BasePage {
     const page = typeof target === 'number'
       ? pages.find((p: any) => p.pageId === target)
       : pages.find((p: any) => p.url.includes(String(target)));
-    if (page) {
-      this.pageId = (page as any).pageId;
-      this.resetPageState();
-      this._stealthInjected = false;
-      this._console?.stop();
-      this._console = null;
-      this._network?.stop();
-      this._network = null;
+    if (!page) {
+      throw new Error(`Tab not found: ${target}`);
     }
+    this.pageId = (page as any).pageId;
+    this.resetPageState();
+    this._stealthInjected = false;
+    this._stealthRegistered = false;
+    this._console?.stop();
+    this._console = null;
+    await this._network?.stop();
+    this._network = null;
+    // Re-register stealth for the new tab's CDP session
+    const { session } = await this.session.pages.getSession(this.pageId);
+    await session.Page.addScriptToEvaluateOnNewDocument({ source: generateStealthJs() });
+    this._stealthRegistered = true;
   }
 
   // ── CDP escape hatch ──
@@ -226,7 +235,9 @@ export class UnifiedPage extends BasePage {
         role: entry.role,
         name: entry.name,
         nth: entry.nth,
-        frame: entry.frameId ? { frameId: entry.frameId } : undefined,
+        frame: entry.frameId
+          ? { frameId: entry.frameId, url: entry.frameUrl ?? undefined }
+          : undefined,
       });
     }
   }
