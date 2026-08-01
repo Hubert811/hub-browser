@@ -444,7 +444,7 @@ async function getBrowserPage(session, targetPage, opts = {}) {
         if (!page.setActivePage) {
             throw new Error('This browser session does not support explicit tab targeting');
         }
-        page.setActivePage(resolvedTargetPage);
+        await page.setActivePage(resolvedTargetPage);
     }
     return page;
 }
@@ -910,17 +910,27 @@ Examples:
                 }
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
             }
+            finally {
+                // Close CDP connection so the process can exit cleanly.
+                // Without this, the WebSocket handle keeps the event loop alive
+                // and the process hangs indefinitely after every browser command.
+                if (page?.close) {
+                    try { await page.close(); } catch {}
+                }
+                process.exit(process.exitCode || 0);
+            }
         };
     }
     function browserSessionCommandAction(fn) {
-        return async (optsOrCommand, maybeCommand) => {
+       return async (optsOrCommand, maybeCommand) => {
             const command = optsOrCommand instanceof Command ? optsOrCommand : maybeCommand;
-            const session = getBrowserSession(command);
+           const session = getBrowserSession(command);
+            let bridge = null;
             try {
                 const { BrowserBridge } = await import('./browser/index.js');
-            const bridge = new BrowserBridge();
-            await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser' });
-            await fn({ session });
+                bridge = new BrowserBridge();
+                await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser' });
+                await fn({ session });
             }
             catch (err) {
                 if (err instanceof BrowserCommandError) {
@@ -931,6 +941,12 @@ Examples:
                     log.error(err instanceof Error ? err.message : String(err));
                 }
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
+            }
+            finally {
+                if (bridge?.close) {
+                    try { await bridge.close(); } catch {}
+                }
+                process.exit(process.exitCode || 0);
             }
         };
     }

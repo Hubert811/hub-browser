@@ -176,6 +176,35 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     return this._browserSession.pages.getInfo(this.pageId)?.targetId;
   }
 
+  /** Bind the page object to a specific tab by targetId. */
+  async setActivePage(targetId?: string): Promise<void> {
+    if (!targetId) return;
+    const current = this._browserSession.pages.getInfo(this.pageId);
+    if (current?.targetId === targetId) return;
+    const pages = await this._browserSession.pages.list();
+    const match = pages.find((p: any) => p.targetId === targetId);
+    if (!match) throw new Error(`Tab not found: ${targetId}`);
+    this.pageId = (match as any).pageId;
+    this.resetPageState();
+    this._stealthInjected = false;
+    this._console?.stop();
+    this._console = null;
+    await this._network?.stop();
+    this._network = null;
+    this.clearExecutionContexts();
+  }
+
+  /** Close CDP connection and release all resources. */
+  async close(): Promise<void> {
+    this.clearExecutionContexts();
+    this._console?.stop();
+    this._console = null;
+    await this._network?.stop();
+    this._network = null;
+    await this._browserSession?.dispose?.();
+    await this.cdpBackend?.disconnect?.();
+  }
+
   // ── CDP escape hatch ──
   async cdp(method: string, params?: Record<string, unknown>): Promise<unknown> {
     return this._browserSession.cdpJsonForPage(this.pageId, method, JSON.stringify(params ?? {}));
