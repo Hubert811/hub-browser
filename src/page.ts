@@ -10,9 +10,10 @@ export class UnifiedPage extends BasePage {
  private _console: ConsoleCollector | null = null;
  private _network: NetworkCollector | null = null;
  private _executionContexts = new Map<string, number>();
- private _ctxEventSub: (() => void) | null = null;
+private _ctxEventSub: (() => void) | null = null;
+private _ctxEventSub2: (() => void) | null = null;
 
-  constructor(
+ constructor(
     private session: BrowserSession,
     private cdpBackend: CdpBackend,
     private pageId: number,
@@ -229,11 +230,11 @@ export class UnifiedPage extends BasePage {
      if (result.exceptionDetails) throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
      return result.result?.value;
    }
-   // fallback: contentWindow.eval（仅同源 iframe，跨域会抛 SecurityError）
-   const wrapper = `(function() {
-     const iframe = document.querySelectorAll('iframe')[${frameIndex}];
-     if (!iframe) throw new Error('Frame ${frameIndex} not found');
-     if (!iframe.contentWindow) throw new Error('Frame ${frameIndex} has no contentWindow');
+  // fallback: contentWindow.eval（仅同源 iframe，跨域会抛 SecurityError）
+  const wrapper = `(function() {
+    const iframe = document.querySelectorAll('iframe')[${frameIndex - 1}];
+    if (!iframe) throw new Error('Frame ${frameIndex} not found');
+    if (!iframe.contentWindow) throw new Error('Frame ${frameIndex} has no contentWindow');
      try {
        return iframe.contentWindow.eval(${JSON.stringify(expression)});
      } catch (e) {
@@ -324,37 +325,34 @@ export class UnifiedPage extends BasePage {
  // 2b.1: compound 后处理
 private async collectCompoundInfo(): Promise<Map<string, any>> {
   const { COMPOUND_INFO_JS } = await import('./opencli/compound.js');
-  // COMPOUND_INFO_JS 声明 compoundInfoOf 函数，需要包在 IIFE 中执行
-  // 不能用 this.evaluate（会过 buildEvaluateExpression/wrapForEval，把 function 声明变成 IIFE 导致作用域丢失）
-  const collectJs = '(function() {\n' + COMPOUND_INFO_JS + '\n' +
-    '  var results = [];\n' +
-    '  var sel = "input[type=date],input[type=time],input[type=datetime-local],input[type=month],input[type=week],input[type=file],select";\n' +
-    '  var els = document.querySelectorAll(sel);\n' +
-    '  for (var i = 0; i < els.length; i++) {\n' +
-    '    var info = compoundInfoOf(els[i]);\n' +
-    '    if (!info) continue;\n' +
-    '    var name = (els[i].getAttribute("aria-label") || els[i].getAttribute("name") || els[i].getAttribute("title") || (els[i].tagName === "SELECT" ? "" : els[i].getAttribute("type") || "")).trim();\n' +
-    '    results.push({ name: name, info: info });\n' +
-    '  }\n' +
-    '  return JSON.stringify(results);\n' +
-    '})()';
+  // P1-1 fix: match by backendNodeId, not by name string
+  // DOM getAttribute('name') != AX accessible name, so name matching is unreliable
   const { session } = await this.session.pages.getSession(this.pageId);
-  const r = await session.Runtime.evaluate({
-    expression: collectJs,
-    returnByValue: true,
-    awaitPromise: true,
-  });
-  if (r.exceptionDetails) throw new Error('CompoundInfo: ' + (r.exceptionDetails.exception?.description ?? ''));
-  const result = r.result?.value as string;
-  const items = JSON.parse(result || '[]');
-   const map = new Map();
-   for (const { name, info } of items) {
-     for (const [ref, entry] of this._axRefs) {
-       if (entry.name === name || name === '') { map.set(ref, info); break; }
-     }
-   }
-   return map;
- }
+  const map = new Map();
+  const fnDecl = 'function() {\n' + COMPOUND_INFO_JS + '\nreturn compoundInfoOf(this);\n}';
+  // Check each AX ref: resolve backendNodeId → objectId → callFunctionOn
+  const entries = [...this._axRefs.entries()];
+  const results = await Promise.all(entries.map(async ([ref, entry]: [string, any]) => {
+    try {
+      const resolved = await session.DOM.resolveNode({ backendNodeId: entry.backendNodeId });
+      const objectId = resolved.object?.objectId;
+      if (!objectId) return null;
+      const r = await session.Runtime.callFunctionOn({
+        objectId,
+        functionDeclaration: fnDecl,
+        returnByValue: true,
+      });
+      if (r.exceptionDetails) return null;
+      const info = r.result?.value;
+      if (!info) return null;
+      return { ref, info };
+    } catch { return null; }
+  }));
+  for (const r of results) {
+    if (r) map.set(r.ref, r.info);
+  }
+  return map;
+}
  
  private mergeCompoundIntoSnapshot(text: string, compound: Map<string, any>): string {
    if (compound.size === 0) return text;
@@ -380,24 +378,37 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
    const { sessionId, session } = await this.session.pages.getSession(this.pageId);
    // 先订阅，确保不遗漏事件
    this._ctxEventSub = this.cdpBackend.onSessionEvent(
-     'Runtime.executionContextCreated',
-     (params: any, sid: string) => {
-       if (sid !== sessionId) return;
-       const ctx = params;
-       if (ctx.context?.auxData?.frameId) {
-         this._executionContexts.set(ctx.context.auxData.frameId, ctx.context.id);
-       }
-     }
-   );
-   // 再 enable（触发事件重发）
-   await session.Runtime.enable();
- }
- 
- private clearExecutionContexts(): void {
-   this._executionContexts.clear();
-   this._ctxEventSub?.();
-   this._ctxEventSub = null;
- }
+    'Runtime.executionContextCreated',
+    (params: any, sid: string) => {
+      if (sid !== sessionId) return;
+      const ctx = params;
+      if (ctx.context?.auxData?.frameId) {
+        this._executionContexts.set(ctx.context.auxData.frameId, ctx.context.id);
+      }
+    }
+  );
+  // Also subscribe to context destruction to avoid stale contextId
+  this._ctxEventSub2 = this.cdpBackend.onSessionEvent(
+    'Runtime.executionContextDestroyed',
+    (params: any, sid: string) => {
+      if (sid !== sessionId) return;
+      const ctx = params;
+      if (ctx.context?.auxData?.frameId) {
+        this._executionContexts.delete(ctx.context.auxData.frameId);
+      }
+    }
+  );
+  // 再 enable（触发事件重发）
+  await session.Runtime.enable();
+}
+
+private clearExecutionContexts(): void {
+  this._executionContexts.clear();
+  this._ctxEventSub?.();
+  this._ctxEventSub = null;
+  this._ctxEventSub2?.();
+  this._ctxEventSub2 = null;
+}
 
  private populateAxRefs(refs: any): void {
     for (const [ref, entry] of refs.byRef) {

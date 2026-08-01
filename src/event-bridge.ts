@@ -101,6 +101,10 @@ export class NetworkCollector {
     this.unsub.push(onSessionEvent(this.cdp, this.sessionId, 'Network.loadingFinished', (p) => {
       void this.handleLoadingFinished(p as { requestId: string });
     }));
+    this.unsub.push(onSessionEvent(this.cdp, this.sessionId, 'Network.loadingFailed', (p) => {
+      const params = p as { requestId: string };
+      this.pending.delete(params.requestId);
+    }));
 
   }
 
