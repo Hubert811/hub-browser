@@ -40,10 +40,12 @@ private _ctxEventSub2: (() => void) | null = null;
   }
 
   // ── goto ──
- async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
-    await this.session.nav(this.pageId).goto(url);
-    this._lastUrl = url;
-    if (!this._stealthInjected) {
+async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
+   await this.session.nav(this.pageId).goto(url);
+   this._lastUrl = url;
+   // Clear stale refs from previous page (prevent cross-page silent mis-click)
+   this.resetPageState();
+   if (!this._stealthInjected) {
       await this.evaluate(generateStealthJs());
       this._stealthInjected = true;
     }
@@ -416,8 +418,9 @@ private clearExecutionContexts(): void {
   this._ctxEventSub2 = null;
 }
 
- private populateAxRefs(refs: any): void {
-    for (const [ref, entry] of refs.byRef) {
+private populateAxRefs(refs: any): void {
+   this._axRefs.clear();
+   for (const [ref, entry] of refs.byRef) {
       this._axRefs.set(ref, {
         ref,
         backendNodeId: entry.backendNodeId,
