@@ -210,9 +210,7 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
             const BrowserFactory = getBrowserFactory(cmd.site);
             // Requirement vs preference: --profile / OPENCLI_PROFILE route strictly;
             // the config default is a soft preference the daemon arbitrates.
-            const profileSelection = null;
-            const profileRouting = {};
-            const contextId = profileSelection?.contextId;
+            const contextId = undefined;
             const internal = cmd;
             const siteSession = resolveSiteSession(cmd, opts.siteSession);
             const session = resolveAdapterBrowserSession(cmd, siteSession);
@@ -333,7 +331,7 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                         await page.closeWindow?.().catch(() => { });
                     throw err;
                 }
-            }, { session, cdpEndpoint, ...profileRouting, windowMode, surface: 'adapter', siteSession });
+            }, { session, cdpEndpoint, windowMode, surface: 'adapter', siteSession });
         }
         else {
             // Non-browser commands: enforce a timeout only when the command exposes
