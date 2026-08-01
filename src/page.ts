@@ -10,8 +10,6 @@ export class UnifiedPage extends BasePage {
   private _stealthInjected = false;
   private _console: ConsoleCollector | null = null;
   private _network: NetworkCollector | null = null;
-  private _executionContexts = new Map<string, number>();
-  private _ctxSub: (() => void) | null = null;
 
   constructor(
     private session: BrowserSession,
@@ -40,7 +38,7 @@ export class UnifiedPage extends BasePage {
   }
 
   // ── goto ──
-  async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
+ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
     await this.session.nav(this.pageId).goto(url);
     this._lastUrl = url;
     if (!this._stealthInjected) {
@@ -108,9 +106,6 @@ export class UnifiedPage extends BasePage {
       this._console = null;
       this._network?.stop();
       this._network = null;
-      this._executionContexts.clear();
-      this._ctxSub?.();
-      this._ctxSub = null;
     }
   }
 
@@ -203,25 +198,22 @@ export class UnifiedPage extends BasePage {
   }
 
   // ── evaluateInFrame (wujie iframe support) ──
+  // Uses contentWindow.eval for same-origin iframes — no executionContextCreated
+  // tracking needed. Cross-origin OOPIF requires a dedicated CDP session (future).
   async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
     const { buildEvaluateExpression } = await import('./opencli/utils.js');
-    const frames = await this.frames();
-    const frame = frames[frameIndex];
-    if (!frame) throw new Error(`Frame ${frameIndex} not found`);
-
-    await this.ensureRuntimeEnabled();
-    const ctxId = this._executionContexts.get(frame.frameId);
-    if (ctxId === undefined) throw new Error(`No execution context for frame ${frame.frameId}`);
-
-    const { session } = await this.session.pages.getSession(this.pageId);
-    const result = await session.Runtime.evaluate({
-      expression: buildEvaluateExpression(js, []),
-      contextId: ctxId,
-      returnByValue: true,
-      awaitPromise: true,
-    });
-    if (result.exceptionDetails) throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
-    return result.result?.value;
+    const expression = buildEvaluateExpression(js, []);
+    const wrapper = `(function() {
+      const iframe = document.querySelectorAll('iframe')[${frameIndex}];
+      if (!iframe) throw new Error('Frame ${frameIndex} not found');
+      if (!iframe.contentWindow) throw new Error('Frame ${frameIndex} has no contentWindow');
+      try {
+        return iframe.contentWindow.eval(${JSON.stringify(expression)});
+      } catch (e) {
+        throw new Error('Frame ${frameIndex} eval failed: ' + e.message);
+      }
+    })()`;
+    return this.evaluate(wrapper);
   }
 
   // ── private helpers ──
@@ -239,19 +231,4 @@ export class UnifiedPage extends BasePage {
     }
   }
 
-  private async ensureRuntimeEnabled(): Promise<void> {
-    if (this._ctxSub) return;
-    const { sessionId, session } = await this.session.pages.getSession(this.pageId);
-    await session.Runtime.enable();
-    this._ctxSub = this.cdpBackend.onSessionEvent(
-      'Runtime.executionContextCreated',
-      (params: unknown, sid: string) => {
-        if (sid !== sessionId) return;
-        const ctx = params as { context?: { id: number; auxData?: { frameId?: string } } };
-        if (ctx.context?.auxData?.frameId) {
-          this._executionContexts.set(ctx.context.auxData.frameId, ctx.context.id);
-        }
-      },
-    );
-  }
 }
