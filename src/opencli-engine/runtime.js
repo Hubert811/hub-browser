@@ -33,17 +33,11 @@ export function withTimeoutMs(promise, timeoutMs, makeError = 'Operation timed o
 export async function browserSession(BrowserFactory, fn, opts = {}) {
     const browser = new BrowserFactory();
     try {
-        const page = await browser.connect({
-            timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT,
-            session: opts.session,
-            cdpEndpoint: opts.cdpEndpoint,
-            contextId: opts.contextId,
-            preferredContextId: opts.preferredContextId,
-            idleTimeout: opts.idleTimeout,
-            windowMode: opts.windowMode,
-            surface: opts.surface,
-            siteSession: opts.siteSession,
-        });
+       const page = await browser.connect({
+           timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT,
+           session: opts.session,
+           cdpEndpoint: opts.cdpEndpoint,
+       });
         return await fn(page);
     }
     finally {
