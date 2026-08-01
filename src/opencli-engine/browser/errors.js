@@ -2,11 +2,10 @@
  * Browser connection error helpers.
  *
  * Simplified — no more token/extension/CDP classification.
- * The daemon architecture has a single failure mode: daemon not reachable or extension not connected.
+* Browser connection failure modes (BrowserClaw CDP or legacy daemon).
  */
-import { BrowserConnectError } from '../errors.js';
-import { DEFAULT_DAEMON_PORT } from '../constants.js';
-/**
+ import { BrowserConnectError } from '../errors.js';
+ /**
  * Extension/daemon transient patterns — service worker restarts, attach races,
  * tab closure, daemon hiccups. These warrant a longer retry delay (~1500ms)
  * because the extension needs time to recover.
@@ -90,9 +89,9 @@ export function isTransientBrowserError(err) {
 export function formatBrowserConnectError(kind, detail) {
     switch (kind) {
         case 'daemon-not-running':
-            return new BrowserConnectError('Cannot connect to opencli daemon.' + (detail ? `\n\n${detail}` : ''), `Run \`opencli doctor\` to diagnose, or \`opencli daemon restart\` to force a fresh daemon. Default port is ${DEFAULT_DAEMON_PORT}.`, kind);
+            return new BrowserConnectError('Cannot connect to browser.' + (detail ? `\n\n${detail}` : ''), 'Make sure BrowserClaw is running on the configured CDP port.', kind);
         case 'extension-not-connected':
-            return new BrowserConnectError('Browser Bridge extension is not connected.' + (detail ? `\n\n${detail}` : ''), 'Install the extension from GitHub Releases, then reload.', kind);
+            return new BrowserConnectError('Browser connection failed.' + (detail ? `\n\n${detail}` : ''), 'Make sure BrowserClaw is running.', kind);
         case 'command-failed':
             return new BrowserConnectError(`Browser command failed: ${detail ?? 'unknown error'}`, undefined, kind);
         default:
