@@ -228,10 +228,14 @@ private _ctxEventSub2: (() => void) | null = null;
        awaitPromise: true,
      });
      if (result.exceptionDetails) throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
-     return result.result?.value;
-   }
-  // fallback: contentWindow.eval（仅同源 iframe，跨域会抛 SecurityError）
-  const wrapper = `(function() {
+   return result.result?.value;
+ }
+ // P1-1: frameIndex=0 is the main frame — just evaluate directly
+ if (frameIndex === 0) {
+   return this.evaluate(js);
+ }
+// fallback: contentWindow.eval（仅同源 iframe，跨域会抛 SecurityError）
+const wrapper = `(function() {
     const iframe = document.querySelectorAll('iframe')[${frameIndex - 1}];
     if (!iframe) throw new Error('Frame ${frameIndex} not found');
     if (!iframe.contentWindow) throw new Error('Frame ${frameIndex} has no contentWindow');
@@ -377,12 +381,13 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
    if (this._ctxEventSub) return;
    const { sessionId, session } = await this.session.pages.getSession(this.pageId);
    // 先订阅，确保不遗漏事件
-   this._ctxEventSub = this.cdpBackend.onSessionEvent(
+  this._ctxEventSub = this.cdpBackend.onSessionEvent(
     'Runtime.executionContextCreated',
     (params: any, sid: string) => {
       if (sid !== sessionId) return;
       const ctx = params;
-      if (ctx.context?.auxData?.frameId) {
+      // P0-2: only accept isDefault context (avoid extension context overwriting page context)
+      if (ctx.context?.auxData?.frameId && ctx.context?.auxData?.isDefault) {
         this._executionContexts.set(ctx.context.auxData.frameId, ctx.context.id);
       }
     }
@@ -393,12 +398,13 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
     (params: any, sid: string) => {
       if (sid !== sessionId) return;
       const ctx = params;
-      if (ctx.context?.auxData?.frameId) {
+      if (ctx.context?.auxData?.frameId && ctx.context?.auxData?.isDefault) {
         this._executionContexts.delete(ctx.context.auxData.frameId);
       }
     }
   );
-  // 再 enable（触发事件重发）
+  // P0-1: disable first to force CDP to resend all existing execution contexts
+  await session.Runtime.disable().catch(() => {});
   await session.Runtime.enable();
 }
 
