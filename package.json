@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "bin": {
-    "hub": "bin/hub.cjs"
+    "hub": "bin/hub.mjs"
   },
   "exports": {
     ".": "./src/index.ts",
