@@ -9,7 +9,6 @@ export class UnifiedPage extends BasePage {
   private _stealthInjected = false;
   private _console: ConsoleCollector | null = null;
   private _network: NetworkCollector | null = null;
-  private _stealthRegistered = false;
 
   constructor(
     private session: BrowserSession,
@@ -107,7 +106,6 @@ export class UnifiedPage extends BasePage {
     this.pageId = (page as any).pageId;
     this.resetPageState();
     this._stealthInjected = false;
-    this._stealthRegistered = false;
     this._console?.stop();
     this._console = null;
     await this._network?.stop();
@@ -115,7 +113,6 @@ export class UnifiedPage extends BasePage {
     // Re-register stealth for the new tab's CDP session
     const { session } = await this.session.pages.getSession(this.pageId);
     await session.Page.addScriptToEvaluateOnNewDocument({ source: generateStealthJs() });
-    this._stealthRegistered = true;
   }
 
   // ── CDP escape hatch ──
