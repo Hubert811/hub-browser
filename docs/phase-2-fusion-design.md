@@ -21,7 +21,7 @@ BrowserClaw 是后端（Chromium fork、CDP、MCP server、AX tree snapshot、Di
 核心交互能力——snapshot、click、fillText、scroll、stealth、CDP 逃生口、原生输入。
 不包含 compound 后处理和 visual ref 叠加。
 
-### Phase 2b（增强，5 天）：compound + visual ref
+### Phase 2b（增强，7 天）：compound + visual ref + 遗留修复
 
 snapshot 中的 compound 组件信息、annotatedScreenshot 的视觉 ref 标签。
 
@@ -288,7 +288,6 @@ async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
 private async ensureRuntimeEnabled(): Promise<void> {
   if (this._ctxEventSub) return;  // 已订阅
   const { sessionId, session } = await this.session.pages.getSession(this.pageId);
-  await session.Runtime.enable();
   this._ctxEventSub = this.cdpBackend.onSessionEvent(
     'Runtime.executionContextCreated',
     (params, sid) => {
@@ -299,13 +298,17 @@ private async ensureRuntimeEnabled(): Promise<void> {
       }
     }
   );
+  // 必须先订阅再 enable（以 2b.4.1 修正为准）
+  await session.Runtime.enable();
 }
 
-// selectTab 时清理
-// 在 resetPageState 或 selectTab 中:
+// selectTab 时清理（以 2b.4.1 为准：用 UnifiedPage 私有方法，不改 base-page.ts）
+// private clearExecutionContexts(): void {
 //   this._executionContexts.clear();
 //   this._ctxEventSub?.();
 //   this._ctxEventSub = null;
+// }
+// selectTab 中调用: this.clearExecutionContexts();
 ```
 
 ## 六、event-bridge.ts 完整设计（P1-3 补充）
@@ -499,7 +502,7 @@ export class UnifiedPage extends BasePage {
   async selectTab(target) {
     const pages = await this.session.pages.list();
     const page = typeof target === 'number' ? pages.find(p => p.pageId === target) : pages.find(p => p.url.includes(String(target)));
-    if (page) { this.pageId = page.pageId; this.resetPageState(); this._stealthInjected = false; this._console?.stop(); this._console = null; this._network?.stop(); this._network = null; }
+    if (page) { this.pageId = page.pageId; this.resetPageState(); this._stealthInjected = false; this._console?.stop(); this._console = null; await this._network?.stop(); this._network = null; this.clearExecutionContexts(); }
   }
 
   async cdp(method, params?) { return this.session.cdpJsonForPage(this.pageId, method, JSON.stringify(params ?? {})); }
