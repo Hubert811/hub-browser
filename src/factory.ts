@@ -9,12 +9,6 @@ export interface IBrowserFactory {
     cdpEndpoint?: string;
     pageId?: number;
     session?: string;
-    contextId?: string;
-    preferredContextId?: string;
-    idleTimeout?: number;
-    windowMode?: 'foreground' | 'background';
-    surface?: 'browser' | 'adapter';
-    siteSession?: 'ephemeral' | 'persistent';
   }): Promise<IPage>;
   close(): Promise<void>;
 }

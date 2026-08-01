@@ -57,7 +57,7 @@ const BROWSER_SUBCOMMAND_NAMES = new Set([
  *
  * Keep in sync with `program.option(...)` calls in cli.ts.
  */
-const ROOT_VALUE_FLAGS = new Set(['--profile']);
+const ROOT_VALUE_FLAGS = new Set();
 /**
  * Returns the set of reserved subcommand names (exposed for tests so they stay
  * synced with the actual registrations in cli.ts).

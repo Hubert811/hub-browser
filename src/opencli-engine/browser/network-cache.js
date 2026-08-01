@@ -1,7 +1,7 @@
 /**
  * Persistent cache for browser network captures.
  *
- * The live capture buffer (JS interceptor / daemon ring) can be cleared
+ * The live capture buffer (JS interceptor / JS interceptor / capture buffer) can be cleared
  * by navigation or lost between CLI invocations. Agents still need
  * stable references to request bodies after running other commands,
  * so every `browser network` call snapshots its results to disk.
