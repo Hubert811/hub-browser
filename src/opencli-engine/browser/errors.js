@@ -2,13 +2,14 @@
  * Browser connection error helpers.
  *
  * Simplified — no more token/extension/CDP classification.
-* Browser connection failure modes (BrowserClaw CDP or legacy daemon).
+ * Browser connection failure modes (BrowserClaw CDP direct connection).
  */
  import { BrowserConnectError } from '../errors.js';
  /**
- * Extension/daemon transient patterns — service worker restarts, attach races,
- * tab closure, daemon hiccups. These warrant a longer retry delay (~1500ms)
- * because the extension needs time to recover.
+ * Browser transient patterns — service worker restarts, attach races,
+ * Browser transient patterns — service worker restarts, attach races,
+ * tab closure, browser connection hiccups. These warrant a longer retry delay (~1500ms)
+ * because the browser needs time to recover.
  */
 const EXTENSION_TRANSIENT_PATTERNS = [
     'Extension disconnected',
@@ -19,7 +20,6 @@ const EXTENSION_TRANSIENT_PATTERNS = [
     'no longer exists',
     'No tab with id',
     'CDP connection',
-    'Daemon command failed',
     'No window with id',
 ];
 /**
@@ -63,7 +63,7 @@ export function classifyBrowserError(err) {
         return ERROR_CODE_ADVICE[code];
     }
     const msg = errorMessage(err);
-    // Extension/daemon transient errors — longer recovery time
+    // Browser transient errors — longer recovery time
     if (EXTENSION_TRANSIENT_PATTERNS.some(p => msg.includes(p))) {
         return { kind: 'extension-transient', retryable: true, delayMs: 1500 };
     }

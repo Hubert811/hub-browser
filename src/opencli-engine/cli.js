@@ -35,7 +35,7 @@ import { registerAuthCommands } from './commands/auth.js';
 import { log } from './logger.js';
 import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from './browser/config.js';
 const CLI_FILE = fileURLToPath(import.meta.url);
-/** Error class for browser command failures (inlined from removed daemon-client.js). */
+/** Error class for browser command failures. */
 class BrowserCommandError extends Error {
     constructor(message) { super(message); this.name = 'BrowserCommandError'; }
 }
@@ -81,7 +81,7 @@ export function selectFreshByTimestamp(items, lastSeenTs) {
     return { fresh, lastSeenTs: nextSeenTs };
 }
 /**
- * Normalize raw capture entries (from daemon/CDP `readNetworkCapture` or
+ * Normalize raw capture entries (from CDP `readNetworkCapture` or
  * the JS interceptor's `window.__opencli_net`) into a consistent shape.
  * Response preview is parsed as JSON when possible, otherwise kept as string.
  * `bodyFullSize` / `bodyTruncated` surface capture-layer truncation so the
@@ -416,9 +416,6 @@ async function resolveBrowserTargetInSession(page, targetPage, opts) {
     throw new Error(`Target tab ${candidate} is not part of the current browser session. ` +
         'The Browser Bridge session may have restarted; re-run "opencli browser tab list" and choose a current target.');
 }
-function getBrowserScope(session, contextId) {
-    return contextId ? `${contextId}:${session}` : session;
-}
 async function resolveStoredBrowserTarget(page, scope) {
     const defaultPage = loadBrowserTargetState(scope)?.defaultPage?.trim();
     if (!defaultPage)
@@ -426,7 +423,7 @@ async function resolveStoredBrowserTarget(page, scope) {
     return resolveBrowserTargetInSession(page, defaultPage, { scope, source: 'saved' });
 }
 /** Create a browser page for browser commands. Uses a named browser session for continuity. */
-async function getBrowserPage(session, targetPage, profileSelection, opts = {}) {
+async function getBrowserPage(session, targetPage, opts = {}) {
     const { BrowserBridge } = await import('./browser/index.js');
     const bridge = new BrowserBridge();
     // Internal GC timeout for browser sessions. Not the per-command runtime timeout.
@@ -439,7 +436,7 @@ async function getBrowserPage(session, targetPage, profileSelection, opts = {}) 
         ...(idleTimeout && idleTimeout > 0 && { idleTimeout }),
         windowMode: opts.windowMode ?? getBrowserWindowMode(undefined, 'foreground'),
     });
-    const targetScope = getBrowserScope(session, profileSelection?.contextId);
+    const targetScope = session;
     const resolvedTargetPage = targetPage
         ? await resolveBrowserTargetInSession(page, targetPage, { scope: targetScope, source: 'explicit' })
         : await resolveStoredBrowserTarget(page, targetScope);
@@ -494,11 +491,6 @@ function getBrowserSession(command) {
         return raw.trim();
     throw new Error('<session> is a required positional argument: opencli browser <session> <command>');
 }
-function getBrowserProfileSelection(command) {
-    const raw = getCommandOption(command, 'profile');
-    // Profile selection removed in hub-browser (no daemon/BrowserBridge contexts).
-    return null;
-}
 function getPageSession(page) {
     const session = page.session;
     if (typeof session === 'string' && session.trim())
@@ -506,15 +498,7 @@ function getPageSession(page) {
     throw new Error('Browser page is missing a session');
 }
 function getPageScope(page) {
-    // Scope is keyed by the SELECTED profile (explicit or preferred), matching
-    // getBrowserPage's targetScope — reading only the explicit contextId would
-    // save and look up the remembered tab under different keys whenever the
-    // profile came from the config default.
-    const { contextId, preferredContextId } = page;
-    const selected = typeof contextId === 'string' && contextId.trim()
-        ? contextId.trim()
-        : (typeof preferredContextId === 'string' && preferredContextId.trim() ? preferredContextId.trim() : undefined);
-    return getBrowserScope(getPageSession(page), selected);
+    return getPageSession(page);
 }
 function snapshotMetricText(snapshot) {
     return typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2);
@@ -605,7 +589,6 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
         .name('opencli')
         .description('Make any website your CLI. Zero setup. AI-powered.')
         .version(PKG_VERSION)
-        .option('--profile <name>', 'Chrome profile/context alias for Browser Bridge commands')
         .enablePositionalOptions();
     // ── Built-in: list ────────────────────────────────────────────────────────
     program
@@ -785,7 +768,7 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
     // All commands wrapped in browserAction() for consistent error handling.
     const browser = program
         .command('browser')
-        // --session is an internal hidden option used by the daemon protocol and direct
+        // --session is an internal hidden option used by direct
         // program.parseAsync callers (tests). User-facing surface is the <session>
         // positional; main.ts argv preprocessor rewrites positional -> --session.
         .addOption(new Option('--session <name>', 'Internal — set automatically from the <session> positional').hideHelp())
@@ -886,9 +869,8 @@ Examples:
                 const command = args.at(-1) instanceof Command ? args.at(-1) : undefined;
                 const targetPage = getBrowserTargetId(command);
                 const session = getBrowserSession(command);
-                const profileSelection = getBrowserProfileSelection(command);
                 const windowMode = getBrowserWindowMode(command, 'foreground');
-                page = await getBrowserPage(session, targetPage, profileSelection, { windowMode });
+                page = await getBrowserPage(session, targetPage, { windowMode });
                 await fn(page, ...args);
             }
             catch (err) {
@@ -934,13 +916,11 @@ Examples:
         return async (optsOrCommand, maybeCommand) => {
             const command = optsOrCommand instanceof Command ? optsOrCommand : maybeCommand;
             const session = getBrowserSession(command);
-            const profileSelection = getBrowserProfileSelection(command);
-            const contextId = profileSelection?.contextId;
             try {
                 const { BrowserBridge } = await import('./browser/index.js');
             const bridge = new BrowserBridge();
             await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser' });
-            await fn({ session, contextId });
+            await fn({ session });
             }
             catch (err) {
                 if (err instanceof BrowserCommandError) {
@@ -956,12 +936,12 @@ Examples:
     }
     browser.command('bind')
         .description('Bind the current Chrome tab/window to the browser session named by <session>')
-        .action(browserSessionCommandAction(async ({ session, contextId }) => {
+        .action(browserSessionCommandAction(async ({ session }) => {
         throw new Error('browser bind not available in hub-browser (use opencli adapters instead)');
     }));
     browser.command('unbind')
         .description('Detach the bound browser session named by <session> without closing the user tab/window')
-        .action(browserSessionCommandAction(async ({ session, contextId }) => {
+        .action(browserSessionCommandAction(async ({ session }) => {
         throw new Error('browser unbind not available in hub-browser (use opencli adapters instead)');
     }));
     const browserTab = browser

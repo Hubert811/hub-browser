@@ -25,7 +25,7 @@ import { probeCDP, resolveElectronEndpoint } from './launcher.js';
 import { ObservationSession, exportObservationSession } from './observation/index.js';
 import { resolveAdapterSourcePath } from './adapter-source.js';
 const _loadedModules = new Map();
-/** Track mtime of loaded user adapter files for hot-reload in daemon mode. */
+/** Track mtime of loaded user adapter files for hot-reload. */
 const _moduleMtimes = new Map();
 const _userClisDir = `${os.homedir()}/.opencli/clis/`;
 function normalizeTraceMode(raw) {
@@ -208,9 +208,6 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                 }
             }
             const BrowserFactory = getBrowserFactory(cmd.site);
-            // Requirement vs preference: --profile / OPENCLI_PROFILE route strictly;
-            // the config default is a soft preference the daemon arbitrates.
-            const contextId = undefined;
             const internal = cmd;
             const siteSession = resolveSiteSession(cmd, opts.siteSession);
             const session = resolveAdapterBrowserSession(cmd, siteSession);
@@ -221,7 +218,6 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                     ? null
                     : new ObservationSession({
                         scope: {
-                            contextId,
                             session,
                             target: page.getActivePage?.(),
                             site: cmd.site,
