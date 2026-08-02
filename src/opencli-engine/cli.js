@@ -1018,6 +1018,88 @@ Examples:
         }
         console.log(JSON.stringify({ closed: validatedTarget }, null, 2));
     }));
+    // ── Tab Group ──
+    const browserTabGroup = browser
+        .command('group')
+        .description('Tab group management — list, create, update, ungroup, and close tab groups');
+    addBrowserTabOption(browserTabGroup.command('list')
+        .description('List all tab groups in the browser session'))
+        .action(browserAction(async (page) => {
+        const groups = await page.tabGroupList();
+        console.log(JSON.stringify(groups, null, 2));
+    }));
+    addBrowserTabOption(browserTabGroup.command('create')
+        .description('Create a tab group from existing pages')
+        .option('--title <title>', 'Tab group title')
+        .option('--pages <pageIds>', 'Comma-separated page IDs (e.g. 1,2)'))
+        .action(browserAction(async (page, opts) => {
+        if (!opts.pages) throw new Error('--pages <pageIds> is required (e.g. --pages 1,2)');
+        const pages = String(opts.pages).split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        if (pages.length === 0) throw new Error('No valid page IDs provided');
+        const group = await page.tabGroupCreate(pages, opts.title);
+        console.log(JSON.stringify(group, null, 2));
+    }));
+    addBrowserTabOption(browserTabGroup.command('update')
+        .argument('<groupId>', 'Tab group ID')
+        .description('Update a tab group (title, color, collapsed state)')
+        .option('--title <title>', 'New tab group title')
+        .option('--color <color>', 'Tab group color (grey, blue, red, yellow, green, pink, purple, cyan, orange)')
+        .option('--collapsed', 'Collapse the tab group'))
+        .action(browserAction(async (page, groupId, opts) => {
+        const updateOpts = {};
+        if (opts.title !== undefined) updateOpts.title = opts.title;
+        if (opts.color !== undefined) updateOpts.color = opts.color;
+        if (opts.collapsed !== undefined) updateOpts.collapsed = opts.collapsed;
+        const group = await page.tabGroupUpdate(groupId, updateOpts);
+        console.log(JSON.stringify(group, null, 2));
+    }));
+    addBrowserTabOption(browserTabGroup.command('ungroup')
+        .description('Remove tabs from their tab group')
+        .option('--pages <pageIds>', 'Comma-separated page IDs (e.g. 1,2)'))
+        .action(browserAction(async (page, opts) => {
+        if (!opts.pages) throw new Error('--pages <pageIds> is required (e.g. --pages 1,2)');
+        const pages = String(opts.pages).split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        if (pages.length === 0) throw new Error('No valid page IDs provided');
+        await page.tabGroupUngroup(pages);
+        console.log(JSON.stringify({ ungrouped: pages }, null, 2));
+    }));
+    addBrowserTabOption(browserTabGroup.command('close')
+        .argument('<groupId>', 'Tab group ID')
+        .description('Close a tab group and all its tabs'))
+        .action(browserAction(async (page, groupId) => {
+        await page.tabGroupClose(groupId);
+        console.log(JSON.stringify({ closed: groupId }, null, 2));
+    }));
+    // ── Window ──
+    const browserWindow = browser
+        .command('window')
+        .description('Window management — list, create, close, and activate browser windows');
+    addBrowserTabOption(browserWindow.command('list')
+        .description('List all browser windows'))
+        .action(browserAction(async (page) => {
+        const windows = await page.windowList();
+        console.log(JSON.stringify(windows, null, 2));
+    }));
+    addBrowserTabOption(browserWindow.command('create')
+        .description('Create a new browser window'))
+        .action(browserAction(async (page) => {
+        const win = await page.windowCreate();
+        console.log(JSON.stringify(win, null, 2));
+    }));
+    addBrowserTabOption(browserWindow.command('close')
+        .argument('<windowId>', 'Window ID')
+        .description('Close a browser window'))
+        .action(browserAction(async (page, windowId) => {
+        await page.windowClose(parseInt(windowId, 10));
+        console.log(JSON.stringify({ closed: windowId }, null, 2));
+    }));
+    addBrowserTabOption(browserWindow.command('activate')
+        .argument('<windowId>', 'Window ID')
+        .description('Activate (bring to front) a browser window'))
+        .action(browserAction(async (page, windowId) => {
+        await page.windowActivate(parseInt(windowId, 10));
+        console.log(JSON.stringify({ activated: windowId }, null, 2));
+    }));
     // ── Navigation ──
     addBrowserTabOption(browser.command('open').argument('<url>').description('Open URL in the browser session'))
         .action(browserAction(async (page, url, opts) => {

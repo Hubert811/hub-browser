@@ -191,6 +191,67 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     return this._browserSession.pages.getInfo(this.pageId)?.targetId;
   }
 
+  // ── Tab Group ──
+  async tabGroupList(): Promise<unknown[]> {
+    const result = await this.cdp('Browser.getTabGroups');
+    return (result as any)?.groups ?? [];
+  }
+
+  async tabGroupCreate(pages: number[], title?: string): Promise<unknown> {
+    const allPages = await this._browserSession.pages.list();
+    const tabIds = pages.map(pid => {
+      const info = allPages.find((p: any) => p.pageId === pid);
+      if (!info) throw new Error(`Page ${pid} not found`);
+      return info.tabId;
+    });
+    const params: Record<string, unknown> = { tabIds };
+    if (title) params.title = title;
+    const result = await this.cdp('Browser.createTabGroup', params);
+    return (result as any)?.group;
+  }
+
+  async tabGroupUpdate(groupId: string, opts: { title?: string; color?: string; collapsed?: boolean }): Promise<unknown> {
+    const params: Record<string, unknown> = { groupId };
+    if (opts.title !== undefined) params.title = opts.title;
+    if (opts.color !== undefined) params.color = opts.color;
+    if (opts.collapsed !== undefined) params.collapsed = opts.collapsed;
+    const result = await this.cdp('Browser.updateTabGroup', params);
+    return (result as any)?.group;
+  }
+
+  async tabGroupUngroup(pages: number[]): Promise<void> {
+    const allPages = await this._browserSession.pages.list();
+    const tabIds = pages.map(pid => {
+      const info = allPages.find((p: any) => p.pageId === pid);
+      if (!info) throw new Error(`Page ${pid} not found`);
+      return info.tabId;
+    });
+    await this.cdp('Browser.removeTabsFromGroup', { tabIds });
+  }
+
+  async tabGroupClose(groupId: string): Promise<void> {
+    await this.cdp('Browser.closeTabGroup', { groupId });
+  }
+
+  // ── Window ──
+  async windowList(): Promise<unknown[]> {
+    const result = await this.cdp('Browser.getWindows');
+    return (result as any)?.windows ?? [];
+  }
+
+  async windowCreate(): Promise<unknown> {
+    const result = await this.cdp('Browser.createWindow');
+    return (result as any)?.window;
+  }
+
+  async windowClose(windowId: number): Promise<void> {
+    await this.cdp('Browser.closeWindow', { windowId });
+  }
+
+  async windowActivate(windowId: number): Promise<void> {
+    await this.cdp('Browser.activateWindow', { windowId });
+  }
+
   /** Bind the page object to a specific tab by targetId. */
   async setActivePage(targetId?: string): Promise<void> {
     if (!targetId) return;
