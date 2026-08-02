@@ -85,18 +85,26 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
         deviceScaleFactor: 1,
       });
     }
-    // P1 fix: Page.captureScreenshot can hang in some CDP backends. Add 10s timeout.
-    const SCREENSHOT_TIMEOUT_MS = 10_000;
-    const result = await Promise.race([
-      this.cdp('Page.captureScreenshot', {
-        format: options.format ?? 'jpeg',
-        quality: options.quality ?? 80,
-        captureBeyondViewport: options.fullPage ?? false,
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Screenshot timed out after ' + SCREENSHOT_TIMEOUT_MS + 'ms')), SCREENSHOT_TIMEOUT_MS)
-      ),
-    ]) as { data: string };
+    // P1 fix: Page.captureScreenshot can hang via browser-level CdpBackend (Bun WebSocket
+    // issue with large responses on browser-level sessions). Try CdpBackend first (5s
+    // timeout), then fall back to a direct page-level WebSocket connection.
+    const SCREENSHOT_TIMEOUT_MS = 5_000;
+    let result: { data: string };
+    try {
+      result = await Promise.race([
+        this.cdp('Page.captureScreenshot', {
+          format: options.format ?? 'jpeg',
+          quality: options.quality ?? 80,
+          captureBeyondViewport: options.fullPage ?? false,
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), SCREENSHOT_TIMEOUT_MS)
+        ),
+      ]) as { data: string };
+    } catch {
+      // Fallback: direct page-level WebSocket (bypasses CdpBackend)
+      result = await this.screenshotViaRawWebSocket(options) as { data: string };
+    }
     if (overrideWidth !== undefined || overrideHeight !== undefined) {
       await this.cdp('Emulation.clearDeviceMetricsOverride', {});
     }
@@ -485,6 +493,30 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
  }
  
  // 2b.4.1: executionContext tracking for cross-origin OOPIF eval
+ private async screenshotViaRawWebSocket(options: ScreenshotOptions = {}): Promise<{ data: string }> {
+    const port = Number(process.env.BROWSEROS_CDP_PORT ?? 9110);
+    const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as any[];
+    const pageInfo = this._browserSession.pages.getInfo(this.pageId);
+    const target = pages.find((p: any) => p.targetId === pageInfo?.targetId)
+      ?? pages.find((p: any) => p.type === 'page' && p.url.includes(this._lastUrl ?? ''));
+    if (!target?.webSocketDebuggerUrl) {
+      throw new Error('Screenshot fallback: no page WebSocket URL');
+    }
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(target.webSocketDebuggerUrl);
+      const timeout = setTimeout(() => { ws.close(); reject(new Error('Screenshot fallback timed out')); }, 10_000);
+      let msgId = 0;
+      const send = (method: string, params?: any) => { const id = ++msgId; ws.send(JSON.stringify({ id, method, params })); return id; };
+      ws.onopen = () => { send('Page.enable'); };
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data as string);
+        if (msg.id === 1) { send('Page.captureScreenshot', { format: options.format ?? 'jpeg', quality: options.quality ?? 80, captureBeyondViewport: options.fullPage ?? false }); }
+        else if (msg.id === 2) { clearTimeout(timeout); ws.close(); if (msg.error) reject(new Error('CDP: ' + msg.error.message)); else resolve(msg.result); }
+      };
+      ws.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket error')); };
+    });
+  }
+
  private async ensureRuntimeEnabled(): Promise<void> {
    if (this._ctxEventSub) return;
    const { sessionId, session } = await this._browserSession.pages.getSession(this.pageId);

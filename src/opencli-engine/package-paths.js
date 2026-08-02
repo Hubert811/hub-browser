@@ -3,8 +3,15 @@ import * as path from 'node:path';
 export function findPackageRoot(startFile, fileExists = fs.existsSync) {
     let dir = path.dirname(startFile);
     while (true) {
-        if (fileExists(path.join(dir, 'package.json')))
-            return dir;
+        const pkgPath = path.join(dir, 'package.json');
+        if (fileExists(pkgPath)) {
+            // hub-browser: skip nested package.json (e.g. src/opencli-engine/package.json)
+            // Continue up to the project root marked with "hubBrowserRoot": true
+            try {
+                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+                if (pkg.hubBrowserRoot) return dir;
+            } catch { /* not a valid json, return this dir */ return dir; }
+        }
         const parent = path.dirname(dir);
         if (parent === dir) {
             throw new Error(`Could not find package.json above ${startFile}`);

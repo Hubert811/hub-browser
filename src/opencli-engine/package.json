@@ -18,5 +18,6 @@
     "./download/media-download": "./download/media-download.js",
     "./download/progress": "./download/progress.js",
     "./pipeline": "./pipeline/index.js"
-  }
+  },
+  "main": "./main.js"
 }
