@@ -29,7 +29,7 @@ function parseStrategy(rawStrategy, fallback = Strategy.COOKIE) {
     const key = rawStrategy.toUpperCase();
     return Strategy[key] ?? fallback;
 }
-const PACKAGE_ROOT = findPackageRoot(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 /**
  * Ensure ~/.opencli/node_modules/@jackwener/opencli symlink exists so that
  * user CLIs in ~/.opencli/clis/ can `import { cli } from '@jackwener/opencli/registry'`.
