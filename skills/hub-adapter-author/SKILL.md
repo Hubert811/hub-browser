@@ -12,7 +12,7 @@ allowed-tools: Bash(hub:*), Read, Edit, Write, Grep
 
 调试浏览器型 adapter 时，优先直接带上 `--trace retain-on-failure --window foreground`（`--window` 是 `hub browser` 的全局选项）。`--trace retain-on-failure` 失败时落 trace artifact，`summary.md` 是失败/成功复盘入口；session 的 tab 在 `hub browser <session> close` 之前保留，配合 `--window foreground` 方便核对最终页面状态。
 
-> hub 直连 CDP，没有 doctor。环境自检 = 起一个 browser session 跑 `hub browser <s> state`（能出 URL/title 即连通），或检查 `BROWSEROS_CDP_PORT` 指向的浏览器端口可达。`hub browser bind/unbind` 在 hub 中不可用（直接报错），不需要也不能用它绑定页面——session 本身就是页面容器。
+> hub 直连 CDP，没有 doctor。环境自检 = 起一个 browser session 跑 `hub browser <s> state`（能出 URL/title 即连通），或检查 `BROWSEROS_CDP_PORT` 指向的浏览器端口可达。端口一般不用手动设（v0.1.1 起自动探测：`BROWSEROS_CDP_PORT` → BrowserClaw 配置 `ports.cdp` → 9005，决策 D7）。`hub browser bind/unbind` 在 hub 中不可用（直接报错），不需要也不能用它绑定页面——session 本身就是页面容器。
 
 ---
 

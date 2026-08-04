@@ -16,8 +16,8 @@ allowed-tools: Bash(hub:*), Read, Edit, Write
 
 hub 直连 Chrome 的 CDP（BrowserOS 核心），**没有 extension / daemon 桥**，也没有 `doctor` 命令。浏览器连不上时：
 
-- 检查 `BROWSEROS_CDP_PORT` 指向的调试端口是否可达、Chrome 是否在运行。
-- `hub browser <session> state` 本身就是连通性探针：能返回页面状态 = 桥是通的。
+- **端口一般不用手动设**（v0.1.1 起自动探测，决策 D7）：解析顺序 `BROWSEROS_CDP_PORT` → BrowserClaw `config.json` 的 `ports.cdp` → fallback 9005；显式覆盖就设 `BROWSEROS_CDP_PORT`。
+- `hub browser <session> state` 本身就是连通性探针 + 端口探针：能返回页面状态 = 桥是通的。
 - 常见失败：Chrome 没启动、调试端口被 1Password 等占用 CDP 的程序挡住。`hub browser <session> state` 的错误 envelope 会告诉你是哪一种。
 
 ---
@@ -26,7 +26,8 @@ hub 直连 Chrome 的 CDP（BrowserOS 核心），**没有 extension / daemon �
 
 - `hub browser *` 命令在 `browser` 后紧跟一个 `<session>` 位置参数。多步流程复用同一个 session 名；要隔离并行的浏览器工作就用不同的名字。
 - 多命令或有人参与节奏的流程，用一个稳定的 session 名。例：`hub browser fb-yaya-warmup open https://example.com`，之后继续复用 `hub browser fb-yaya-warmup state` / `read` / `click` 等。
-- owned session 在调用之间保持 tab lease；用完用 `hub browser <session> close` 释放，或等空闲超时。
+- owned session 在调用之间保持 tab lease；用完用 `hub browser <session> close` 释放，或等 daemon 空闲超时（默认 5 分钟）自动退出。
+- session 指向的 tab 失效时**当前实现静默降级、无 stderr 警告**——见下方「session ↔ tab ↔ space 关系」的失效自愈一节，写操作前先用 `tab list` 确认。
 - `--window foreground|background` 决定 hub 是创建/聚焦前台窗口，还是用后台窗口跑 owned session（所有 `hub browser` 子命令都接受该选项）。
 
 ### Bind 不可用
@@ -36,6 +37,40 @@ hub 直连 Chrome 的 CDP（BrowserOS 核心），**没有 extension / daemon �
 - 开页用 `hub browser <session> open <url>`，由 hub 管理 tab 生命周期（`tab new` / `tab select` / `tab close` 都可用）。
 - 需要登录/SSO 的站点：在浏览器里先登录一次，空间共享 cookie/localStorage，后续 `hub browser <session> open` 继承登录态，无需重登。
 - 想复用一个你手动定位好的页面：开在 space 里，然后 `hub browser <session> tab list` 找到它再继续；hub 不会替你关用户窗口。
+
+---
+
+## session ↔ tab ↔ space 关系
+
+三者是不同层的概念，不要混用：
+
+| 概念 | 层级 | 作用 | 说明 |
+|---|---|---|---|
+| **space** | 归属容器（账本，权威） | 决定「哪些 tab 归你、tab group 双向同步」 | `hub space list/current`；MCP `space.*` |
+| **session** | CLI 命令间的记忆指针 | 记住「这个 CLI 任务用的默认 tab」 | 仅 CLI：`hub browser <session> …`；**MCP 路径没有 session** |
+| **tab** | 浏览器真实页面 | 实际操作的页面 | 1 space → N tab；1 tab → 1 space |
+
+- **1 session → 1 tab**：`hub browser <session> tab select <targetId>` 把该 tab 记为 session 的默认 tab（状态落在 `~/.hub/cache/browser-state/`，默认根 `~/.hub`、`BROWSEROS_DIR` 可覆盖；文件内容为 `{defaultPage: <targetId>, updatedAt}`）。`tab select` 同时把该 tab 激活为浏览器活跃 tab，后续 `hub browser <session> *` 经 daemon 连到活跃 tab，实现跨命令连续。
+- **session 归 space 管**：session 指向的 tab 必须属于当前 space（D3/D4 guard）——`tab select` / `tab close` 对非本 space 的 tab 拒绝（`page not in your space`）。
+- **MCP 无 session**：MCP 直接 `space.list_tabs` 拿 pageId，再以 `page: <id>` 传给 snapshot/act/read 等——不需要 session 名。
+
+### 失效自愈 + 静默降级（⚠️ 必读）
+
+session 指向的 tab 被关（MCP `space.close_tab` / `space close` / 人类关 tab / 浏览器重启）后，再用同一个 session 跑命令**不会报错**：saved 分支检测到目标 tab 不在会话里 → 自动删除 session 状态 → 落到**当前活跃 tab** 继续。
+
+- **当前实现是静默降级，没有 stderr 警告。**
+- ⚠️ 风险：你可能操作的是「人类刚切到的活跃 tab」，而不是你记忆里的页面——写操作（click/type/fill/close 等）前先 `hub browser <session> tab list` 确认目标 tab；确认错了就 `tab select <targetId>` 显式切回。
+
+### 人类拖入 tab → 连 session
+
+人类把 tab 拖进 space 的 tab group 后，space 会自动认领该 tab（D5 lazy sync：拖入归属、拖出移除）。CLI 要把它接进 session 步骤流，必须显式 `tab select`：
+
+```bash
+hub browser <session> tab list            # 找到人类拖入的 tab（page / targetId）
+hub browser <session> tab select <targetId>   # 显式设为 session 默认 tab，再继续 state/click/...
+```
+
+MCP 不需要 session：`space.list_tabs` 拿 pageId 后直接操作。
 
 ---
 
@@ -344,7 +379,7 @@ hub browser mercury get text 7        # 验证可见选中 label
 决定某站点 AX ref 是否更优时，收集指标但不分享页面内容：
 
 ```bash
-hub browser compare state --compare-sources
+hub browser <session> state --compare-sources
 ```
 
 汇报 `sources.dom.refs`、`sources.ax.refs`、`frame_sections`、`approx_tokens`、`elapsed_ms` 和各自的 `error`。想论证 AX 应该成为某站默认前，先做这个。

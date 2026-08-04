@@ -27,13 +27,13 @@ npm install -g @hub/browser
 
 ```bash
 cd hub-browser
-npm pack          # 生成 hub-browser-0.1.0.tgz（自动跑 prepack 构建）
+npm pack          # 生成 hub-browser-<version>.tgz（当前 0.1.1，自动跑 prepack 构建）
 ```
 
-把 `hub-browser-0.1.0.tgz` 拷贝到目标机器，然后：
+把生成的 `hub-browser-<version>.tgz`（如 `hub-browser-0.1.1.tgz`）拷贝到目标机器，然后：
 
 ```bash
-npm install -g ./hub-browser-0.1.0.tgz
+npm install -g ./hub-browser-<version>.tgz
 ```
 
 安装后 `hub` 即注册到 PATH。tgz 里包含完整运行时（`dist/` 编译产物 + `clis/` 适配器 + manifest），postinstall 会自动建立包内符号链接，无需额外步骤。
@@ -68,8 +68,8 @@ npm install -g @hub/browser --registry http://your-verdaccio:4873
 ## 快速开始
 
 ```bash
-# 1. 浏览器依赖：确认 CDP 端口可达（默认 9110，BrowserClaw）
-curl http://127.0.0.1:9110/json/version
+# 1. 浏览器依赖：确认 CDP 端口可达（v0.1.1 起自动探测，无需手动设端口）
+curl http://127.0.0.1:9110/json/version   # 本机 BrowserClaw 的 CDP 端口；见「浏览器依赖」
 
 # 2. 看有哪些命令 / 站点
 hub list -f json          # 全部命令（JSON，agent 友好）
@@ -90,7 +90,7 @@ hub space close <id>       # 默认关掉该 space 全部 tab
 ### 作为 MCP server 接入 agent
 
 ```bash
-BROWSEROS_CDP_PORT=9110 hub --mcp
+BROWSEROS_CDP_PORT=9110 hub --mcp   # 端口可省略：v0.1.1 起自动探测（见「浏览器依赖」）
 ```
 
 外部 agent 以 stdio 连入，获得 `space.*` / `tabs` / `snapshot` / `act` / `read` / `grep` / `diff` / `evaluate` / `download` / `upload` / `pdf` / `screenshot` / `tab_groups` / `windows` / `history` 等工具。
@@ -101,13 +101,14 @@ BROWSEROS_CDP_PORT=9110 hub --mcp
 
 | 变量 | 默认 | 用途 |
 |---|---|---|
-| `BROWSEROS_CDP_PORT` | `9005` | 浏览器 CDP 调试端口（BrowserClaw 默认 9110） |
+| `BROWSEROS_CDP_PORT` | 自动探测（env → BrowserClaw 配置 `ports.cdp` → `9005`） | 浏览器 CDP 调试端口显式覆盖；不设时自动读 BrowserClaw 配置（v0.1.1 起，决策 D7） |
 | `BROWSEROS_DIR` | `~/.hub` | 用户数据根目录（space 账本、缓存、适配器等） |
 | `HUB_DAEMON_PORT` | `9300` | hub daemon 端口（CLI 转发给常驻 daemon） |
 | `HUB_SPACES_FILE` | `$BROWSEROS_DIR/state/hub-spaces.json` | space 账本文件覆盖 |
 | `HUB_AGENT_ID` | `cli:local` | 身份标识（多 agent 并发时各自唯一） |
+| `BROWSERCLAW_DIR` | — | 覆盖 BrowserClaw 配置目录（用于 `ports.cdp` 自动探测；默认 macOS `~/Library/Application Support/BrowserClaw`、Windows `%APPDATA%/BrowserClaw`、Linux `~/.config/BrowserClaw`） |
 | `HUB_MCP` / `--mcp` | — | 以 stdio MCP server 模式运行 |
-| `OPENCLI_BROWSER` | — | 浏览器后端（`claw` = BrowserClaw） |
+| `OPENCLI_BROWSER` | `claw`（hub 强制） | 浏览器后端，由 `bin/hub.mjs` 固定设为 `claw`（BrowserClaw），不是用户配置项 |
 
 ---
 
@@ -115,8 +116,14 @@ BROWSEROS_CDP_PORT=9110 hub --mcp
 
 `hub` 本身**不含浏览器**——它通过 CDP 驱动一个已运行的浏览器。推荐：
 
-- **BrowserClaw**（融合目标，默认）：启动后 CDP 端口 9110，`BROWSEROS_CDP_PORT=9110`；
+- **BrowserClaw**（融合目标，默认）：启动后 CDP 端口由 BrowserClaw 配置决定（本机通常 9110）；
 - 任意支持 CDP 的 Chrome / Chromium：用 `--remote-debugging-port` 启动后把 `BROWSEROS_CDP_PORT` 指过去。
+
+**CDP 端口自动探测（v0.1.1 起，决策 D7）**：不再需要手动设端口，解析顺序：
+
+1. `BROWSEROS_CDP_PORT` 环境变量（显式覆盖，最高优先）；
+2. BrowserClaw `config.json` 的 `ports.cdp`——macOS `~/Library/Application Support/BrowserClaw/.browseros/config.json`、Windows `%APPDATA%/BrowserClaw/.browseros/config.json`、Linux `~/.config/BrowserClaw/.browseros/config.json`；`BROWSERCLAW_DIR` 可覆盖整个配置目录；dev 变体 `.browseros-dev` 优先探测；结果进程内缓存，不重复读盘；
+3. 都读不到 → fallback `9005`（v0.1.1 之前的旧默认）。
 
 登录态：浏览器里登录过的站点（zhihu / bilibili / …），`hub` 直接继承 cookie，无需重复登录。
 
@@ -133,7 +140,7 @@ BROWSEROS_CDP_PORT=9110 hub --mcp
 
 ```bash
 hub space create "搜索任务"
-hub space list_tabs <id>      # 看 space 内 tab
+hub browser <session> tab list   # 看 space 内 tab（CLI 没有 `space list_tabs`；等价物是 `browser tab list`）
 hub space close <id>          # 关闭 space 及其全部 tab
 hub space handoff <id>        # 交给用户接管（agent 被拒）
 hub space takeover <id>       # 用户确认后取回
@@ -150,8 +157,14 @@ bun test src/browser-mcp/src src/space tests/*.test.ts
 bun run typecheck
 ```
 
-- `vendor/` 为只读 submodule（BrowserOS 依赖源码），发布时编译进 `dist/vendor/`。
-- 发布：`npm publish --access public`（已配置 `prepack` 自动构建、`files` 白名单、`engines.node>=20`）。
+### 从源码构建 / 发布（npm 包，决策 D6）
+
+- `bun run build`（等价 `npm run build`；脚本 `scripts/build-dist.mjs`，内部用 bun）把 TS 源码 + `vendor/` 三包编译进 `dist/`；`npm pack` 前 `prepack` 会自动跑构建。
+- `npm pack` 生成 `hub-browser-<version>.tgz`，内容由 `package.json` 的 `files` 白名单控制（`bin/`、`dist/`、`clis/`、`cli-manifest.json`、`scripts/postinstall.mjs`）。
+- `npm install -g <tgz>` 时 postinstall（`scripts/postinstall.mjs`）自动建包内符号链接（`@jackwener/opencli` → 包内引擎、`@browseros/*` → 包内 vendor），无需额外步骤。
+- 发布：`npm publish --access public`（`publishConfig.access: public` 已配置；`engines.node >= 20`）。
+
+- `vendor/` 为只读 submodule（BrowserOS 依赖源码），发布时编译进 `dist/vendor/`（见上方「从源码构建 / 发布」）。
 
 ---
 

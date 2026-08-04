@@ -40,6 +40,7 @@ hub-browser 的核心前提：**没有 space 就没有页面操作**。所有 ta
 - **tab group 是 space 的 UI 呈现，且双向同步**：space 自动投影成浏览器 tab group；人类把 tab 拖进组 = 归属该 space，拖出组 = 从账本移除。space 边界是动态的，以 `space.list_tabs` 的实时结果为准。
 - 关掉 space 的全部 tab 等价于关掉 space（`keep:false` 语义）。
 - space 被用户持有（handoff 后）时，agent 的页面操作报 `user is controlling`：停下、问用户，确认后再 `space.takeover {confirmed:true}`。
+- CLI 多步流程用 `<session>` 串步骤（`hub browser <session> …`）：session 是 CLI 命令间的默认 tab 指针，**MCP 路径没有 session**。CLI 与 MCP 的关系、失效自愈与静默降级见 `hub-browser-browser` 的「session ↔ tab ↔ space 关系」节。
 
 ## Tab 卫生纪律（4 条，必须遵守）
 
