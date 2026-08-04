@@ -373,6 +373,10 @@ function loadBrowserTargetState(scope) {
         return null;
     }
 }
+// Scope contract: `scope` is the USER SESSION name (the `hub browser <session>
+// ...` positional / internal --session), which is the ONLY key getBrowserPage()
+// reads through resolveStoredBrowserTarget(). It must never be a page/CDP
+// session like `page-<pageId>` — getPageScope(page) is not interchangeable here.
 function saveBrowserTargetState(defaultPage, scope) {
     const target = getBrowserTargetStatePath(scope);
     if (!defaultPage) {
@@ -502,6 +506,9 @@ function getPageSession(page) {
         return session.trim();
     throw new Error('Browser page is missing a session');
 }
+// The page/CDP session (`page-<pageId>`). Used only for per-page concerns
+// (sitemap-hint dedup, `session:` display). NOT the browser-target-state key —
+// that file must be keyed by the user session name (see saveBrowserTargetState).
 function getPageScope(page) {
     return getPageSession(page);
 }
@@ -883,7 +890,10 @@ Examples:
                         : getBrowserSession(command));
                 const windowMode = getBrowserWindowMode(command, 'foreground');
                 page = await getBrowserPage(session, targetPage, { windowMode });
-                await fn(page, ...args);
+                // Thread the resolved user <session> name through to the action callback so
+                // state-writing commands can key the browser-target-state file by the SAME
+                // session name getBrowserPage() reads from (not the page/CDP session).
+                await fn(page, ...args, session);
             }
             catch (err) {
                 if (err instanceof BrowserConnectError) {
@@ -1086,7 +1096,7 @@ Examples:
     addBrowserTabOption(browserTab.command('select')
         .argument('[targetId]', 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"')
         .description('Select a tab by target ID and make it the default browser tab'))
-        .action(browserAction(async (page, targetId, opts) => {
+        .action(browserAction(async (page, targetId, opts, command, session) => {
         // D3 (2026-08-03): space is the precondition — reject before resolving
         // the target so the no-space hint is always the surfaced error.
         const { space } = await currentSpaceForBrowser();
@@ -1101,13 +1111,18 @@ Examples:
         // selecting another agent's tab is rejected.
         await assertTabInCurrentSpace(page, resolvedTarget);
         await page.selectTab(resolvedTarget);
-        saveBrowserTargetState(resolvedTarget, getPageScope(page));
+        // Persist the default tab under the USER SESSION name (`<session>.json`),
+        // the same key getBrowserPage() reads via resolveStoredBrowserTarget().
+        // getPageScope(page) is the CDP/page session (`page-<pageId>`) and is
+        // never read by the restore path — using it here breaks cross-command
+        // default-tab continuity (audit: session 落盘键不一致).
+        saveBrowserTargetState(resolvedTarget, session);
         console.log(JSON.stringify({ selected: resolvedTarget }, null, 2));
     }));
     addBrowserTabOption(browserTab.command('close')
         .argument('[targetId]', 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"')
         .description('Close a tab by target ID'))
-        .action(browserAction(async (page, targetId, opts) => {
+        .action(browserAction(async (page, targetId, opts, command, session) => {
         // D3 (2026-08-03): space is the precondition — reject before resolving
         // the target so the no-space hint is always the surfaced error.
         const { space } = await currentSpaceForBrowser();
@@ -1122,7 +1137,7 @@ Examples:
             throw new Error('Target tab required. Pass it as an argument or --tab <targetId>.');
         }
         const validatedTarget = await resolveBrowserTargetInSession(page, resolvedTarget, {
-            scope: getPageScope(page),
+            scope: session,
             source: 'explicit',
         });
         if (!validatedTarget) {
@@ -1137,7 +1152,10 @@ Examples:
             await assertTabInCurrentSpace(page, validatedTarget);
             await page.closeTab(validatedTarget);
         }
-        const scope = getPageScope(page);
+        // The default-tab state is keyed by the USER SESSION name (same key
+        // getBrowserPage() reads); clear it only when the closed tab was the
+        // session's saved default.
+        const scope = session;
         if (loadBrowserTargetState(scope)?.defaultPage === validatedTarget) {
             saveBrowserTargetState(undefined, scope);
         }
