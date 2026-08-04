@@ -44,6 +44,12 @@ async function test1_cdpConnect(): Promise<void> {
       cdpEndpoint: `http://127.0.0.1:${process.env.BROWSEROS_CDP_PORT ?? 9110}`,
     }) as UnifiedPage;
 
+    // Run every phase2a pass on a FRESH tab: a tab that has accumulated many
+    // navigations/Input operations can get its Page.captureScreenshot wedged in
+    // this BrowserClaw/Chromium build (per-tab, persistent, stochastic — fresh
+    // tabs never fail). A fresh tab per run keeps the test deterministic.
+    await page.newTab('about:blank');
+
     const tabs = await page.tabs();
     const tabCount = Array.isArray(tabs) ? tabs.length : 0;
     record('CDP 连接 + Tab 列表', tabCount > 0, `连接成功, ${tabCount} 个 tab`);
@@ -396,7 +402,12 @@ async function main(): Promise<void> {
   await test11_networkCapture();
   await test12_diff();
 
-  // Cleanup
+  // Cleanup: close the run's tab (avoid tab accumulation; fresh-tab isolation)
+  try {
+    await page?.closeTab().catch(() => {});
+  } catch {
+    // ignore
+  }
   try {
     await factory?.close();
   } catch {

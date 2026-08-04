@@ -3,6 +3,7 @@
 > 状态：⬜ 未开始
 > 预估：5-7 天
 > 依赖：Phase 3 + Phase 5 完成
+> 注：Phase 7（Space 浏览器 UI）依赖本阶段的构建产物，其 UI 补丁在本阶段构建管线中迭代（可与 5.4 补丁同批次）。
 
 ## 目标
 
@@ -91,8 +92,10 @@ browseros apply --chromium-src ~/work/chromium/src
 
 这会把 `chromium_patches/` 里的所有补丁打到 Chromium 源码上，包括：
 - BrowserClaw 原有补丁（server/CDP 域/品牌/onboarding 等）
-- 我们 Phase 3 加的 TaskSpace CDP 域
-- 我们 Phase 5 加的 Input 拦截
+- （可选）Phase 5.4 的真隔离补丁（若启用）
+- （可选）Phase 7 的 Space UI 补丁（若已开发）
+
+> 注：Phase 3（空间分配）是纯客户端实现，**不产生 Chromium 补丁**。Phase 5 的虚拟指针拦截已暂缓，不在此列。
 
 ### 6.5 构建
 
@@ -248,6 +251,80 @@ browseros dev extract --file path/to/modified/file.cc
 
 **注意**：统一前要确认 TS 版和 JS 版没有实质性差异（除了类型注解）。可以用 `diff` 逐个比对。
 
+## 6.10 统一 MCP 路径与 OpenCLI 路径的网页操作逻辑
+
+> 来源：Phase 2.5 完成后的架构审查
+
+**现状**：hub-browser 有两条网页操作路径，底层 CDP 连接相同，但网页操作逻辑不同：
+
+| | MCP 路径（原有） | OpenCLI 路径（融合后） |
+|---|---|---|
+| **入口** | Agent 扩展 → `/chat` 或外部 Agent → `/mcp` | `hub.mjs` → OpenCLI engine |
+| **网页操作层** | `browser-mcp` 工具 → `browser-core` Observer/Input | `UnifiedPage`（继承 OpenCLI BasePage）|
+| **快照** | `Observer.snapshot()` → AX Tree + `eN` ref | `BasePage.snapshot()` → DOM + AX Tree，输出 `@N`/`eN` 双 ref |
+| **点击/填充** | `Input` 类 → CDP `Input.dispatchMouseEvent` | `BasePage` → `Runtime.evaluate` 执行页面内 JS |
+| **Visual Ref** | `screenshot-overlay.ts` + `screenshot-geometry.ts` | `UnifiedPage.annotatedScreenshot()` → `DOM.getBoxModel` 并行取坐标 |
+| **Ref 解析** | `Observer.resolveRef` → `backendNodeId` + `(frameId, role, name, nth)` | `target-resolver` 三级降级 → `backendNodeId` → `fingerprint` → `reidentified` |
+
+两条路径各自工作正常（Phase 2.5 已验证），但不统一：
+- 同一个 `e5` ref 在两条路径里的解析行为可能有细微差异
+- Agent 扩展（`apps/app`）和外部 MCP Agent 走的是 `browser-mcp` 原有代码，不走 `UnifiedPage`
+- 维护两套网页操作逻辑增加长期维护成本
+
+**统一方案**：把 `browser-mcp` 的工具 handler 从调用 `browser-core` 的 `Observer`/`Input` 改为调用 `UnifiedPage` 的方法。`browser-mcp` 的工具定义、MCP 协议层、Zod schema 验证不动，只替换 handler 内部实现。
+
+**约束**：`browser-mcp` 在 `vendor/browseros/` git submodule 里（只读），不能直接修改。可选方案：
+
+- **方案 A（fork）**：像 OpenCLI 一样把 `browser-mcp` 拷贝到 `src/browser-mcp/`，在副本上改 handler。优点是改动直接；缺点是多维护一份 fork
+- **方案 B（适配器层）**：在 `src/` 下新建一个适配器，包装 `UnifiedPage` 使其满足 `browser-mcp` 的 `ToolContext.session` 接口。`browser-mcp` 通过依赖注入接收适配器，不改 vendored 代码。优点是不 fork；缺点是接口适配可能有摩擦
+- **方案 C（渐进式）**：先只统一核心工具（snapshot/act/click/fill），其余工具（tabs/windows/history/bookmarks/pdf/download/upload）暂保留 `browser-core` 实现，因为这些工具调的是 CDP 域而非网页操作层，不涉及两套逻辑分歧
+
+**建议**：方案 C（渐进式），先统一有分歧的核心工具，风险低且见效快。tabs/windows/history 等工具本来就没有两条路径分歧（都走 CDP 域），不需要统一。
+
+**影响范围**：
+- Agent 扩展（`apps/app`）通过 `/chat` 调用 `browser-mcp` → 统一后 Agent 扩展也走 `UnifiedPage` 逻辑
+- 外部 MCP Agent 通过 `/mcp` 调用 `browser-mcp` → 同上
+- OpenCLI 路径不变，本来就是 `UnifiedPage`
+
+**前置条件**：
+- Phase 2 + 2.5 完成（已完成）
+- 不阻塞 Phase 3/4/5，可与它们并行
+- 最终构建前完成，确保打包的浏览器只有一套网页操作逻辑
+
+**完成标志**：
+- [ ] 核心工具（snapshot/act/click/fill）的 handler 改为调用 `UnifiedPage`
+- [ ] Agent 扩展 `/chat` 路径验证通过
+- [ ] 外部 MCP `/mcp` 路径验证通过
+- [ ] OpenCLI 路径不受影响
+- [ ] 两条路径的 ref 解析行为一致（同一 ref 在两条路径点击同一元素）
+
 ## 实际进展
 
-（待填写）
+**状态：🟢 已按方案 A（fork）完成**
+
+### 6.10 完成情况（2026-08-02）
+- **Fork**：`browser-mcp` 完整拷贝到 `src/browser-mcp/`（package name `@hub/browser-mcp`，
+  已加入 root workspaces；vendor/ 未改动，submodule 保持干净）。
+- **统一**：`ToolContext` 由 `session: BrowserSession` 改为 `UnifiedPageProvider` +
+  `page`/`pageFor`（`UnifiedBrowserFactory.connect` 返回 `Promise<UnifiedPage>`）；
+  17 个工具 handler 全部改为调用 UnifiedPage（无直接映射的走 `page.cdp()`）。
+  UnifiedPage 新增 `selectOption(ref, value)`（AX ref + DOM marker 双路径）。
+- **入口**：`createBrowserMcpServer` 接受 `browser: UnifiedPageProvider`；新增
+  `bin/hub.mjs --mcp`（stdio MCP server）。
+- **验证**：fork typecheck + 32/32 单测（含 17 工具 structured-contract 契约测试）；
+  root typecheck 通过；`tests/test-phase2a.ts` e2e 24/24；连 CDP 9110 实机冒烟
+  （tabs/navigate/snapshot/read/evaluate/windows/history/diff）全通过；
+  stdio MCP client（`hub --mcp`）工具列表 + tabs/snapshot 调用通过。
+- **录屏回放不受影响**：rrweb 采集（claw-app content script）→ recordings ingest
+  （claw-server-rust）→ replay 链路全部在 vendor/ 内，未触碰；claw-server-rust
+  recordings 9/9、replay builder 5/5、claw-app replay 逻辑测试通过（React .tsx 组件
+  测试因本 checkout 未装 react 失败，为环境问题）。
+
+### 已添加的待办
+- 6.9 统一 TS/JS 重复文件（来自 Confucius 审查 P2）
+- 6.10 统一 MCP 路径与 OpenCLI 路径的网页操作逻辑（来自架构审查）— ✅ fork 完成，
+  Agent 扩展 `/chat` 与外部 MCP `/mcp` 消费方切换见 `src/browser-mcp/README.md`
+
+### 已完成的前置工作
+- hub-browser 命令功能验证完成，所有 P0 bug 修复
+- CDP 持久化 daemon 模式实现（6.10 的前置：两条路径共用同一个 CDP 连接）
