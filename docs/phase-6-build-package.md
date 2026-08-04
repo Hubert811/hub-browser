@@ -221,7 +221,7 @@ browseros dev extract --file path/to/modified/file.cc
 - [ ] OpenCLI 能连接并操作
 - [ ] 自定义 CDP 域可用
 - [ ] Task Space 可创建
-- [ ] 统一 TS/JS 双份文件（见 6.9）
+- [x] 统一 TS/JS 双份文件（见 6.9，2026-08-04）
 - [x] CLI 以 npm 包分发 ✅（D6：`@hub/browser`，`files` 白名单 + prepack/postinstall 自建符号链接，2026-08-04）
 - [x] CDP 端口自动探测 BrowserClaw 配置 ✅（D7：`BROWSEROS_CDP_PORT` → config `ports.cdp` → 9005，2026-08-04）
 
@@ -252,6 +252,12 @@ browseros dev extract --file path/to/modified/file.cc
 5. 之后只需维护 TS 版，JS 版自动生成
 
 **注意**：统一前要确认 TS 版和 JS 版没有实质性差异（除了类型注解）。可以用 `diff` 逐个比对。
+
+**实际落地（2026-08-04）**：✅ 完成。
+- 逐文件用 Bun transpiler 做去类型对比 + 导出集合核对：`compound / dom-snapshot / stealth / target-resolver / utils` 确认为**真重复**（JS=去类型 TS，无 JS 独有逻辑）→ 5 个 JS 改为薄重导出 `export * from '../../opencli/<name>.ts'`（与已完成的 `target-errors.js` 同款模式），净变化 +25 / -1991 行。
+- 构建：build-dist.mjs 把 `.ts` 改写为 `.js`，发布包 `dist/opencli-engine/browser/*.js` → `dist/opencli/*.js`，dev（bun）直接解析 `.ts`，双路径验证通过。
+- `errors.js` **保留**（审查误报）：它是 hub 简化 fork（`classifyBrowserError`/`isTransientBrowserError`/`formatBrowserConnectError`，imports `BrowserConnectError` from `../errors.js`），与 `src/opencli/errors.ts`（CliError/BrowserConnectError/EXIT_CODES）API 不同、独立演化，不是去类型副本。
+- 验证：304 pass / 0 fail（与基线一致，零回归）、typecheck 0 error、`bun run build` 成功、live 冒烟（`browser state`/`find` 走 compound/dom-snapshot 路径）正常、外部适配器 `@jackwener/opencli/browser/utils` 导出一致。
 
 ## 6.10 统一 MCP 路径与 OpenCLI 路径的网页操作逻辑
 
@@ -302,10 +308,10 @@ browseros dev extract --file path/to/modified/file.cc
 
 ## 实际进展
 
-**状态：⏳ 部分完成（2026-08-04：D6 npm 分发 ✅、D7 CDP 端口自动探测 ✅、6.10 核心统一 ✅；Chromium 构建未开始、6.9 未做）**
+**状态：⏳ 部分完成（2026-08-04：D6 npm 分发 ✅、D7 CDP 端口自动探测 ✅、6.9 重复文件统一 ✅、6.10 核心统一 ✅；Chromium 构建未开始）**
 
 ### 已添加的待办
-- 6.9 统一 TS/JS 重复文件（来自 Confucius 审查 P2）——**未做**：`src/opencli-engine/browser/` 的 7 个 JS 重复文件（compound/dom-snapshot/errors/stealth/target-errors/target-resolver/utils）仍在，未切到 `dist/opencli/*.js`
+- 6.9 统一 TS/JS 重复文件（来自 Confucius 审查 P2）——**✅ 已完成（2026-08-04）**：见下方 6.9 节更新
 - 6.10 统一 MCP 路径与 OpenCLI 路径的网页操作逻辑（来自架构审查）——**核心已落地**：`src/browser-mcp` fork 全部工具经 `UnifiedPage` 操作页面
 
 ### 已完成的前置工作
