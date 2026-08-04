@@ -5227,7 +5227,7 @@
     "name": "search",
     "description": "Search Booking.com hotels by destination and dates (server-rendered card scrape).",
     "access": "read",
-    "example": "opencli booking search Tokyo --checkin 2026-06-15 --checkout 2026-06-17 -f yaml",
+    "example": "hub booking search Tokyo --checkin 2026-06-15 --checkout 2026-06-17 -f yaml",
     "domain": "www.booking.com",
     "strategy": "public",
     "browser": true,
@@ -13734,7 +13734,7 @@
         "name": "model",
         "type": "string",
         "required": false,
-        "help": "Gemini model to use (e.g. \"2.5-flash\"). Use \"opencli gemini models\" to list available values."
+        "help": "Gemini model to use (e.g. \"2.5-flash\"). Use \"hub gemini models\" to list available values."
       },
       {
         "name": "timeout",
@@ -14114,7 +14114,7 @@
     "name": "add-circle",
     "description": "Create a circle by center+radius or center+point",
     "access": "write",
-    "example": "opencli geogebra add-circle --center A --radius 3",
+    "example": "hub geogebra add-circle --center A --radius 3",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14153,7 +14153,7 @@
     "name": "add-line",
     "description": "Create a line through two points or a segment between two points",
     "access": "write",
-    "example": "opencli geogebra add-line --points A,B --type segment",
+    "example": "hub geogebra add-line --points A,B --type segment",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14192,7 +14192,7 @@
     "name": "add-point",
     "description": "Create a point with given label and coordinates",
     "access": "write",
-    "example": "opencli geogebra add-point --name A --coords 1,2",
+    "example": "hub geogebra add-point --name A --coords 1,2",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14225,7 +14225,7 @@
     "name": "add-polygon",
     "description": "Create a polygon from a list of point labels",
     "access": "write",
-    "example": "opencli geogebra add-polygon --points A,B,C",
+    "example": "hub geogebra add-polygon --points A,B,C",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14251,7 +14251,7 @@
     "name": "eval",
     "description": "Execute one or more GeoGebra command strings (semicolon-separated)",
     "access": "write",
-    "example": "opencli geogebra eval \"A=(0,0);B=(4,0);c=Circle(A,B);d=Circle(B,A);C=Intersect(c,d,1);Polygon(A,B,C)\"",
+    "example": "hub geogebra eval \"A=(0,0);B=(4,0);c=Circle(A,B);d=Circle(B,A);C=Intersect(c,d,1);Polygon(A,B,C)\"",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14278,7 +14278,7 @@
     "name": "hexagon",
     "description": "Draw a regular hexagon centered at the origin",
     "access": "write",
-    "example": "opencli geogebra hexagon --size 3",
+    "example": "hub geogebra hexagon --size 3",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14305,7 +14305,7 @@
     "name": "info",
     "description": "Get detailed properties of a GeoGebra object",
     "access": "read",
-    "example": "opencli geogebra info --name A",
+    "example": "hub geogebra info --name A",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -14358,7 +14358,7 @@
     "name": "triangle",
     "description": "Draw an equilateral triangle from a horizontal base segment",
     "access": "write",
-    "example": "opencli geogebra triangle --size 4",
+    "example": "hub geogebra triangle --size 4",
     "domain": "www.geogebra.org",
     "strategy": "public",
     "browser": true,
@@ -15205,7 +15205,7 @@
     "name": "export",
     "description": "Export all visible Grok conversation history metadata",
     "access": "read",
-    "example": "opencli grok export -f yaml",
+    "example": "hub grok export -f yaml",
     "domain": "grok.com",
     "strategy": "cookie",
     "browser": true,
@@ -15243,7 +15243,7 @@
     "name": "export-all",
     "description": "Export Grok conversation history and each conversation transcript",
     "access": "read",
-    "example": "opencli grok export-all --limit 5 -f json",
+    "example": "hub grok export-all --limit 5 -f json",
     "domain": "grok.com",
     "strategy": "cookie",
     "browser": true,
@@ -16279,7 +16279,7 @@
     "name": "event-matches",
     "description": "Read visible HLTV stats match rows for a specific event",
     "access": "read",
-    "example": "opencli hltv event-matches 8301 --limit 10 -f json",
+    "example": "hub hltv event-matches 8301 --limit 10 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16321,7 +16321,7 @@
     "name": "match-map",
     "description": "Read a single HLTV mapstats page and return all player rows for that map",
     "access": "read",
-    "example": "opencli hltv match-map \"https://www.hltv.org/stats/matches/mapstatsid/231594/falcons-vs-natus-vincere\" -f json",
+    "example": "hub hltv match-map \"https://www.hltv.org/stats/matches/mapstatsid/231594/falcons-vs-natus-vincere\" -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16358,7 +16358,7 @@
     "name": "match-series",
     "description": "Expand an HLTV match or stats series into summary, map, and player rows",
     "access": "read",
-    "example": "opencli hltv match-series https://www.hltv.org/stats/matches/126993/spirit-vs-falcons -f json",
+    "example": "hub hltv match-series https://www.hltv.org/stats/matches/126993/spirit-vs-falcons -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16395,7 +16395,7 @@
     "name": "player-duel",
     "description": "Compare two HLTV players on shared maps, including direct kill matrix when available",
     "access": "read",
-    "example": "opencli hltv player-duel 19230/m0nesy 3741/niko --match https://www.hltv.org/stats/matches/mapstatsid/231594/falcons-vs-natus-vincere -f json",
+    "example": "hub hltv player-duel 19230/m0nesy 3741/niko --match https://www.hltv.org/stats/matches/mapstatsid/231594/falcons-vs-natus-vincere -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16523,7 +16523,7 @@
     "name": "player-form",
     "description": "Aggregate recent HLTV player maps into form summaries grouped by summary, map, and opponent",
     "access": "read",
-    "example": "opencli hltv player-form --player 19230/m0nesy --limit 30 -f json",
+    "example": "hub hltv player-form --player 19230/m0nesy --limit 30 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16609,7 +16609,7 @@
     "name": "player-map-pool",
     "description": "Aggregate a player matches page into per-map performance buckets",
     "access": "read",
-    "example": "opencli hltv player-map-pool --player 3741/niko --limit 50 -f json",
+    "example": "hub hltv player-map-pool --player 3741/niko --limit 50 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16702,7 +16702,7 @@
     "name": "player-matches",
     "description": "Read HLTV player match history from the stats Matches tab",
     "access": "read",
-    "example": "opencli hltv player-matches --player 3741/niko --limit 10 -f json",
+    "example": "hub hltv player-matches --player 3741/niko --limit 10 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16788,7 +16788,7 @@
     "name": "player-summary",
     "description": "Read an HLTV player summary page",
     "access": "read",
-    "example": "opencli hltv player-summary --player 3741/niko -f json",
+    "example": "hub hltv player-summary --player 3741/niko -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16825,7 +16825,7 @@
     "name": "player-teammate-impact",
     "description": "Compare playerA maps with and without playerB present in the scanned sample",
     "access": "read",
-    "example": "opencli hltv player-teammate-impact 3741/niko 19230/m0nesy --limit 50 -f json",
+    "example": "hub hltv player-teammate-impact 3741/niko 19230/m0nesy --limit 50 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -16924,7 +16924,7 @@
     "name": "player-vs-team",
     "description": "Filter a player matches page to maps played against a specific HLTV team",
     "access": "read",
-    "example": "opencli hltv player-vs-team 7020/spirit --player 3741/niko --limit 20 -f json",
+    "example": "hub hltv player-vs-team 7020/spirit --player 3741/niko --limit 20 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -17024,7 +17024,7 @@
     "name": "search",
     "description": "Search HLTV players, teams, events, and articles",
     "access": "read",
-    "example": "opencli hltv search niko --limit 10 -f json",
+    "example": "hub hltv search niko --limit 10 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -17064,7 +17064,7 @@
     "name": "team-map-pool",
     "description": "Read the visible HLTV team map-pool page with win rate, pick rate, and ban rate",
     "access": "read",
-    "example": "opencli hltv team-map-pool 11283/falcons -f json",
+    "example": "hub hltv team-map-pool 11283/falcons -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -17099,7 +17099,7 @@
     "name": "team-matches",
     "description": "Read recent HLTV team map results from the stats team matches page",
     "access": "read",
-    "example": "opencli hltv team-matches 6667/falcons --limit 10 -f json",
+    "example": "hub hltv team-matches 6667/falcons --limit 10 -f json",
     "domain": "www.hltv.org",
     "strategy": "ui",
     "browser": true,
@@ -24102,7 +24102,7 @@
     "name": "check-login",
     "description": "Open Mercury reimbursements and report whether the active browser profile is logged in",
     "access": "read",
-    "example": "opencli --profile <profile> mercury check-login -f json",
+    "example": "hub --profile <profile> mercury check-login -f json",
     "domain": "app.mercury.com",
     "strategy": "ui",
     "browser": true,
@@ -24127,7 +24127,7 @@
     "name": "reimbursement-draft",
     "description": "Create a Mercury reimbursement draft from a local receipt, correct OCR fields, and stop at Review",
     "access": "write",
-    "example": "opencli --profile <profile> mercury reimbursement-draft --receipt /tmp/receipt.png --amount 140.00 --currency CNY --date 2026-06-26 --merchant \"Example Merchant\" --category \"Marketing & Advertising\" --notes \"Example business purpose.\" -f json",
+    "example": "hub --profile <profile> mercury reimbursement-draft --receipt /tmp/receipt.png --amount 140.00 --currency CNY --date 2026-06-26 --merchant \"Example Merchant\" --category \"Marketing & Advertising\" --notes \"Example business purpose.\" -f json",
     "domain": "app.mercury.com",
     "strategy": "ui",
     "browser": true,
@@ -24213,7 +24213,7 @@
     "name": "reimbursement-plan",
     "description": "Validate Mercury reimbursement inputs and print the draft plan without opening a browser",
     "access": "read",
-    "example": "opencli mercury reimbursement-plan --receipt /tmp/receipt.png --amount 140.00 --currency CNY --date 2026-06-26 --merchant \"Example Merchant\" --category \"Marketing & Advertising\" --notes \"Example business purpose.\" -f json",
+    "example": "hub mercury reimbursement-plan --receipt /tmp/receipt.png --amount 140.00 --currency CNY --date 2026-06-26 --merchant \"Example Merchant\" --category \"Marketing & Advertising\" --notes \"Example business purpose.\" -f json",
     "strategy": "local",
     "browser": false,
     "args": [
@@ -35000,7 +35000,7 @@
     "name": "activity",
     "description": "Read the current Trae CN task/activity state, including in-progress steps when visible",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn activity --max-chars 1200 -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn activity --max-chars 1200 -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35044,7 +35044,7 @@
     "name": "approve",
     "description": "Approve visible Trae CN permission prompts such as terminal-run, high-risk command, or delete confirmations",
     "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn approve --approve-kinds terminal,delete -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn approve --approve-kinds terminal,delete -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35096,7 +35096,7 @@
     "name": "ask",
     "description": "Send a prompt to Trae CN, wait for the assistant result without treating approval cards as final, and return it",
     "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn ask \"请只回复 OK\" --timeout 120 -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn ask \"请只回复 OK\" --timeout 120 -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35173,7 +35173,7 @@
     "name": "export",
     "description": "Export the current Trae CN conversation to Markdown",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn export --limit 20 --output /tmp/trae-cn-export.md",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn export --limit 20 --output /tmp/trae-cn-export.md",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35207,7 +35207,7 @@
     "name": "model",
     "description": "Read the model label currently shown in the Trae CN chat input",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn model -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn model -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35227,7 +35227,7 @@
     "name": "new",
     "description": "Start a new Trae CN task in the current workspace, optionally sending the first prompt",
     "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn new \"请执行你的任务\" -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn new \"请执行你的任务\" -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35269,7 +35269,7 @@
     "name": "read",
     "description": "Read the current Trae CN chat conversation",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn read --limit 5 --max-chars 12000 -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn read --limit 5 --max-chars 12000 -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35307,7 +35307,7 @@
     "name": "screenshot",
     "description": "Capture a snapshot of the current Trae CN window (DOM + Accessibility tree)",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn screenshot --output /tmp/trae-cn-snapshot.txt",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn screenshot --output /tmp/trae-cn-snapshot.txt",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35333,7 +35333,7 @@
     "name": "select-model",
     "description": "Select a model in the current Trae CN chat input",
     "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn select-model \"GPT 5.4\" -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn select-model \"GPT 5.4\" -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35363,7 +35363,7 @@
     "name": "send",
     "description": "Send a prompt into the current Trae CN chat input",
     "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn send \"请执行你的任务\" -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn send \"请执行你的任务\" -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35391,7 +35391,7 @@
     "name": "setup",
     "description": "Show local setup commands for controlling Trae CN with OpenCLI",
     "access": "read",
-    "example": "opencli trae-cn setup -f table",
+    "example": "hub trae-cn setup -f table",
     "strategy": "local",
     "browser": false,
     "args": [],
@@ -35409,7 +35409,7 @@
     "name": "status",
     "description": "Check active CDP connection to Trae CN and summarize the current workspace/model",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn status -f json",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn status -f json",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -35434,7 +35434,7 @@
     "name": "targets",
     "description": "List Trae CN CDP targets and show which workspace/window is waiting",
     "access": "read",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 opencli trae-cn targets -f table",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 hub trae-cn targets -f table",
     "strategy": "local",
     "browser": false,
     "args": [
@@ -35483,7 +35483,7 @@
     "name": "watch",
     "description": "Sample Trae CN activity over time to monitor long-running tasks; optionally approve visible terminal/delete prompts",
     "access": "write",
-    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk opencli trae-cn watch --stream true --duration 120",
+    "example": "OPENCLI_CDP_ENDPOINT=http://127.0.0.1:39240 OPENCLI_CDP_TARGET=talk hub trae-cn watch --stream true --duration 120",
     "domain": "localhost",
     "strategy": "ui",
     "browser": true,
@@ -36536,7 +36536,7 @@
   {
     "site": "twitter",
     "name": "bookmark-folder",
-    "description": "Read the tweets inside a single Twitter/X bookmark folder. Get the folder id from `opencli twitter bookmark-folders`.",
+    "description": "Read the tweets inside a single Twitter/X bookmark folder. Get the folder id from `hub twitter bookmark-folders`.",
     "access": "read",
     "domain": "x.com",
     "strategy": "cookie",
@@ -36547,7 +36547,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Folder id from `opencli twitter bookmark-folders`."
+        "help": "Folder id from `hub twitter bookmark-folders`."
       },
       {
         "name": "limit",
@@ -37004,7 +37004,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Numeric ID of the list you own (e.g. from `opencli twitter lists`)"
+        "help": "Numeric ID of the list you own (e.g. from `hub twitter lists`)"
       },
       {
         "name": "username",
@@ -37040,7 +37040,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Numeric ID of the list you own (e.g. from `opencli twitter lists`)"
+        "help": "Numeric ID of the list you own (e.g. from `hub twitter lists`)"
       },
       {
         "name": "usernames",
@@ -37133,7 +37133,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Numeric ID of the list you own (e.g. from `opencli twitter lists`)"
+        "help": "Numeric ID of the list you own (e.g. from `hub twitter lists`)"
       },
       {
         "name": "confirm",
@@ -37176,7 +37176,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Numeric ID of the list you own (e.g. from `opencli twitter lists`)"
+        "help": "Numeric ID of the list you own (e.g. from `hub twitter lists`)"
       },
       {
         "name": "username",
@@ -37212,7 +37212,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Numeric ID of the list you own (e.g. from `opencli twitter lists`)"
+        "help": "Numeric ID of the list you own (e.g. from `hub twitter lists`)"
       },
       {
         "name": "usernames",
@@ -37262,7 +37262,7 @@
         "type": "string",
         "required": true,
         "positional": true,
-        "help": "Numeric ID of a Twitter/X list (e.g. from `opencli twitter lists`)"
+        "help": "Numeric ID of a Twitter/X list (e.g. from `hub twitter lists`)"
       },
       {
         "name": "limit",
@@ -41691,7 +41691,7 @@
         "type": "str",
         "required": true,
         "positional": true,
-        "help": "Draft id returned by `opencli xiaohongshu drafts`"
+        "help": "Draft id returned by `hub xiaohongshu drafts`"
       },
       {
         "name": "type",
@@ -41733,7 +41733,7 @@
         "type": "str",
         "required": true,
         "positional": true,
-        "help": "Draft id returned by `opencli xiaohongshu drafts`"
+        "help": "Draft id returned by `hub xiaohongshu drafts`"
       },
       {
         "name": "type",
@@ -42906,7 +42906,7 @@
         "type": "str",
         "required": true,
         "positional": true,
-        "help": "Image URL (upload via \"opencli yollomi upload\" first)"
+        "help": "Image URL (upload via \"hub yollomi upload\" first)"
       },
       {
         "name": "prompt",
@@ -42955,7 +42955,7 @@
         "type": "str",
         "required": true,
         "positional": true,
-        "help": "Input image URL (upload via \"opencli yollomi upload\" first)"
+        "help": "Input image URL (upload via \"hub yollomi upload\" first)"
       },
       {
         "name": "prompt",
@@ -43090,7 +43090,7 @@
         "name": "image",
         "type": "str",
         "required": false,
-        "help": "Input image URL for image-to-image (upload via \"opencli yollomi upload\" first)"
+        "help": "Input image URL for image-to-image (upload via \"hub yollomi upload\" first)"
       },
       {
         "name": "output",
@@ -43297,7 +43297,7 @@
         "name": "person",
         "type": "str",
         "required": true,
-        "help": "Person photo URL (upload via \"opencli yollomi upload\" first)"
+        "help": "Person photo URL (upload via \"hub yollomi upload\" first)"
       },
       {
         "name": "cloth",
