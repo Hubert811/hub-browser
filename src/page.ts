@@ -1,12 +1,45 @@
 import { BasePage } from './opencli/base-page.js';
 import { generateStealthJs } from './opencli/stealth.js';
+import { applyUserAgentOverride } from './opencli/ua-override.js';
 import type { BrowserSession } from '@browseros/browser-core';
+import type { ProtocolApi } from '@browseros/cdp-protocol/protocol-api';
 import type { CdpBackend } from '@browseros/browser-core';
 import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, SnapshotOptions } from './opencli/types.js';
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
 
+/**
+ * Serialize registry-mutating browser operations on one BrowserSession.
+ *
+ * Real-browser race (2026-08-03): `spaces.restore()` runs concurrently with
+ * the first tool call at hub.mjs startup. restore's live-tab list
+ * (`pages.list()`) can interleave with a tool's `newPage()` — the concurrent
+ * `PageManager.list()` picks up the just-created tab and assigns it a pageId,
+ * while `newPage()` assigns a second pageId for the same tab (duplicate
+ * targetId/tabId in the registry). Tools addressing either pageId then fail
+ * with "Page N has no attached session". Serializing every UnifiedPage
+ * registry operation (tabs/newTab/closeTab/selectTab) per session closes the
+ * race for all hub-browser paths (CLI, daemon, MCP, restore gateway).
+ */
+function serialOp<T>(session: unknown, fn: () => Promise<T>): Promise<T> {
+  const holder = session as { __hubOpChain?: Promise<unknown> }
+  const chain = holder.__hubOpChain ?? Promise.resolve()
+  const next = chain.then(fn, fn)
+  holder.__hubOpChain = next.catch(() => {})
+  return next
+}
+
 export class UnifiedPage extends BasePage {
  private _stealthInjected = false;
+  /**
+   * sessionId of the CDP page session that already received the full-Chrome
+   * UA override (Emulation.setUserAgentOverride is per-session). null until
+   * the override has been applied to the current session. Reset never happens
+   * manually: rebinding to another tab (selectTab/newTab/setActivePage) yields
+   * a different sessionId, so ensureUserAgentOverride() re-applies naturally.
+   */
+  private _uaOverrideSessionId: string | null = null;
+  /** Set when this tab's capture pipeline was detected wedged (screenshot hang). */
+  private _screenshotWedged = false;
  private _console: ConsoleCollector | null = null;
  private _network: NetworkCollector | null = null;
  private _executionContexts = new Map<string, number>();
@@ -25,6 +58,23 @@ private _ctxEventSub2: (() => void) | null = null;
   /** Stable string identity for cli.js getPageSession / getPageScope. */
   get session(): string {
     return `page-${this.pageId}`;
+  }
+
+  /**
+   * Ensure the full-Chrome UA override (Emulation.setUserAgentOverride) is
+   * applied to this page's current CDP session. The override is per-session,
+   * so we track the sessionId it was applied to: re-applying is skipped while
+   * the page keeps the same CDP session (idempotent), and a different
+   * sessionId (new tab / selectTab / setActivePage / re-attach) triggers a
+   * fresh apply. Failure to apply is best-effort (returns false) and retried
+   * on the next call — the caller's navigation proceeds regardless.
+   */
+  async ensureUserAgentOverride(): Promise<boolean> {
+    const { sessionId, session } = await this._browserSession.pages.getSession(this.pageId);
+    if (this._uaOverrideSessionId === sessionId) return true;
+    const applied = await applyUserAgentOverride(session);
+    if (applied) this._uaOverrideSessionId = sessionId;
+    return applied;
   }
   // ── evaluate (P0-3: two overloads + buildEvaluateExpression) ──
   async evaluate<T = unknown>(js: string): Promise<T>;
@@ -46,10 +96,20 @@ private _ctxEventSub2: (() => void) | null = null;
 
   // ── goto ──
 async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: number; allowBoundNavigation?: boolean }): Promise<void> {
+   // P2 (方案 1): ensure the full-Chrome UA override is active before the next
+   // document loads. Idempotent — a no-op while the page keeps the same CDP
+   // session (the override persists across same-session navigations), and only
+   // re-applies when this page rebinds to a new session (new tab / re-attach).
+   await this.ensureUserAgentOverride();
    await this._browserSession.nav(this.pageId).goto(url);
    this._lastUrl = url;
    // Clear stale refs from previous page (prevent cross-page silent mis-click)
    this.resetPageState();
+   // Navigation is not expected to reset a session-scoped emulation override,
+   // but re-ensure after the load so a freshly attached session (or a browser
+   // that did reset it) still carries the full-Chrome brand list for any
+   // in-page fetches (e.g. zhihu /api/v4/questions/{id}/answers).
+   await this.ensureUserAgentOverride();
    if (!this._stealthInjected) {
       await this.evaluate(generateStealthJs());
       this._stealthInjected = true;
@@ -88,6 +148,11 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     // P1 fix: Page.captureScreenshot can hang via browser-level CdpBackend (Bun WebSocket
     // issue with large responses on browser-level sessions). Try CdpBackend first (5s
     // timeout), then fall back to a direct page-level WebSocket connection.
+    // A/B verification (2026-08-03): retrying captureScreenshot on a wedged
+    // renderer does not help — the primary call stays pending in CdpBackend for
+    // up to CDP_REQUEST_TIMEOUT (60s), so extra attempts stack in-flight
+    // captures on the same session and add latency without recovery. Keep one
+    // clean primary attempt then one clean raw-WS fallback.
     const SCREENSHOT_TIMEOUT_MS = 5_000;
     let result: { data: string };
     try {
@@ -103,8 +168,22 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
       ]) as { data: string };
     } catch {
       // Fallback: direct page-level WebSocket (bypasses CdpBackend)
-      result = await this.screenshotViaRawWebSocket(options) as { data: string };
+      try {
+        result = await this.screenshotViaRawWebSocket(options) as { data: string };
+      } catch {
+        // Per-tab capture-pipeline wedge (verified 2026-08-03): Page.captureScreenshot
+        // hangs on BOTH paths once a tab has accumulated renderer state. Reload does
+        // not recover it; only a fresh tab does. Surface an actionable error instead
+        // of a bare timeout so agents know to open a new tab (space.open_tab / tabs new).
+        this._screenshotWedged = true;
+        throw new Error(
+          'Screenshot failed: this tab’s capture pipeline is wedged ' +
+          '(Page.captureScreenshot timed out on both the CDP session and the raw page WebSocket). ' +
+          'Reloading will not fix it — open a fresh tab (space.open_tab or tabs new) and retry.',
+        );
+      }
     }
+    this._screenshotWedged = false;
     if (overrideWidth !== undefined || overrideHeight !== undefined) {
       await this.cdp('Emulation.clearDeviceMetricsOverride', {});
     }
@@ -116,12 +195,49 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
   }
 
   // ── tabs / selectTab / newTab / closeTab ──
+
+  /**
+   * Foreground this tab in its window (browser-level Browser.activateTab).
+   *
+   * Real-browser quirk (2026-08-03): Chrome does not service
+   * `Input.dispatchMouseEvent` for a background/occluded tab — the renderer
+   * stays silent and the CDP call never resolves (act scroll/hover/click on a
+   * space.open_tab'd background tab hung for the full CDP request timeout).
+   * Activation is best-effort: dispatch proceeds even if it fails, matching
+   * the old foreground-tab behavior.
+   */
+  async activateTab(): Promise<void> {
+    try {
+      const tabId = this._browserSession.pages.getTabId(this.pageId)
+      if (tabId !== undefined) {
+        await this._browserSession.cdp('Browser.activateTab', { tabId })
+        return
+      }
+      const info = this._browserSession.pages.getInfo(
+        this.pageId,
+      ) as { targetId?: string } | undefined
+      if (info?.targetId) {
+        await this._browserSession.cdp('Browser.activateTab', {
+          targetId: info.targetId,
+        })
+      }
+    } catch {
+      // best-effort: continue with the dispatch
+    }
+  }
+
   async tabs(): Promise<unknown[]> {
-    const pages = await this._browserSession.pages.list();
-    return pages.map((p: any) => ({ ...p, page: p.targetId }));
+    return serialOp(this._browserSession, async () => {
+      const pages = await this._browserSession.pages.list();
+      return pages.map((p: any) => ({ ...p, page: p.targetId }));
+    })
   }
 
   async selectTab(target: number | string): Promise<void> {
+    return serialOp(this._browserSession, () => this._selectTabInner(target))
+  }
+
+  private async _selectTabInner(target: number | string): Promise<void> {
     const pages = await this._browserSession.pages.list();
     const page = typeof target === 'number'
       ? pages.find((p: any) => p.pageId === target)
@@ -132,6 +248,7 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     this.pageId = (page as any).pageId;
     this.resetPageState();
     this._stealthInjected = false;
+    this._screenshotWedged = false;
     this._console?.stop();
     this._console = null;
     await this._network?.stop();
@@ -140,13 +257,27 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     // Re-register stealth for the new tab's CDP session
     const { session } = await this._browserSession.pages.getSession(this.pageId);
     await session.Page.addScriptToEvaluateOnNewDocument({ source: generateStealthJs() });
+    // P2: the new tab has a fresh CDP session — apply the full-Chrome UA
+    // override (ensureUserAgentOverride sees a different sessionId).
+    await this.ensureUserAgentOverride();
   }
 
-  async newTab(url?: string): Promise<string | undefined> {
-    const newPageId = await this._browserSession.pages.newPage(url ?? 'about:blank');
+  async newTab(
+    url?: string,
+    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+  ): Promise<string | undefined> {
+    return serialOp(this._browserSession, () => this._newTabInner(url, opts))
+  }
+
+  private async _newTabInner(
+    url?: string,
+    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+  ): Promise<string | undefined> {
+    const newPageId = await this._browserSession.pages.newPage(url ?? 'about:blank', opts);
     this.pageId = newPageId;
     this.resetPageState();
     this._stealthInjected = false;
+    this._screenshotWedged = false;
     this._console?.stop();
     this._console = null;
     await this._network?.stop();
@@ -155,11 +286,18 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     // Register stealth for the new tab's CDP session
     const { session } = await this._browserSession.pages.getSession(this.pageId);
     await session.Page.addScriptToEvaluateOnNewDocument({ source: generateStealthJs() });
+    // P2: the new tab has a fresh CDP session — apply the full-Chrome UA
+    // override before its first document finishes loading.
+    await this.ensureUserAgentOverride();
     const info = this._browserSession.pages.getInfo(newPageId);
     return info?.targetId;
   }
 
   async closeTab(target?: number | string): Promise<void> {
+    return serialOp(this._browserSession, () => this._closeTabInner(target))
+  }
+
+  private async _closeTabInner(target?: number | string): Promise<void> {
     const pages = await this._browserSession.pages.list();
     let pageId: number | undefined;
     if (typeof target === 'number') {
@@ -178,6 +316,10 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
         this.pageId = (remaining[0] as any).pageId;
         this.resetPageState();
         this._stealthInjected = false;
+    this._screenshotWedged = false;
+        // P2: rebound to a remaining tab whose CDP session may not carry the
+        // full-Chrome UA override yet (idempotent per sessionId).
+        await this.ensureUserAgentOverride();
         this._console?.stop();
         this._console = null;
         await this._network?.stop();
@@ -233,6 +375,18 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     await this.cdp('Browser.closeTabGroup', { groupId });
   }
 
+  /** D5 (2026-08-03): move existing tabs into a tab group (space → group wiring). */
+  async addTabsToGroup(pages: number[], groupId: string): Promise<void> {
+    const allPages = await this._browserSession.pages.list();
+    const tabIds = pages.map(pid => {
+      const info = allPages.find((p: any) => p.pageId === pid);
+      if (!info) throw new Error(`Page ${pid} not found`);
+      return info.tabId;
+    });
+    await this.cdp('Browser.addTabsToGroup', { groupId, tabIds });
+  }
+
+
   // ── Window ──
   async windowList(): Promise<unknown[]> {
     const result = await this.cdp('Browser.getWindows');
@@ -263,6 +417,10 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     this.pageId = (match as any).pageId;
     this.resetPageState();
     this._stealthInjected = false;
+    this._screenshotWedged = false;
+    // P2: the newly-bound tab has its own CDP session — apply the full-Chrome
+    // UA override (idempotent per sessionId).
+    await this.ensureUserAgentOverride();
     this._console?.stop();
     this._console = null;
     await this._network?.stop();
@@ -305,13 +463,110 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     await session.Input.insertText({ text });
   }
 
+  /** Live CDP page session for event subscriptions (e.g. Page.downloadWillBegin). */
+  async pageSession(): Promise<ProtocolApi> {
+    const { session } = await this._browserSession.pages.getSession(this.pageId);
+    return session;
+  }
+
+  /** True when this tab's capture pipeline was detected wedged by a screenshot hang. */
+  isScreenshotWedged(): boolean {
+    return this._screenshotWedged;
+  }
+
+  /**
+   * Cheap capture-pipeline probe (TabFreshness canary, 2026-08-03).
+   *
+   * Runs `Page.captureScreenshot` with a tiny 16×16 clip (jpeg) so the probe
+   * exercises the exact pipeline that per-tab wedges hang — NOT just the main
+   * thread (Runtime.evaluate stays responsive on a wedged tab; only the
+   * capture pipeline is stuck). A healthy tab answers in a few ms; a wedged
+   * tab never answers and the call times out after `timeoutMs` (default
+   * 2500ms — well under the 5s real-screenshot budget).
+   *
+   * Returns the elapsed milliseconds on success. On timeout/failure the tab
+   * is marked wedged (same `_screenshotWedged` flag `screenshot()` uses) and
+   * an error is thrown — the caller decides hint vs auto-recycle.
+   */
+  async canaryCapture(timeoutMs: number = 2500): Promise<number> {
+    const started = Date.now();
+    try {
+      await Promise.race([
+        this.cdp('Page.captureScreenshot', {
+          format: 'jpeg',
+          quality: 60,
+          clip: { x: 0, y: 0, width: 16, height: 16, scale: 1 },
+        }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('timeout')), timeoutMs),
+        ),
+      ]);
+    } catch {
+      // Same wedge semantics as screenshot(): a canary timeout means this tab's
+      // capture pipeline is wedged (reload does not recover it — fresh tab only).
+      this._screenshotWedged = true;
+      throw new Error(
+        'Canary screenshot failed: this tab’s capture pipeline is wedged ' +
+          '(Page.captureScreenshot with a 16×16 clip timed out). ' +
+          'Reloading will not fix it — open a fresh tab (space.open_tab or tabs new) and retry.',
+      );
+    }
+    this._screenshotWedged = false;
+    return Date.now() - started;
+  }
+
+  // ── selectOption (6.10 fork: act select routes through UnifiedPage) ──
+  // Mirrors the click cascade: AX refs (eN, from MCP-style AX snapshots) resolve
+  // through backendNodeId first; OpenCLI numeric refs fall back to the DOM
+  // data-opencli-ref marker path.
+  async selectOption(ref: string, value: string): Promise<unknown> {
+    if (/^e?\d+$/.test(ref)) {
+      const entry = this._axRefs.get(ref);
+      if (entry?.backendNodeId != null) {
+        try {
+          const { session } = await this._browserSession.pages.getSession(this.pageId);
+          const resolved = await session.DOM.resolveNode({ backendNodeId: entry.backendNodeId });
+          const objectId = resolved.object?.objectId;
+          if (objectId) {
+            const SELECT_OPTION_FN = `function(val){
+  for(var i=0;i<this.options.length;i++){
+    if(this.options[i].value===val||this.options[i].textContent.trim()===val){
+      this.selectedIndex=i;
+      this.dispatchEvent(new Event('change',{bubbles:true}));
+      return this.options[i].textContent.trim();
+    }
+  }
+  return null;
+}`;
+            const r = await session.Runtime.callFunctionOn({
+              functionDeclaration: SELECT_OPTION_FN,
+              objectId,
+              returnByValue: true,
+              arguments: [{ value }],
+            });
+            if (r.result?.value) return r.result.value;
+          }
+        } catch { /* fall through to the DOM marker path */ }
+      }
+    }
+    const { resolveTargetJs, selectResolvedJs } = await import('./opencli/target-resolver.js');
+    const script = `
+      (() => {
+        const resolution = (${resolveTargetJs(ref)});
+        if (!resolution || !resolution.ok) return { error: resolution?.message ?? 'resolution failed' };
+        return (${selectResolvedJs(value)});
+      })()
+    `;
+    return this.evaluate(script);
+  }
+
   // ── handleJavaScriptDialog (P1-8) ──
   async handleJavaScriptDialog(accept: boolean, promptText?: string): Promise<void> {
     await this._browserSession.input(this.pageId).handleDialog(accept, promptText);
   }
 
  // ── snapshot (P2: opts.source routing) ──
-async snapshot(opts?: SnapshotOptions): Promise<unknown> {
+override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
   if (opts?.source === 'dom') {
     // Cap viewportExpand to avoid collecting too many elements on large pages
     const cappedOpts = { ...opts, viewportExpand: Math.min(opts?.viewportExpand ?? 2000, 1000) };
@@ -342,7 +597,7 @@ async snapshot(opts?: SnapshotOptions): Promise<unknown> {
   }
 
   // ── consoleMessages (event-bridge) ──
-  async consoleMessages(level: string = 'all'): Promise<unknown[]> {
+  override async consoleMessages(level: string = 'all'): Promise<unknown[]> {
     if (!this._console) {
       const { sessionId } = await this._browserSession.pages.getSession(this.pageId);
       this._console = new ConsoleCollector(this.cdpBackend, sessionId);
@@ -429,7 +684,7 @@ const wrapper = `(function() {
 
  // ── private helpers ──
  // 2b.2: UnifiedPage 覆写 annotatedScreenshot — visual ref overlay by coordinates
- async annotatedScreenshot(options: ScreenshotOptions = {}): Promise<string> {
+ override async annotatedScreenshot(options: ScreenshotOptions = {}): Promise<string> {
    const snapResult = await this._browserSession.observe(this.pageId).snapshot();
    this.populateAxRefs(snapResult.refs);
    const { session } = await this._browserSession.pages.getSession(this.pageId);
@@ -542,7 +797,7 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
      if (!info) return match;
      let desc = '';
      if (info.control === 'select') {
-       const opts = info.options?.slice(0, 5).map(o => o.label).join('/') ?? '';
+       const opts = info.options?.slice(0, 5).map((o: { label?: string }) => o.label).join('/') ?? '';
        desc = `select, ${info.options_total} options${info.multiple ? ' (multi)' : ''}, current: ${info.current || 'none'}${opts ? ', e.g. ' + opts : ''}`;
      } else if (info.control === 'file') {
        desc = `file${info.multiple ? ' (multi)' : ''}${info.accept ? ', accept: ' + info.accept : ''}`;

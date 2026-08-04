@@ -75,6 +75,10 @@ export function typeTextJs(ref: string, text: string): string {
         } else {
           el.value = ${safeText};
         }
+        // Vue/React controlled components cache the bound value on el._value; without
+        // it the native setter write does not trigger a reactive update. Best-effort:
+        // plain inputs have no _value, so this is harmless there.
+        el._value = ${safeText};
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }

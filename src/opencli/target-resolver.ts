@@ -187,7 +187,7 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
             ok: false,
             code: 'not_found',
             message: 'ref=' + ref + ' not found in DOM',
-            hint: 'The element may have been removed. Re-run \`opencli browser state\` to get a fresh snapshot.',
+            hint: 'The element may have been removed. Re-run \`hub browser state\` to get a fresh snapshot.',
           };
         }
 
@@ -224,7 +224,7 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
           code: 'stale_ref',
           message: 'ref=' + ref + ' was <' + fp.tag + '>' + (fp.text ? '"' + fp.text + '"' : '')
             + ' but now points to <' + liveFp.tag + '>' + (liveFp.text ? '"' + liveFp.text.slice(0, 30) + '"' : ''),
-          hint: 'The page has changed since the last snapshot. Re-run \`opencli browser state\` to refresh.',
+          hint: 'The page has changed since the last snapshot. Re-run \`hub browser state\` to refresh.',
         };
       }
 
@@ -247,7 +247,7 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
             ok: false,
             code: 'selector_not_found',
             message: 'CSS selector "' + ref + '" matched 0 elements',
-            hint: 'The element may not exist or may be hidden. Re-run \`opencli browser state\` to check, or use \`opencli browser find --css\` to explore candidates.',
+            hint: 'The element may not exist or may be hidden. Re-run \`hub browser state\` to check, or use \`hub browser find --css\` to explore candidates.',
             matches_n: 0,
           };
         }
@@ -280,7 +280,7 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
             ok: false,
             code: 'selector_ambiguous',
             message: 'CSS selector "' + ref + '" matched ' + matches.length + ' elements',
-            hint: 'Pass --nth <n> (0-based) to pick one, or use a more specific selector. Use \`opencli browser find --css\` to list all candidates.',
+            hint: 'Pass --nth <n> (0-based) to pick one, or use a more specific selector. Use \`hub browser find --css\` to list all candidates.',
             candidates: candidates,
             matches_n: matches.length,
           };
@@ -376,6 +376,10 @@ export function typeResolvedJs(text: string): string {
         } else {
           el.value = ${safeText};
         }
+        // Vue/React controlled components cache the bound value on el._value; without
+        // it the native setter write does not trigger a reactive update. Best-effort:
+        // plain inputs have no _value, so this is harmless there.
+        el._value = ${safeText};
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }

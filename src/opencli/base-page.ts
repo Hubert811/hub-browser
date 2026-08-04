@@ -709,7 +709,7 @@ export abstract class BasePage implements IPage {
       throw new TargetError({
         code: 'not_checkable',
         message: `Target "${ref}" is not a checkbox, radio, switch, or aria-checked control.`,
-        hint: 'Use `opencli browser state` or `browser find` to pick an input[type=checkbox], input[type=radio], or role=checkbox/switch target.',
+        hint: 'Use `hub browser state` or `browser find` to pick an input[type=checkbox], input[type=radio], or role=checkbox/switch target.',
       });
     }
     if (before.disabled) {
@@ -810,7 +810,7 @@ export abstract class BasePage implements IPage {
         throw new TargetError({
           code: 'not_file_input',
           message: `Target "${ref}" is not an input[type=file].`,
-          hint: 'Use `opencli browser find --css "input[type=file]"` or inspect `compound` output from browser state/find.',
+          hint: 'Use `hub browser find --css "input[type=file]"` or inspect `compound` output from browser state/find.',
         });
       }
       if (files.length > 1 && !info?.multiple) {
@@ -966,7 +966,7 @@ export abstract class BasePage implements IPage {
       throw new TargetError({
         code: 'not_editable',
         message: `Target "${ref}" is not a fillable input, textarea, or contenteditable element.`,
-        hint: 'Use `opencli browser state` to pick an editable target, or use `browser type` for keyboard-like interactions.',
+        hint: 'Use `hub browser state` to pick an editable target, or use `browser type` for keyboard-like interactions.',
       });
     }
 
@@ -1015,6 +1015,34 @@ export abstract class BasePage implements IPage {
 
   async getFormState(): Promise<Record<string, unknown>> {
     return (await this.evaluate(getFormStateJs())) as Record<string, unknown>;
+  }
+
+  /**
+   * Resolve a ref (AX `eN` or OpenCLI `@N`) to its on-screen center point,
+   * using the same cascade as `click()`. Returns null when the target cannot
+   * be resolved or measured — callers fall back to their normal path.
+   */
+  async refCenter(ref: string): Promise<{ x: number; y: number } | null> {
+    if (/^e?\d+$/.test(ref)) {
+      const entry = this._axRefs.get(ref);
+      if (entry) {
+        const point = await this.resolveAxRefPoint(entry).catch(() => null);
+        if (point) return { x: point.x, y: point.y };
+      }
+    }
+    try {
+      await runResolve(this, ref);
+      const nativeScrolled = await this.tryCdpOnResolvedElement('DOM.scrollIntoViewIfNeeded');
+      const rect = (await this.evaluate(
+        boundingRectResolvedJs({ skipScroll: nativeScrolled }),
+      )) as { x: number; y: number; w: number; h: number; visible: boolean } | null;
+      if (rect?.visible && rect.w > 0 && rect.h > 0) {
+        return { x: Math.round(rect.x + rect.w / 2), y: Math.round(rect.y + rect.h / 2) };
+      }
+    } catch {
+      // unresolved ref — return null and let the caller fall back
+    }
+    return null;
   }
 
   async scroll(direction: string = 'down', amount: number = 500): Promise<void> {

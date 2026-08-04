@@ -218,8 +218,8 @@ export interface ErrorEnvelope {
   trace?: {
     traceId: string;
     dir: string;
-    summaryPath: string;
-    receiptPath: string;
+    summaryPath?: string;
+    receiptPath?: string;
     status: ObservationTraceReceipt['status'];
   };
 }
