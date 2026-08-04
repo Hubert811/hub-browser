@@ -119,6 +119,29 @@ BROWSEROS_CDP_PORT=9110 hub --mcp   # 端口可省略：v0.1.1 起自动探测�
 - **BrowserClaw**（融合目标，默认）：启动后 CDP 端口由 BrowserClaw 配置决定（本机通常 9110）；
 - 任意支持 CDP 的 Chrome / Chromium：用 `--remote-debugging-port` 启动后把 `BROWSEROS_CDP_PORT` 指过去。
 
+### 安装 BrowserClaw（推荐）
+
+**BrowserClaw** 是一个免费、开源的浏览器：像普通浏览器一样安装，登录你日常使用的网站，然后你的 AI（Claude Code / Codex / Cursor 或任何 MCP 客户端）就能用你已经登录的账号驱动它。agent 在自己的 tab 里干活，你可以实时观看，还能像看视频一样回放每一个 session。
+
+[![Download for macOS](https://img.shields.io/badge/Download-macOS-black?style=flat&logo=apple&logoColor=white)](https://cdn.browseros.com/download/BrowserClaw.dmg)
+[![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D4?style=flat&logo=windows&logoColor=white)](https://cdn.browseros.com/download/BrowserClaw_installer.exe)
+
+1. **下载并安装** BrowserClaw：macOS 用 `.dmg`，Windows 用 `.exe`（系统要求与 Google Chrome 一致）；
+2. **登录你常用的网站**（zhihu / bilibili / …）——`hub` 直接继承这些登录态，无需重复登录；
+3. **用 `hub` 连上它**：
+
+```bash
+curl http://127.0.0.1:9110/json/version   # 确认 CDP 端口可达（v0.1.1 起自动探测，无需手动设端口）
+hub space create "我的任务"
+hub zhihu hot -f plain                    # 直接以你的登录态跑适配器
+```
+
+- **你的登录态。** agent 用你已经登录的真实会话干活，而不是一个空白的沙箱。
+- **纯本地。** session、截图、历史都存放在 `~/.browserclaw/`，不会离开你的机器。
+- **有回放。** 每个 session 都会被录制成可拖拽回放的视频，带一步步的操作时间线。
+
+> 项目主页：<https://www.browseros.com/agents> · 文档：<https://docs.browseros.com/browserclaw>
+
 **CDP 端口自动探测（v0.1.1 起，决策 D7）**：不再需要手动设端口，解析顺序：
 
 1. `BROWSEROS_CDP_PORT` 环境变量（显式覆盖，最高优先）；
