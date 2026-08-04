@@ -40,7 +40,22 @@ hub-browser 的核心前提：**没有 space 就没有页面操作**。所有 ta
 - **tab group 是 space 的 UI 呈现，且双向同步**：space 自动投影成浏览器 tab group；人类把 tab 拖进组 = 归属该 space，拖出组 = 从账本移除。space 边界是动态的，以 `space.list_tabs` 的实时结果为准。
 - 关掉 space 的全部 tab 等价于关掉 space（`keep:false` 语义）。
 - space 被用户持有（handoff 后）时，agent 的页面操作报 `user is controlling`：停下、问用户，确认后再 `space.takeover {confirmed:true}`。
-- CLI 多步流程用 `<session>` 串步骤（`hub browser <session> …`）：session 是 CLI 命令间的默认 tab 指针，**MCP 路径没有 session**。CLI 与 MCP 的关系、失效自愈与静默降级见 `hub-browser-browser` 的「session ↔ tab ↔ space 关系」节。
+- CLI 多步流程用 `<session>` 串步骤（`hub browser <session> …`），详见下文「Session（仅 CLI 使用）」节。
+
+## Session（仅 CLI 使用）
+
+`<session>` 是给 CLI 浏览器会话起的名字：用同一个名字连跑多条 `hub browser <session> …` 命令，就操作同一个 tab——session 是 CLI 命令间的默认 tab 指针，状态存 `~/.hub/cache/browser-state/<session>.json`。多步 CLI 流程复用同一个 session 名；要隔离并行的浏览器工作就用不同名字。
+
+三者是不同层，别混用：
+
+- **space** = 归属（谁拥有 tab）；**session** = CLI 记忆（上次操作哪个 tab）；**tab** = 实体（浏览器真实页面）。
+- **MCP 路径没有 session**：直接 `space.list_tabs` 拿 pageId 再传给 `snapshot` / `act` / `read` 等，不需要 session 名。
+
+用法要点：
+
+- 人类拖进 space 的 tab，用 `hub browser <session> tab select <targetId>` 显式连上，再继续 `state` / `click` / …。
+- tab 被关后 session 自动失效并落到**当前活跃 tab**（静默降级、不报错）——写操作（click / type / close 等）前先 `hub browser <session> tab list` 确认目标。
+- 详情见 `hub-browser-browser` 的「session ↔ tab ↔ space 关系」节。
 
 ## Tab 卫生纪律（4 条，必须遵守）
 
@@ -140,6 +155,7 @@ CLI 等价：`hub browser <session> tab list` / `hub browser <session> tab close
 CLI 等价：
 
 ```bash
+# work 是 session 名：CLI 用同一 session 串起多步操作（MCP 无 session）
 hub space create "查 github issue"          # 1. 建 space
 hub browser work open "https://github.com/..."   # 2. 开 tab
 hub browser work state                           # 3. 看页面
