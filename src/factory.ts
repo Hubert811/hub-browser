@@ -1,6 +1,7 @@
 import { generateStealthJs } from './opencli/stealth.js';
 import type { IPage } from './opencli/types.js';
 import { UnifiedPage } from './page.js';
+import { resolveCdpPort } from './cdp-port.js';
 
 /** Browser factory interface (mirrors OpenCLI's IBrowserFactory) */
 export interface IBrowserFactory {
@@ -36,7 +37,7 @@ export class UnifiedBrowserFactory implements IBrowserFactory {
       const { CdpBackend, BrowserSession } = await import('@browseros/browser-core');
       const port = cdpEndpoint
         ? parsePortFromEndpoint(cdpEndpoint)
-        : Number(process.env.BROWSEROS_CDP_PORT ?? 9005);
+        : resolveCdpPort();
       const cdp = new CdpBackend({ port });
       await cdp.connect();
       this._cdp = cdp;
@@ -104,5 +105,5 @@ export class UnifiedBrowserFactory implements IBrowserFactory {
 
 function parsePortFromEndpoint(endpoint: string): number {
   const match = endpoint.match(/:(\d+)$/);
-  return match ? Number(match[1]) : 9005;
+  return match ? Number(match[1]) : resolveCdpPort();
 }
