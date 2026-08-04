@@ -1,6 +1,6 @@
 # Phase 6 — Chromium 构建 + 打包
 
-> 状态：⬜ 未开始
+> 状态：⏳ 部分完成（2026-08-04：D6 npm 分发 + D7 CDP 端口自动探测已落地；Chromium 构建部分未开始）
 > 预估：5-7 天
 > 依赖：Phase 3 + Phase 5 完成
 > 注：Phase 7（Space 浏览器 UI）依赖本阶段的构建产物，其 UI 补丁在本阶段构建管线中迭代（可与 5.4 补丁同批次）。
@@ -222,6 +222,8 @@ browseros dev extract --file path/to/modified/file.cc
 - [ ] 自定义 CDP 域可用
 - [ ] Task Space 可创建
 - [ ] 统一 TS/JS 双份文件（见 6.9）
+- [x] CLI 以 npm 包分发 ✅（D6：`@hub/browser`，`files` 白名单 + prepack/postinstall 自建符号链接，2026-08-04）
+- [x] CDP 端口自动探测 BrowserClaw 配置 ✅（D7：`BROWSEROS_CDP_PORT` → config `ports.cdp` → 9005，2026-08-04）
 
 ## 6.9 统一 src/opencli/ 与 src/opencli-engine/browser/ 重复文件
 
@@ -292,39 +294,49 @@ browseros dev extract --file path/to/modified/file.cc
 - 最终构建前完成，确保打包的浏览器只有一套网页操作逻辑
 
 **完成标志**：
-- [ ] 核心工具（snapshot/act/click/fill）的 handler 改为调用 `UnifiedPage`
-- [ ] Agent 扩展 `/chat` 路径验证通过
-- [ ] 外部 MCP `/mcp` 路径验证通过
-- [ ] OpenCLI 路径不受影响
-- [ ] 两条路径的 ref 解析行为一致（同一 ref 在两条路径点击同一元素）
+- [x] 核心工具（snapshot/act/click/fill）的 handler 改为调用 `UnifiedPage` ✅（2026-08-04：`src/browser-mcp` fork 的**全部**工具都走 UnifiedPage，不只是核心工具）
+- [ ] Agent 扩展 `/chat` 路径验证通过（BrowserClaw `apps/app` 产品面，非 hub-browser 范围）
+- [x] 外部 MCP `/mcp` 路径验证通过 ✅（`hub --mcp` stdio server 即 fork + UnifiedPage，冒烟通过）
+- [x] OpenCLI 路径不受影响 ✅（本就是 UnifiedPage）
+- [x] 两条路径的 ref 解析行为一致 ✅（MCP 工具与 CLI 共用 UnifiedPage target-resolver）
 
 ## 实际进展
 
-**状态：🟢 已按方案 A（fork）完成**
-
-### 6.10 完成情况（2026-08-02）
-- **Fork**：`browser-mcp` 完整拷贝到 `src/browser-mcp/`（package name `@hub/browser-mcp`，
-  已加入 root workspaces；vendor/ 未改动，submodule 保持干净）。
-- **统一**：`ToolContext` 由 `session: BrowserSession` 改为 `UnifiedPageProvider` +
-  `page`/`pageFor`（`UnifiedBrowserFactory.connect` 返回 `Promise<UnifiedPage>`）；
-  17 个工具 handler 全部改为调用 UnifiedPage（无直接映射的走 `page.cdp()`）。
-  UnifiedPage 新增 `selectOption(ref, value)`（AX ref + DOM marker 双路径）。
-- **入口**：`createBrowserMcpServer` 接受 `browser: UnifiedPageProvider`；新增
-  `bin/hub.mjs --mcp`（stdio MCP server）。
-- **验证**：fork typecheck + 32/32 单测（含 17 工具 structured-contract 契约测试）；
-  root typecheck 通过；`tests/test-phase2a.ts` e2e 24/24；连 CDP 9110 实机冒烟
-  （tabs/navigate/snapshot/read/evaluate/windows/history/diff）全通过；
-  stdio MCP client（`hub --mcp`）工具列表 + tabs/snapshot 调用通过。
-- **录屏回放不受影响**：rrweb 采集（claw-app content script）→ recordings ingest
-  （claw-server-rust）→ replay 链路全部在 vendor/ 内，未触碰；claw-server-rust
-  recordings 9/9、replay builder 5/5、claw-app replay 逻辑测试通过（React .tsx 组件
-  测试因本 checkout 未装 react 失败，为环境问题）。
+**状态：⏳ 部分完成（2026-08-04：D6 npm 分发 ✅、D7 CDP 端口自动探测 ✅、6.10 核心统一 ✅；Chromium 构建未开始、6.9 未做）**
 
 ### 已添加的待办
-- 6.9 统一 TS/JS 重复文件（来自 Confucius 审查 P2）
-- 6.10 统一 MCP 路径与 OpenCLI 路径的网页操作逻辑（来自架构审查）— ✅ fork 完成，
-  Agent 扩展 `/chat` 与外部 MCP `/mcp` 消费方切换见 `src/browser-mcp/README.md`
+- 6.9 统一 TS/JS 重复文件（来自 Confucius 审查 P2）——**未做**：`src/opencli-engine/browser/` 的 7 个 JS 重复文件（compound/dom-snapshot/errors/stealth/target-errors/target-resolver/utils）仍在，未切到 `dist/opencli/*.js`
+- 6.10 统一 MCP 路径与 OpenCLI 路径的网页操作逻辑（来自架构审查）——**核心已落地**：`src/browser-mcp` fork 全部工具经 `UnifiedPage` 操作页面
 
 ### 已完成的前置工作
 - hub-browser 命令功能验证完成，所有 P0 bug 修复
 - CDP 持久化 daemon 模式实现（6.10 的前置：两条路径共用同一个 CDP 连接）
+
+## 决策 D6（2026-08-04）：CLI 分发用 npm 包（方案 A）
+
+**选型**：`@hub/browser` 以 npm 包发布（`npm i -g @hub/browser`），作为 Phase 6 的 CLI 分发部分。
+
+**关键事实（已核实）**：
+- `hub` 是纯 Node CLI（`node bin/hub.mjs` 可跑，无 Bun 专属 API）；引擎 fork 纯 JS。
+- 运行时依赖 vendor 三包：`@browseros/browser-core`（248K）、`cdp-protocol`（688K）、`shared`（128K）——**纯 TS 源码无 dist**，经 workspace 链接。
+- 适配器 `clis/`（13MB）+ `cli-manifest.json`（1MB）需随包发布（合计 ~15MB，可接受）。
+- ABI shim：适配器 `import '@jackwener/opencli/*'`，方案 C 在 `~/.hub/node_modules` 建符号链接（postinstall/首次运行自建）。
+- `hub` 驱动外部浏览器（`BROWSEROS_CDP_PORT`），包不含浏览器（BrowserClaw `.app` 是另一层）。
+
+**实现要点**：
+1. `bun run build`（`tsc --outDir dist`）把 TS（src/space、src/browser-mcp、src/page.ts、src/factory.ts、vendor 三包）编译进 dist。
+2. `files` 白名单：`bin/`、`dist/`、`clis/`、`cli-manifest.json`、`src/opencli-engine`、`src/browser-mcp`（如未全进 dist）、`src/space`、`src/opencli`、`vendor` 三包源码（或编译产物）。
+3. `postinstall` 调整：发布后不依赖相对路径 workspace 链接，改为包内自建符号链接（@jackwener/opencli → 包内引擎、@browseros/* → 包内 vendor）或直接用 dist 产物路径。
+4. `publishConfig.access: public`。
+5. 验证：`npm pack --dry-run` 看包内容；`npm i -g <tgz>` 干净环境测 `hub list`、`hub --mcp`、建 space + 适配器命令。
+
+## 决策 D7（2026-08-04）：CDP 端口自动探测 BrowserClaw 配置
+
+**问题**：`hub` 默认找 `9005` 端口，但 BrowserClaw 的 CDP 端口是配置动态分配的（本机 `~/.browseros/config.json` 的 `ports.cdp = 9110`），另一台机器装完 BrowserClaw 不设 `BROWSEROS_CDP_PORT` 就连不上（"CDP discovery failed ... fetch failed"）。
+
+**方案**：`src/factory.ts` 端口解析加 BrowserClaw 配置探测：
+1. `BROWSEROS_CDP_PORT` 环境变量优先（显式覆盖）；
+2. 未设置 → 读 BrowserClaw config.json 的 `ports.cdp`（macOS: `~/Library/Application Support/BrowserClaw/.browseros/config.json`；dev: `.browseros-dev`；Windows/Linux 对应路径；也可探测 `BROWSERCLAW_DIR`）；
+3. 读不到 → fallback 9005。
+- 探测结果做进程内缓存（避免每次 connect 读盘）；配置文件不存在/无 ports.cdp 时静默 fallback。
+- 这是唯一入口：engine 的 `getBrowserFactory` 返回 `UnifiedBrowserFactory`，vendor `browser-core/cdp.ts` 只接收 port，无需改 vendor。

@@ -58,6 +58,8 @@ opencli browser tabs         # 标签列表
 
 ## 新增命令
 
+> 本节的命令是设计稿（当时命令名仍为 `opencli browser tabs ...`）。D4 后用户可见命令统一为 `hub`，且 Tab 管理命令组实际落地为 `hub browser <session> tab list/new/select/close`（不是 `tabs`），Tab Group / Window 为 `hub browser <session> group/window ...`；最终落地清单以「实际进展」4.1/4.2-4.7 为准，命令签名可跑 `hub --help` 核对。
+
 ### 4.1 Tab/Window 管理（用 BrowserClaw 自定义 CDP 域）
 
 ```bash
@@ -204,17 +206,21 @@ async function bookmarksList(opts: { folderId?: string }) {
 
 - [x] Tab/Window 管理命令 ✅ (commit 5c99fc9)
 - [x] Tab Group 命令 ✅ (commit 5c99fc9)
-- [x] Bookmarks 命令 ✅ (commit pending)
-- [x] History 命令 ✅ (commit pending)
-- [x] Diff 命令 ✅ (commit pending)
-- [x] Read/Grep 命令增强 ✅ (commit pending)
-- [x] PDF/Download/Upload 命令 ✅ (commit pending)
-- [x] 录屏回放命令 ✅ (commit pending)
-- [x] space 命令组（Phase 3 交付，本阶段验收：`create/list/switch/close/handoff/takeover`）✅
+- [x] Bookmarks 命令 ✅
+- [x] History 命令 ✅
+- [x] Diff 命令 ✅
+- [x] Read/Grep 命令增强 ✅
+- [x] PDF/Download/Upload 命令 ✅
+- [x] 录屏回放命令 ✅
+- [x] space 命令组（Phase 3 交付，本阶段验收：`create/list/switch/close/handoff/takeover/current/refresh`）✅
 
 ## 实际进展
 
-**状态：🔄 进行中（P0 修复 + Tab Group + Window 已完成，其余命令未做）**
+**状态：✅ 完成（2026-08-03 收尾）**
+
+- P0 修复 + Tab/Window/Tab Group/Bookmarks/History/Diff/Read+Grep/PDF+Download+Upload/录屏回放 全部交付（完成标志全勾）。
+- space 命令组（create/list/switch/close/handoff/takeover/current/refresh）由 Phase 3 交付并验收。
+- 真实浏览器冒烟全过（tests/phase4-*.ts），并入 Phase 3 完整回归。
 
 ### P0 修复（commit 2c810e6, 2ff267d）
 
