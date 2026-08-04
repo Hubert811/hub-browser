@@ -158,6 +158,21 @@ export interface RecycleSpaceTabsResult {
   failed?: number
 }
 
+/**
+ * D8 — one ledger eviction performed by reapExpiredSpaces.
+ *
+ * tier 1 = empty space (tabs.length === 0) idle past emptyTtl (default 24h);
+ * tier 2 = agent-owned space idle past spaceTtl (default 7d), any tab count.
+ */
+export interface ReapEviction {
+  spaceId: string
+  name: string
+  owner: string
+  tier: 1 | 2
+  ageMs: number
+  tabs: number
+}
+
 /** Minimal browser surface TaskSpaceManager needs to open/close/list tabs. */
 export interface SpaceTabGateway {
   newTab(
@@ -363,6 +378,20 @@ export function migrateLegacyLedger(
   }
 }
 
+/**
+ * D8 — legacy-space auto-reap (unified TTL scheme). Every field is optional;
+ * resolution order is options.reap → env (HUB_SPACE_EMPTY_TTL_MS /
+ * HUB_SPACE_TTL_MS, positive integers, invalid falls back to the default) →
+ * defaults (24h empty TTL / 7d space TTL). `enabled: false` (or
+ * HUB_SPACE_REAP=off) turns the whole reaper off — no load-time sweep, and
+ * the MCP timer is not started by bin/hub.mjs.
+ */
+export interface TaskSpaceReapOptions {
+  enabled?: boolean
+  emptyTtlMs?: number
+  spaceTtlMs?: number
+}
+
 export interface TaskSpaceManagerOptions {
   /** JSON ledger path; defaults to defaultStoragePath(). Tests pass a temp file. */
   storagePath?: string
@@ -372,6 +401,33 @@ export interface TaskSpaceManagerOptions {
   events?: SpaceEventBus | null
   /** Persist mutations to disk. Default true. */
   persist?: boolean
+  /** D8 — TTL reaper configuration. See TaskSpaceReapOptions. */
+  reap?: TaskSpaceReapOptions
+}
+
+/** D8 — default TTLs for legacy-space auto-reap (overridable via options/env). */
+export const REAP_EMPTY_TTL_MS_DEFAULT = 24 * 60 * 60 * 1000 // 24h
+export const REAP_SPACE_TTL_MS_DEFAULT = 7 * 24 * 60 * 60 * 1000 // 7d
+
+/**
+ * D8 — positive-integer TTL parse with fallback. Resolution: options.reap
+ * value → env value → default; anything that is not a positive integer falls
+ * through to the next source and finally to the default.
+ */
+function resolveReapTtl(
+  option: number | undefined,
+  envValue: string | undefined,
+  fallback: number,
+): number {
+  if (option !== undefined) {
+    const n = Number(option)
+    if (Number.isInteger(n) && n > 0) return n
+  }
+  if (envValue !== undefined && envValue.trim() !== '') {
+    const n = Number(envValue)
+    if (Number.isInteger(n) && n > 0) return n
+  }
+  return fallback
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -604,6 +660,12 @@ export class TaskSpaceManager {
   private readonly storagePath: string | undefined
   private readonly gateway: SpaceTabGateway | undefined
   private readonly persist: boolean
+  /** D8 — TTL reaper on/off (options.reap.enabled === false or HUB_SPACE_REAP=off → off). */
+  private readonly reapEnabled: boolean
+  /** D8 — Tier 1 empty-space idle TTL (ms). */
+  private readonly reapEmptyTtlMs: number
+  /** D8 — Tier 2 idle agent-space TTL (ms). */
+  private readonly reapSpaceTtlMs: number
   /**
    * TabFreshness health telemetry — in-memory ONLY (ledger structure untouched,
    * never persisted, no automatic decisions; thresholds stay future work).
@@ -627,7 +689,29 @@ export class TaskSpaceManager {
     this.gateway = options.gateway
     this.persist = options.persist ?? true
     this.events = options.events === undefined ? new SpaceEventBus() : options.events
+    // D8 — reap config: options.reap → env → defaults; HUB_SPACE_REAP=off
+    // (or reap.enabled === false) disables the sweep entirely.
+    this.reapEnabled = !(
+      options.reap?.enabled === false || process.env.HUB_SPACE_REAP === 'off'
+    )
+    this.reapEmptyTtlMs = resolveReapTtl(
+      options.reap?.emptyTtlMs,
+      process.env.HUB_SPACE_EMPTY_TTL_MS,
+      REAP_EMPTY_TTL_MS_DEFAULT,
+    )
+    this.reapSpaceTtlMs = resolveReapTtl(
+      options.reap?.spaceTtlMs,
+      process.env.HUB_SPACE_TTL_MS,
+      REAP_SPACE_TTL_MS_DEFAULT,
+    )
     this.state = this.load()
+    // D8 — load-time sweep (fire-and-forget). The synchronous ledger eviction
+    // runs to completion before this constructor returns (reapExpiredSpaces
+    // awaits nothing until after eviction), so tests can observe the result
+    // immediately; only the best-effort tab closes are deferred.
+    if (this.reapEnabled) {
+      void this.reapExpiredSpaces(this.gateway)
+    }
   }
 
   // ── storage ──
@@ -1285,6 +1369,113 @@ export class TaskSpaceManager {
     }
   }
 
+  /**
+   * D8 — legacy-space auto-reap (unified TTL scheme).
+   *
+   * Tier 1: empty space (tabs.length === 0) idle longer than emptyTtl
+   *   (default 24h) → ledger eviction.
+   * Tier 2: agent-owned space idle longer than spaceTtl (default 7d), any
+   *   tab count → ledger eviction + best-effort tab/group close.
+   * user-held spaces (ownership === 'user') are never reaped; records whose
+   * lastActiveAt is missing/invalid are conservatively skipped.
+   *
+   * The synchronous part is authoritative and fast: scan this.state.spaces,
+   * evict expired ones (spaces delete + owner current-pointer clear +
+   * deletedSpaces tombstone), and save() — only when something was actually
+   * evicted. The browser close for Tier 2 is best-effort and fire-and-forget
+   * (any failure is logged, never blocks, never affects the ledger); with no
+   * gateway only the ledger is evicted and the tabs remain as ordinary
+   * browser tabs.
+   */
+  async reapExpiredSpaces(
+    gateway?: SpaceTabGateway,
+  ): Promise<{ evicted: ReapEviction[] }> {
+    const gw = gateway ?? this.gateway
+    const now = this.now()
+    const evicted: ReapEviction[] = []
+    const evictedSpaces = new Map<string, SpaceRecord>()
+    const deleted = new Set(this.state.deletedSpaces ?? [])
+    let changed = false
+    for (const space of Object.values(this.state.spaces)) {
+      if (space.ownership === 'user') continue
+      if (
+        typeof space.lastActiveAt !== 'number' ||
+        !Number.isFinite(space.lastActiveAt)
+      ) {
+        // Missing/legacy lastActiveAt — conservative skip, never reap on guess.
+        continue
+      }
+      const ageMs = Math.max(0, now - space.lastActiveAt)
+      let tier: 1 | 2 | undefined
+      if (space.tabs.length === 0 && ageMs > this.reapEmptyTtlMs) {
+        tier = 1
+      } else if (space.ownership === 'agent' && ageMs > this.reapSpaceTtlMs) {
+        // "不管有没有 tab": an agent space idle past spaceTtl is reaped even
+        // when empty — in practice an empty space crosses the much shorter
+        // emptyTtl first, but with a custom emptyTtl > spaceTtl this branch
+        // still fires (with zero tabs to close).
+        tier = 2
+      }
+      if (tier === undefined) continue
+      evicted.push({
+        spaceId: space.id,
+        name: space.name,
+        owner: space.owner,
+        tier,
+        ageMs,
+        tabs: space.tabs.length,
+      })
+      evictedSpaces.set(space.id, space)
+      // Ledger eviction (authoritative, synchronous).
+      delete this.state.spaces[space.id]
+      deleted.add(space.id)
+      this.state.deletedSpaces = [...deleted]
+      if (this.state.currentSpaceByOwner[space.owner] === space.id) {
+        delete this.state.currentSpaceByOwner[space.owner]
+      }
+      changed = true
+      console.log(
+        `[hub-spaces] reaped space ${space.id} "${space.name}" (tier ${tier}, age ${ageMs}ms, owner ${space.owner}, tabs ${space.tabs.length})`,
+      )
+    }
+    // Only write the disk when this pass actually evicted something.
+    if (changed) this.save()
+    // Best-effort, non-blocking: close Tier 2 tabs + the tab group. Errors are
+    // logged and never touch the ledger eviction above.
+    if (gw) {
+      for (const ev of evicted) {
+        if (ev.tier !== 2) continue
+        const space = evictedSpaces.get(ev.spaceId)
+        if (!space) continue
+        void this.reapCloseTabs(gw, space).catch((err) => {
+          console.warn(
+            `[hub-spaces] tab close skipped for reaped space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
+          )
+        })
+      }
+    }
+    return { evicted }
+  }
+
+  /** D8 — best-effort close of a reaped space's tabs + tab group (never throws). */
+  private async reapCloseTabs(
+    gw: SpaceTabGateway,
+    space: SpaceRecord,
+  ): Promise<void> {
+    for (const ref of space.tabs) {
+      await this.closeTabBestEffort(gw, ref)
+    }
+    if (space.tabGroupId && gw.tabGroupClose) {
+      try {
+        await gw.tabGroupClose(space.tabGroupId)
+      } catch (err) {
+        console.warn(
+          `[hub-spaces] tab-group close skipped for reaped space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
+        )
+      }
+    }
+  }
+
   /** Restart recovery: re-open every agent-owned space tab by URL (no targetId persisted). */
   async restore(gateway?: SpaceTabGateway): Promise<number> {
     const gw = gateway ?? this.gateway
@@ -1311,6 +1502,11 @@ export class TaskSpaceManager {
       .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
     for (const space of spaces) {
       const next: TabRef[] = []
+      // D8 — did this round actually change the space? A refresh of
+      // lastActiveAt is allowed only when at least one ref went
+      // pending→restored or a stale ref was pruned; an untouched pass must
+      // not keep an idle space "fresh" forever or the TTL reaper never fires.
+      let touched = false
       for (const ref of space.tabs) {
         // 1. Same pageId still live → keep (same-process / same-connection idempotency).
         const liveById = live.find(
@@ -1324,7 +1520,10 @@ export class TaskSpaceManager {
             title: liveById.title ?? ref.title,
             restored: true,
           })
-          if (!ref.restored) reconciled++
+          if (!ref.restored) {
+            reconciled++
+            touched = true
+          }
           continue
         }
         // 2. pageId drifted across a browser-session restart → re-attach the
@@ -1344,14 +1543,22 @@ export class TaskSpaceManager {
             title: ref.title ?? byUrl.title,
             restored: true,
           })
-          if (!ref.restored) reconciled++
+          if (!ref.restored) {
+            reconciled++
+            touched = true
+          }
           continue
         }
         // 3. Already restored and gone → deliberately closed after the last
         //    restore; prune the stale ref (only when the live list is
         //    trustworthy — a failed listTabs must not drop ledger entries).
         if (ref.restored) {
-          if (!liveOk) next.push(ref)
+          if (!liveOk) {
+            next.push(ref)
+          } else {
+            // Stale ref pruned — the space changed this round.
+            touched = true
+          }
           continue
         }
         // 4. Pending → re-open by URL (background tab, no targetId persisted).
@@ -1367,6 +1574,7 @@ export class TaskSpaceManager {
             used.add(pageId)
             next.push({ pageId, url: ref.url, title: ref.title, restored: true })
             reconciled++
+            touched = true
           }
         } catch {
           // Skip unrecoverable tabs.
@@ -1393,7 +1601,10 @@ export class TaskSpaceManager {
       // Mark the space restored so the pending list is empty for the next
       // daemon/MCP start (idempotent restarts never duplicate tabs).
       space.restoredAt = this.now()
-      space.lastActiveAt = this.now()
+      // D8 — only refresh lastActiveAt when this space was actually reconciled
+      // (pending→restored or a prune) this round. restoredAt stays
+      // informational and updates every time (not part of the TTL).
+      if (touched) space.lastActiveAt = this.now()
     }
     this.save()
     return reconciled

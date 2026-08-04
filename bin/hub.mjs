@@ -76,6 +76,19 @@ if (process.env.HUB_MCP === 'true' || process.argv.includes('--mcp')) {
     storagePath: process.env.HUB_SPACES_FILE || (await import(`${RUNTIME}/space/task-space-manager.js`)).defaultStoragePath(),
     gateway: gatewayFromProvider(browser),
   });
+  // D8 — legacy-space auto-reap for the long-lived MCP process. The daemon
+  // branch adds no timer: every daemon command goes through loadSpaceManager,
+  // whose constructor already runs the load-time sweep. HUB_SPACE_REAP=off
+  // disables the reaper entirely (no sweep, no timer).
+  if (process.env.HUB_SPACE_REAP !== 'off') {
+    const reapIntervalMs = parseInt(process.env.HUB_SPACE_REAP_INTERVAL_MS ?? '300000', 10) || 300000;
+    const reapTimer = setInterval(() => {
+      spaces.reapExpiredSpaces().catch((err) => {
+        process.stderr.write(`[hub-mcp] space reap error: ${err?.message ?? String(err)}\n`);
+      });
+    }, reapIntervalMs);
+    reapTimer.unref?.();
+  }
   const server = createBrowserMcpServer({
     name: 'hub-browser',
     title: 'hub-browser MCP (UnifiedPage)',

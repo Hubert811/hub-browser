@@ -28,4 +28,6 @@ export type {
   TabRef,
   TabUrlReuseMode,
   TaskSpaceManagerOptions,
+  TaskSpaceReapOptions,
+  ReapEviction,
 } from './task-space-manager.ts'
