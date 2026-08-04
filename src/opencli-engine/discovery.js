@@ -6,6 +6,9 @@
  *    registers commands instantly. JS modules are loaded lazily only
  *    when their command is executed.
  * 2. FALLBACK (filesystem scan): Traditional runtime discovery for development.
+ *
+ * User data root (方案 C): product-owned ~/.hub (overridable via
+ * BROWSEROS_DIR). The `clis/` adapter directory keeps the opencli naming.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -15,12 +18,26 @@ import { Strategy, registerCommand } from './registry.js';
 import { getErrorMessage } from './errors.js';
 import { log } from './logger.js';
 import { findPackageRoot, getCliManifestPath } from './package-paths.js';
-/** User runtime directory: ~/.opencli */
-export const USER_OPENCLI_DIR = path.join(os.homedir(), '.opencli');
-/** User CLIs directory: ~/.opencli/clis */
+/**
+ * Single user-data root (方案 C): `~/.hub` by default, overridable via
+ * `BROWSEROS_DIR`. This is the only place the JS engine fork resolves the
+ * root; src/space/task-space-manager.ts keeps an identical inline copy
+ * (TS side is deliberately zero-relative-import, so no cross-package import).
+ */
+export function hubUserRoot() {
+    const override = process.env.BROWSEROS_DIR?.trim();
+    if (override)
+        return override;
+    return path.join(os.homedir(), '.hub');
+}
+/** User runtime directory: <root> (~/.hub) */
+export const USER_OPENCLI_DIR = hubUserRoot();
+/** User CLIs directory: <root>/clis (opencli adapter naming retained) */
 export const USER_CLIS_DIR = path.join(USER_OPENCLI_DIR, 'clis');
-/** Plugins directory: ~/.opencli/plugins/ */
+/** Plugins directory: <root>/plugins */
 export const PLUGINS_DIR = path.join(USER_OPENCLI_DIR, 'plugins');
+/** Legacy user CLIs directory (pre-方案 C): ~/.opencli/clis — migration source only. */
+const LEGACY_USER_CLIS_DIR = path.join(os.homedir(), '.opencli', 'clis');
 /** Matches files that register commands via cli() or lifecycle hooks */
 const PLUGIN_MODULE_PATTERN = /\b(?:cli|registerSiteAuthCommands|onStartup|onBeforeExecute|onAfterExecute)\s*\(/;
 function parseStrategy(rawStrategy, fallback = Strategy.COOKIE) {
@@ -31,8 +48,8 @@ function parseStrategy(rawStrategy, fallback = Strategy.COOKIE) {
 }
 const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
 /**
- * Ensure ~/.opencli/node_modules/@jackwener/opencli symlink exists so that
- * user CLIs in ~/.opencli/clis/ can `import { cli } from '@jackwener/opencli/registry'`.
+ * Ensure <root>/node_modules/@jackwener/opencli symlink exists so that
+ * user CLIs in <root>/clis/ can `import { cli } from '@jackwener/opencli/registry'`.
  *
  * This is the sole resolution mechanism — adapters use package exports
  * (e.g. `@jackwener/opencli/registry`, `@jackwener/opencli/errors`) and
@@ -40,7 +57,7 @@ const PACKAGE_ROOT = path.dirname(fileURLToPath(import.meta.url));
  */
 export async function ensureUserCliCompatShims(baseDir = USER_OPENCLI_DIR) {
     await fs.promises.mkdir(baseDir, { recursive: true });
-    // package.json for ESM resolution in ~/.opencli/
+    // package.json for ESM resolution in <root>/
     const pkgJsonPath = path.join(baseDir, 'package.json');
     const pkgJsonContent = `${JSON.stringify({ name: 'opencli-user-runtime', private: true, type: 'module' }, null, 2)}\n`;
     try {
@@ -78,9 +95,48 @@ export async function ensureUserCliCompatShims(baseDir = USER_OPENCLI_DIR) {
     }
 }
 /**
+ * Best-effort one-time migration of user adapters from the legacy
+ * `~/.opencli/clis/<site>/` layout to the new `<root>/clis/<site>/` layout.
+ * A site is copied only when the destination does not exist yet (existing
+ * destination wins; legacy files are kept, never deleted). Failures are
+ * logged and never block startup.
+ */
+export async function migrateLegacyUserClis(legacyDir = LEGACY_USER_CLIS_DIR, destDir = USER_CLIS_DIR) {
+    try {
+        let entries;
+        try {
+            entries = await fs.promises.readdir(legacyDir, { withFileTypes: true });
+        }
+        catch {
+            return; // No legacy directory — nothing to migrate.
+        }
+        const siteDirs = entries.filter((entry) => entry.isDirectory() || entry.isSymbolicLink());
+        for (const entry of siteDirs) {
+            const src = path.join(legacyDir, entry.name);
+            const dest = path.join(destDir, entry.name);
+            try {
+                await fs.promises.access(dest);
+                continue; // Destination already exists — never overwrite.
+            }
+            catch { /* not present — copy */ }
+            try {
+                await fs.promises.mkdir(destDir, { recursive: true });
+                await fs.promises.cp(src, dest, { recursive: true, errorOnExist: true });
+                log.info(`Migrated user adapter site "${entry.name}" from ${legacyDir} to ${destDir}`);
+            }
+            catch (err) {
+                log.warn(`Skipped migrating user adapter site "${entry.name}": ${getErrorMessage(err)}`);
+            }
+        }
+    }
+    catch (err) {
+        log.warn(`Legacy user adapter migration skipped: ${getErrorMessage(err)}`);
+    }
+}
+/**
  * Ensure the user adapters directory exists.
  *
- * With smart sync, ~/.opencli/clis/ only holds files that differ from the
+ * With smart sync, <root>/clis/ only holds files that differ from the
  * package baseline (upstream-synced cache + autofix output + user overrides).
  * Built-in adapters are loaded directly from the installed package.
  */
@@ -188,7 +244,7 @@ async function discoverClisFromFs(dir) {
     await Promise.all(sitePromises);
 }
 /**
- * Discover and register plugins from ~/.opencli/plugins/.
+ * Discover and register plugins from <root>/plugins/.
  * Each subdirectory is treated as a plugin (site = directory name).
  * Files inside are scanned flat (no nested site subdirs).
  */
@@ -234,7 +290,7 @@ async function discoverPluginDir(dir, site) {
             // No compiled .js found — cannot import raw .ts in production Node.js.
             // This typically means esbuild transpilation failed during plugin install.
             log.warn(`Plugin ${site}/${file}: no compiled .js found. ` +
-                `Run "opencli plugin update ${site}" to re-transpile, or install esbuild.`);
+                `Run "hub plugin update ${site}" to re-transpile, or install esbuild.`);
         }
     }));
 }

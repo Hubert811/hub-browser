@@ -34,6 +34,7 @@ import { analyzeSite } from './browser/analyze.js';
 import { registerAuthCommands } from './commands/auth.js';
 import { log } from './logger.js';
 import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from './browser/config.js';
+import { hubUserRoot } from './discovery.js';
 const CLI_FILE = fileURLToPath(import.meta.url);
 /** Error class for browser command failures. */
 class BrowserCommandError extends Error {
@@ -151,7 +152,7 @@ function emitNetworkError(code, message, extra = {}) {
     console.log(JSON.stringify({ error: { code, message, ...extra } }, null, 2));
     process.exitCode = NETWORK_ERROR_EXIT[code] ?? EXIT_CODES.GENERIC_ERROR;
 }
-const SITEMAP_HINT = 'Site sitemap available. For navigation context, use the opencli-browser-sitemap skill; treat browser state as truth if it disagrees.';
+const SITEMAP_HINT = 'Site sitemap available. For navigation context, use the hub-browser-sitemap skill; treat browser state as truth if it disagrees.';
 function siteNameCandidatesFromUrl(url, registry = getRegistry()) {
     let host;
     try {
@@ -192,7 +193,7 @@ function sitemapPathsForSite(site, opts) {
     const safeSite = site.replace(/[^a-zA-Z0-9_-]+/g, '-');
     if (!safeSite)
         return {};
-    const localBase = path.join(opts.homeDir, '.opencli', 'sites', safeSite);
+    const localBase = path.join(opts.homeDir, '.hub', 'config', 'sites', safeSite);
     return {
         local: firstExistingSitemapPath([
             path.join(localBase, 'sitemap'),
@@ -264,7 +265,7 @@ function sitemapHintForBrowserUrl(url, scope, opts) {
     return sitemap;
 }
 export function checkSiteMemory(site) {
-    const siteDir = path.join(os.homedir(), '.opencli', 'sites', site);
+    const siteDir = path.join(hubUserRoot(), 'config', 'sites', site);
     const endpointsPath = path.join(siteDir, 'endpoints.json');
     const notesPath = path.join(siteDir, 'notes.md');
     let endpointsCount = 0;
@@ -356,7 +357,7 @@ export function renderVerifyPreview(rows, opts = {}) {
     return out.join('\n');
 }
 function getBrowserCacheDir() {
-    return process.env.OPENCLI_CACHE_DIR || path.join(os.homedir(), '.opencli', 'cache');
+    return process.env.OPENCLI_CACHE_DIR || path.join(hubUserRoot(), 'cache');
 }
 function getBrowserTargetStatePath(scope) {
     const safeSession = scope.replace(/[^a-zA-Z0-9_-]+/g, '_');
@@ -404,7 +405,7 @@ async function resolveBrowserTargetInSession(page, targetPage, opts) {
             return undefined;
         }
         throw new Error(`Target tab ${candidate} could not be validated in the current browser session. ` +
-            'The Browser Bridge session may have restarted; re-run "opencli browser tab list" and choose a current target.', { cause: err });
+            'The Browser Bridge session may have restarted; re-run "hub browser tab list" and choose a current target.', { cause: err });
     }
     if (Array.isArray(tabs) && hasBrowserTabTarget(tabs, candidate)) {
         return candidate;
@@ -414,7 +415,7 @@ async function resolveBrowserTargetInSession(page, targetPage, opts) {
         return undefined;
     }
     throw new Error(`Target tab ${candidate} is not part of the current browser session. ` +
-        'The Browser Bridge session may have restarted; re-run "opencli browser tab list" and choose a current target.');
+        'The Browser Bridge session may have restarted; re-run "hub browser tab list" and choose a current target.');
 }
 async function resolveStoredBrowserTarget(page, scope) {
     const defaultPage = loadBrowserTargetState(scope)?.defaultPage?.trim();
@@ -425,7 +426,11 @@ async function resolveStoredBrowserTarget(page, scope) {
 /** Create a browser page for browser commands. Uses a named browser session for continuity. */
 async function getBrowserPage(session, targetPage, opts = {}) {
     const { BrowserBridge } = await import('./browser/index.js');
-    const bridge = new BrowserBridge();
+    // Test-only seam: tests inject a fake bridge (a class with connect()) via
+    // globalThis.__HubBrowserBridgeOverride so browser commands can be exercised
+    // without a live CDP connection.
+    const BridgeCtor = globalThis.__HubBrowserBridgeOverride ?? BrowserBridge;
+    const bridge = new BridgeCtor();
     // Internal GC timeout for browser sessions. Not the per-command runtime timeout.
     const envTimeout = process.env.OPENCLI_BROWSER_IDLE_TIMEOUT;
     const idleTimeout = envTimeout ? parseInt(envTimeout, 10) : undefined;
@@ -483,13 +488,13 @@ function getCommandOption(command, option) {
     return undefined;
 }
 function getBrowserSession(command) {
-    // The CLI surface is `opencli browser <session> <subcommand>`. main.ts rewrites
+    // The CLI surface is `hub browser <session> <subcommand>`. main.ts rewrites
     // argv to insert `--session <name>` before commander parses it; this helper
     // reads back the rewritten flag.
     const raw = getCommandOption(command, 'session');
     if (typeof raw === 'string' && raw.trim())
         return raw.trim();
-    throw new Error('<session> is a required positional argument: opencli browser <session> <command>');
+    throw new Error('<session> is a required positional argument: hub browser <session> <command>');
 }
 function getPageSession(page) {
     const session = page.session;
@@ -586,7 +591,7 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
     // enablePositionalOptions: prevents parent from consuming flags meant for subcommands;
     // prerequisite for passThroughOptions to forward --help/--version to external binaries
     program
-        .name('opencli')
+        .name('hub')
         .description('Make any website your CLI. Zero setup. AI-powered.')
         .version(PKG_VERSION)
         .enablePositionalOptions();
@@ -618,8 +623,8 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
                 fmt,
                 columns: ['command', 'site', 'name', 'aliases', 'description', 'access', 'strategy', 'browser', 'args',
                     ...(isStructured ? ['columns', 'domain'] : [])],
-                title: 'opencli/list',
-                source: 'opencli list',
+                title: 'hub/list',
+                source: 'hub list',
             });
             return;
         }
@@ -647,7 +652,7 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
             console.log();
         };
         console.log();
-        console.log('  opencli' + ' — available commands');
+        console.log('  hub' + ' — available commands');
         console.log();
         if (appsBySite.size > 0) {
             console.log('  App adapters');
@@ -707,14 +712,14 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
             fmt: opts.format,
             fmtExplicit: !!opts.format,
             columns: ['name', 'description', 'version', 'path'],
-            title: 'opencli/skills/list',
-            source: 'opencli skills list',
+            title: 'hub/skills/list',
+            source: 'hub skills list',
         });
     });
     skillsCmd
         .command('read')
         .description("Print an opencli-* skill's SKILL.md or reference file")
-        .argument('<skill>', 'Skill name, or skill/path like opencli-browser/references/foo.md')
+        .argument('<skill>', 'Skill name, or skill/path like hub-browser-browser/references/foo.md')
         .argument('[path]', 'Path under the skill directory')
         .option('--json', 'Output a JSON envelope instead of raw markdown', false)
         .action((skill, skillPath, opts) => {
@@ -779,12 +784,12 @@ export function createProgram(BUILTIN_CLIS, USER_CLIS) {
 <session> is a required positional: pass the name of the browser session every subcommand should operate on. Reuse the same name across calls to keep the tab/state alive; pick a different name to isolate parallel browser work.
 
 Examples:
-  $ opencli browser work open https://x.com
-  $ opencli browser work open https://x.com --window background
-  $ opencli browser work click 12
-  $ opencli browser work state
-  $ opencli browser work bind
-  $ opencli browser work unbind
+  $ hub browser work open https://x.com
+  $ hub browser work open https://x.com --window background
+  $ hub browser work click 12
+  $ hub browser work state
+  $ hub browser work bind
+  $ hub browser work unbind
 `);
     const originalBrowserDescription = browser.description();
     /**
@@ -841,7 +846,7 @@ Examples:
             error: {
                 code: 'javascript_dialog_open',
                 message,
-                hint: 'Handle the modal first: opencli browser dialog accept (or dismiss). Use --text for prompt dialogs.',
+                hint: 'Handle the modal first: hub browser dialog accept (or dismiss). Use --text for prompt dialogs.',
             },
         }, null, 2));
     }
@@ -862,13 +867,20 @@ Examples:
             log.error(`Hint: ${err.hint}`);
     }
     /** Wrap browser actions with error handling and optional --json output */
-    function browserAction(fn) {
+    function browserAction(fn, opts = {}) {
         return async (...args) => {
             let page = null;
             try {
                 const command = args.at(-1) instanceof Command ? args.at(-1) : undefined;
                 const targetPage = getBrowserTargetId(command);
-                const session = getBrowserSession(command);
+                // Standalone groups (bookmarks/history) have no <session> positional;
+                // browserAction accepts a default session via opts.session.
+                const explicitSession = getCommandOption(command, 'session');
+                const session = typeof explicitSession === 'string' && explicitSession.trim()
+                    ? explicitSession.trim()
+                    : (typeof opts.session === 'string' && opts.session.trim()
+                        ? opts.session.trim()
+                        : getBrowserSession(command));
                 const windowMode = getBrowserWindowMode(command, 'foreground');
                 page = await getBrowserPage(session, targetPage, { windowMode });
                 await fn(page, ...args);
@@ -919,6 +931,60 @@ Examples:
             }
         };
     }
+    /**
+     * Phase 4 — run a fork browser tool (src/browser-mcp/src/tools/registry.ts)
+     * against the CLI-connected UnifiedPage. The fork tools are the single
+     * implementation shared with the MCP server (统一 Core); the CLI commands
+     * below are thin wrappers over them.
+     */
+    async function runForkBrowserTool(toolName, args, page) {
+        const { BROWSER_TOOLS } = await import('../browser-mcp/src/tools/registry.ts');
+        const { executeTool } = await import('../browser-mcp/src/tools/framework.ts');
+        const def = BROWSER_TOOLS.find((t) => t.name === toolName);
+        if (!def)
+            throw new Error(`Fork browser tool "${toolName}" is not registered`);
+        return executeTool(def, args, {
+            page,
+            pageFor: async () => page,
+        });
+    }
+    /** Tool args carrying the connected page id (fork tools require a numeric page). */
+    function forkToolArgsFor(page) {
+        return typeof page.pageId === 'number' ? { page: page.pageId } : {};
+    }
+    /** Print a fork tool result: formatted text by default, structured envelope with --json. */
+    function printForkToolResult(result, opts = {}) {
+        const text = result.content?.find?.((c) => c.type === 'text')?.text ?? '';
+        if (result.isError) {
+            console.log(JSON.stringify({
+                error: {
+                    code: 'tool_error',
+                    message: text || 'browser tool failed',
+                },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.GENERIC_ERROR;
+            return false;
+        }
+        if (opts.json) {
+            console.log(JSON.stringify(result.structuredContent ?? { text }, null, 2));
+            return true;
+        }
+        console.log(text);
+        return true;
+    }
+    function stripAtPrefix(ref) {
+        return typeof ref === 'string' ? ref.replace(/^@+/, '') : ref;
+    }
+    /** Parse an optional integer option; returns { error } when present but invalid. */
+    function parseIntOption(raw, flagName, fallback) {
+        if (raw === undefined || raw === null || raw === '')
+            return fallback;
+        const n = Number.parseInt(String(raw), 10);
+        if (!Number.isFinite(n))
+            return { error: `--${flagName} must be an integer, got "${raw}"` };
+        return n;
+    }
+
     function browserSessionCommandAction(fn) {
        return async (optsOrCommand, maybeCommand) => {
             const command = optsOrCommand instanceof Command ? optsOrCommand : maybeCommand;
@@ -937,6 +1003,8 @@ Examples:
                 }
                 else {
                     log.error(err instanceof Error ? err.message : String(err));
+                    if (err && typeof err === 'object' && 'hint' in err && err.hint)
+                        log.error(`Hint: ${err.hint}`);
                 }
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
             }
@@ -952,12 +1020,12 @@ Examples:
     browser.command('bind')
         .description('Bind the current Chrome tab/window to the browser session named by <session>')
         .action(browserSessionCommandAction(async ({ session }) => {
-        throw new Error('browser bind not available in hub-browser (use opencli adapters instead)');
+        throw new Error('browser bind not available in hub-browser (use hub adapters instead)');
     }));
     browser.command('unbind')
         .description('Detach the bound browser session named by <session> without closing the user tab/window')
         .action(browserSessionCommandAction(async ({ session }) => {
-        throw new Error('browser unbind not available in hub-browser (use opencli adapters instead)');
+        throw new Error('browser unbind not available in hub-browser (use hub adapters instead)');
     }));
     const browserTab = browser
         .command('tab')
@@ -965,7 +1033,15 @@ Examples:
     browserTab.command('list')
         .description('List tabs in the browser session with target IDs')
         .action(browserAction(async (page) => {
-        const tabs = await page.tabs();
+        let tabs = await page.tabs();
+        // Phase 3 B: with a current space the listing is scoped to that
+        // space's tabs (legacy unfiltered behavior without one).
+        // bug 1 (D5): pass the already-connected page as the manager gateway
+        // so raw tab-group edits (拖入/拖出) are reconciled into the ledger
+        // before the scoped answer — no second bridge/cleanup needed here
+        // (browserAction owns the page lifecycle).
+        const { gatewayFromPage } = await import('../space/task-space-manager.ts');
+        tabs = await scopeTabsToCurrentSpace(tabs, gatewayFromPage(page));
         console.log(JSON.stringify(tabs, null, 2));
     }));
     browserTab.command('new')
@@ -975,20 +1051,55 @@ Examples:
         if (!page.newTab) {
             throw new Error('This browser session does not support creating tabs');
         }
+        // D3 (2026-08-03): space is the precondition for opening tabs — without
+        // a current space `tab new` is rejected (mirrors the MCP `tabs new`
+        // guard) so a fresh tab is never silently created unattributed.
+        const { manager, space } = await currentSpaceForBrowser();
+        if (!space) {
+            throw await noSpaceErrorForBrowser();
+        }
         const createdPage = await page.newTab(url);
+        // Phase 3 B: attribute the fresh tab to the current space so scoped
+        // listings and `space close` include it.
+        let attributed = null;
+        if (typeof createdPage === 'string') {
+            try {
+                const tabs = await page.tabs();
+                const info = tabs.find((t) => t.targetId === createdPage);
+                if (info?.pageId !== undefined) {
+                    const ok = await manager.recordTabForCurrentSpace(
+                        LOCAL_SPACE_IDENTITY().agentId,
+                        info.pageId,
+                        url ?? 'about:blank',
+                    );
+                    if (ok) attributed = { spaceId: space.id, pageId: info.pageId };
+                }
+            }
+            catch { /* attribution is best-effort */ }
+        }
         console.log(JSON.stringify({
             page: createdPage,
             url: url ?? null,
+            ...(attributed ? { space: attributed.spaceId, pageId: attributed.pageId } : {}),
         }, null, 2));
     }));
     addBrowserTabOption(browserTab.command('select')
         .argument('[targetId]', 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"')
         .description('Select a tab by target ID and make it the default browser tab'))
         .action(browserAction(async (page, targetId, opts) => {
+        // D3 (2026-08-03): space is the precondition — reject before resolving
+        // the target so the no-space hint is always the surfaced error.
+        const { space } = await currentSpaceForBrowser();
+        if (!space) {
+            throw await noSpaceErrorForBrowser();
+        }
         const resolvedTarget = resolveBrowserTabTarget(targetId, opts);
         if (!resolvedTarget) {
             throw new Error('Target tab required. Pass it as an argument or --tab <targetId>.');
         }
+        // Phase 3 B guard (bug #4): the tab must belong to the current space;
+        // selecting another agent's tab is rejected.
+        await assertTabInCurrentSpace(page, resolvedTarget);
         await page.selectTab(resolvedTarget);
         saveBrowserTargetState(resolvedTarget, getPageScope(page));
         console.log(JSON.stringify({ selected: resolvedTarget }, null, 2));
@@ -997,6 +1108,12 @@ Examples:
         .argument('[targetId]', 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"')
         .description('Close a tab by target ID'))
         .action(browserAction(async (page, targetId, opts) => {
+        // D3 (2026-08-03): space is the precondition — reject before resolving
+        // the target so the no-space hint is always the surfaced error.
+        const { space } = await currentSpaceForBrowser();
+        if (!space) {
+            throw await noSpaceErrorForBrowser();
+        }
         const resolvedTarget = resolveBrowserTabTarget(targetId, opts);
         if (!page.closeTab) {
             throw new Error('This browser session does not support closing tabs');
@@ -1011,7 +1128,15 @@ Examples:
         if (!validatedTarget) {
             throw new Error(`Target tab ${resolvedTarget} is not part of the current browser session.`);
         }
-        await page.closeTab(validatedTarget);
+        // Phase 3 B: when the tab belongs to the current space, close it through
+        // the manager so the space ledger stays in sync. The raw fallback must
+        // never bypass the guard (bug #4: closing another agent's tab); D3 —
+        // without a space this path is already rejected above.
+        const closedThroughSpace = await closeTabThroughCurrentSpace(page, validatedTarget);
+        if (!closedThroughSpace) {
+            await assertTabInCurrentSpace(page, validatedTarget);
+            await page.closeTab(validatedTarget);
+        }
         const scope = getPageScope(page);
         if (loadBrowserTargetState(scope)?.defaultPage === validatedTarget) {
             saveBrowserTargetState(undefined, scope);
@@ -1102,10 +1227,25 @@ Examples:
     }));
     // ── Navigation ──
     addBrowserTabOption(browser.command('open').argument('<url>').description('Open URL in the browser session'))
-        .action(browserAction(async (page, url, opts) => {
+        .action(browserAction(async (page, url, opts, command) => {
+        // Phase 3 B: with a current space (and no explicit --tab target) the
+        // open is routed through the manager's openTab path — a fresh tab is
+        // created in the space and made active, so subsequent browser commands
+        // operate on it and `space close` cleans it up.
+        // D3 (2026-08-03): without a current space the open is REJECTED — the
+        // legacy navigate-the-connected-page behavior is gone (including the
+        // explicit --tab path), matching the MCP navigate guard.
+        const explicitTab = getBrowserTargetId(command);
+        const { space } = await currentSpaceForBrowser();
+        if (!space) {
+            throw await noSpaceErrorForBrowser();
+        }
+        const opened = explicitTab ? null : await openIntoCurrentSpace(page, url);
         // Start session-level capture before navigation (catches initial requests)
         const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
-        await page.goto(url);
+        if (!opened) {
+            await page.goto(url);
+        }
         await page.wait(2);
         // Fallback: inject JS interceptor when session capture is unavailable
         if (!hasSessionCapture) {
@@ -1118,6 +1258,9 @@ Examples:
         const sitemap = sitemapHintForBrowserUrl(currentUrl, getPageScope(page), { oncePerSession: true });
         console.log(JSON.stringify({
             url: currentUrl,
+            ...(opened
+                ? { pageId: opened.pageId, spaceId: opened.spaceId, reused: opened.reused }
+                : {}),
             ...(page.getActivePage?.() ? { page: page.getActivePage?.() } : {}),
             ...(sitemap ? { sitemap } : {}),
         }, null, 2));
@@ -1523,7 +1666,7 @@ Examples:
                 error: {
                     code: 'usage_error',
                     message: '--css <selector> or a semantic locator flag is required',
-                    hint: 'Examples: opencli browser find --css ".btn.primary"; opencli browser find --role button --name Save',
+                    hint: 'Examples: hub browser find --css ".btn.primary"; hub browser find --role button --name Save',
                 },
             }, null, 2));
             process.exitCode = EXIT_CODES.USAGE_ERROR;
@@ -1746,7 +1889,7 @@ Examples:
             return;
         }
         if (max > 0 && html.length > max) {
-            console.log(`<!-- opencli: truncated ${max} of ${html.length} chars; re-run without --max (or --max 0) for full -->\n${html.slice(0, max)}`);
+            console.log(`<!-- hub: truncated ${max} of ${html.length} chars; re-run without --max (or --max 0) for full -->\n${html.slice(0, max)}`);
             return;
         }
         console.log(html);
@@ -1785,7 +1928,7 @@ Examples:
                 error: {
                     code: 'usage_error',
                     message: 'At least one file path is required.',
-                    hint: 'Example: opencli browser upload "input[type=file]" ./receipt.pdf',
+                    hint: 'Example: hub browser upload "input[type=file]" ./receipt.pdf',
                 },
             };
         }
@@ -1965,10 +2108,43 @@ Examples:
         .argument('[targetOrFile]', 'Numeric ref/CSS target, or first file when using --role/--name/etc.')
         .argument('[files...]', 'Local file path(s) to attach')
         .option('--nth <n>', 'When <target> is a multi-match CSS selector, pick the nth match (0-based)')
+        .option('--file <path>', 'Local file to attach (Phase 4.7 fork-tool surface: hub browser upload <ref> --file ./a.pdf)')
+        .option('--files <paths>', 'Comma-separated local files to attach (hub browser upload <ref> --files a.pdf,b.pdf)')
+        .option('--json', 'Print the structured envelope', false)
         .description('Attach local files to a file input — JSON envelope {uploaded, files, file_names, target, matches_n}'))
         .action(browserAction(async (page, targetOrFile, files, opts) => {
         if (typeof page.uploadFiles !== 'function')
             throw new Error('browser upload is not supported by this browser backend');
+        // Phase 4.7 — fork upload tool path (`upload <ref> --file x` / `--files a,b`).
+        const optionFiles = (opts?.file !== undefined && String(opts.file).trim())
+            ? [String(opts.file)]
+            : (typeof opts?.files === 'string' && opts.files.trim())
+                ? [...String(opts.files).split(',').map((s) => s.trim()).filter(Boolean),
+                   ...(Array.isArray(files) ? files : [])].filter(Boolean)
+                : null;
+        if (optionFiles !== null) {
+            const cleanRef = stripAtPrefix(targetOrFile);
+            if (!cleanRef) {
+                console.log(JSON.stringify({
+                    error: { code: 'usage_error', message: 'Pass the file input ref as the first argument (e.g. hub browser upload 5 --file ./a.pdf)' },
+                }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            const resolvedFiles = resolveUploadFilePaths(optionFiles);
+            if ('error' in resolvedFiles) {
+                console.log(JSON.stringify({ error: resolvedFiles.error }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            const result = await runForkBrowserTool('upload', {
+                ...forkToolArgsFor(page),
+                ref: cleanRef,
+                files: resolvedFiles.files,
+            }, page);
+            printForkToolResult(result, { json: opts?.json === true });
+            return;
+        }
         const hasSemantic = !!semanticLocatorFromOptions(opts ?? {});
         const target = hasSemantic ? undefined : targetOrFile;
         const resolvedTarget = await resolveWriteTargetOrPrint(page, target, opts ?? {});
@@ -2266,6 +2442,154 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
         }
     }));
+    // ── Phase 4: Diff / Read / Grep / PDF / Download (fork tool wrappers) ──
+    // Each command is a thin wrapper over the matching src/browser-mcp tool,
+    // executed against the CLI-connected UnifiedPage (same implementation the
+    // MCP server uses).
+    addBrowserTabOption(browser.command('diff')
+        .option('--json', 'Print the structured diff envelope instead of formatted text', false)
+        .description('Show what changed on the page since the last snapshot/diff'))
+        .action(browserAction(async (page, opts) => {
+        const result = await runForkBrowserTool('diff', forkToolArgsFor(page), page);
+        printForkToolResult(result, { json: opts?.json === true });
+    }));
+    addBrowserTabOption(browser.command('read')
+        .option('--format <format>', 'Content format: markdown (default), text, or links', 'markdown')
+        .option('--selector <selector>', 'Restrict extraction to a CSS subtree')
+        .option('--viewport-only', 'For markdown reads, include only visible viewport content', false)
+        .option('--include-links', 'For markdown reads, render links as markdown links', false)
+        .option('--include-images', 'For markdown reads, include image references', false)
+        .option('--json', 'Print the structured envelope instead of extracted text', false)
+        .description('Extract page content as markdown (default), plain text, or a list of links'))
+        .action(browserAction(async (page, opts) => {
+        const format = String(opts?.format ?? 'markdown').toLowerCase();
+        if (format !== 'markdown' && format !== 'text' && format !== 'links') {
+            console.log(JSON.stringify({
+                error: {
+                    code: 'usage_error',
+                    message: `--format must be one of: markdown, text, links. Received: "${opts?.format}"`,
+                },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await runForkBrowserTool('read', {
+            ...forkToolArgsFor(page),
+            format,
+            ...(opts?.selector ? { selector: String(opts.selector) } : {}),
+            ...(opts?.viewportOnly ? { viewportOnly: true } : {}),
+            ...(opts?.includeLinks ? { includeLinks: true } : {}),
+            ...(opts?.includeImages ? { includeImages: true } : {}),
+        }, page);
+        printForkToolResult(result, { json: opts?.json === true });
+    }));
+    addBrowserTabOption(browser.command('grep')
+        .argument('<pattern>', 'Case-insensitive regular expression')
+        .option('--over <source>', 'Search surface: ax (snapshot lines with refs) or content (visible text)', 'ax')
+        .option('--limit <n>', 'Max matching lines', '50')
+        .option('--json', 'Print the structured envelope instead of matching lines', false)
+        .description('Search the page without dumping it — matches keep their refs when over=ax'))
+        .action(browserAction(async (page, pattern, opts) => {
+        const over = String(opts?.over ?? 'ax').toLowerCase();
+        if (over !== 'ax' && over !== 'content') {
+            console.log(JSON.stringify({
+                error: { code: 'usage_error', message: `--over must be "ax" or "content", got "${opts?.over}"` },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const limit = parseIntOption(opts?.limit, 'limit', 50);
+        if (limit && typeof limit === 'object' && 'error' in limit) {
+            console.log(JSON.stringify({ error: { code: 'usage_error', message: limit.error } }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await runForkBrowserTool('grep', {
+            ...forkToolArgsFor(page),
+            pattern: String(pattern),
+            over,
+            ...(typeof limit === 'number' ? { limit } : {}),
+        }, page);
+        printForkToolResult(result, { json: opts?.json === true });
+    }));
+    addBrowserTabOption(browser.command('pdf')
+        .option('--path <path>', 'Save the PDF to this path (default: a BrowserOS tool-output file)')
+        .option('--landscape', 'Use landscape orientation', false)
+        .option('--background', 'Compatibility alias for --print-background', false)
+        .option('--print-background', 'Print background graphics', false)
+        .option('--prefer-css-page-size', 'Use CSS page size when the page defines one', false)
+        .option('--json', 'Print the structured envelope', false)
+        .description('Print the current page to a PDF'))
+        .action(browserAction(async (page, opts) => {
+        const result = await runForkBrowserTool('pdf', {
+            ...forkToolArgsFor(page),
+            ...(opts?.landscape ? { landscape: true } : {}),
+            ...(opts?.printBackground || opts?.background ? { printBackground: true } : {}),
+            ...(opts?.preferCssPageSize ? { preferCSSPageSize: true } : {}),
+        }, page);
+        if (result.isError) {
+            printForkToolResult(result, { json: opts?.json === true });
+            return;
+        }
+        const generatedPath = result.structuredContent?.path;
+        const targetPath = typeof opts?.path === 'string' && opts.path.trim() ? opts.path.trim() : undefined;
+        if (!targetPath) {
+            if (opts?.json) {
+                console.log(JSON.stringify(result.structuredContent ?? {}, null, 2));
+            }
+            else {
+                console.log(result.content?.find?.((c) => c.type === 'text')?.text ?? '');
+            }
+            return;
+        }
+        if (typeof generatedPath !== 'string') {
+            console.log(JSON.stringify({
+                error: { code: 'tool_error', message: 'pdf tool did not return an output path' },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.GENERIC_ERROR;
+            return;
+        }
+        try {
+            const { copyFileSync, mkdirSync } = await import('node:fs');
+            const { dirname } = await import('node:path');
+            mkdirSync(dirname(targetPath), { recursive: true });
+            copyFileSync(generatedPath, targetPath);
+        }
+        catch (err) {
+            console.log(JSON.stringify({
+                error: {
+                    code: 'pdf_copy_failed',
+                    message: `PDF generated to ${generatedPath} but could not be copied to ${targetPath}: ${err instanceof Error ? err.message : String(err)}`,
+                    hint: 'Check --path points to a writable location.',
+                    generatedPath,
+                },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.GENERIC_ERROR;
+            return;
+        }
+        if (opts?.json) {
+            console.log(JSON.stringify({ ...(result.structuredContent ?? {}), path: targetPath }, null, 2));
+        }
+        else {
+            console.log(`Saved page as PDF (${result.structuredContent?.bytes ?? '?'} bytes) to: ${targetPath}`);
+        }
+    }));
+    addBrowserTabOption(browser.command('download')
+        .argument('<ref>', 'Ref of the element that triggers the download (from browser state / snapshot)')
+        .option('--json', 'Print the structured envelope', false)
+        .description('Click an element to trigger a file download and save it to a BrowserOS output file'))
+        .action(browserAction(async (page, ref, opts) => {
+        const cleanRef = stripAtPrefix(ref);
+        if (!cleanRef) {
+            console.log(JSON.stringify({
+                error: { code: 'usage_error', message: 'Pass the element ref that triggers the download (e.g. hub browser download 5)' },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await runForkBrowserTool('download', { ...forkToolArgsFor(page), ref: cleanRef }, page);
+        printForkToolResult(result, { json: opts?.json === true });
+    }));
     // ── Extract ──
     addBrowserTabOption(browser.command('eval')
         .argument('<js>', 'JavaScript code')
@@ -2351,7 +2675,7 @@ Examples:
     // Default output is JSON (agent-native). Each entry carries a stable `key`
     // (GraphQL operationName or `METHOD host+pathname`) so agents can fetch
     // full bodies with `--detail <key>` even after subsequent commands.
-    // Captures are persisted per browser session under ~/.opencli/cache/browser-network/.
+    // Captures are persisted per browser session under ~/.hub/cache/browser-network/.
     addBrowserTabOption(browser.command('network'))
         .option('--detail <key>', 'Emit full body for the entry with this key')
         .option('--all', 'Include static resources (js/css/images/telemetry)')
@@ -2582,7 +2906,7 @@ Examples:
     // ── Init (adapter scaffolding) ──
     browser.command('init')
         .argument('<name>', 'Adapter name in site/command format (e.g. hn/top)')
-        .description('Generate adapter scaffold in ~/.opencli/clis/')
+        .description('Generate adapter scaffold in ~/.hub/clis/')
         .action(async (name) => {
         try {
             const parts = name.split('/');
@@ -2600,7 +2924,7 @@ Examples:
             const os = await import('node:os');
             const fs = await import('node:fs');
             const path = await import('node:path');
-            const dir = path.join(os.homedir(), '.opencli', 'clis', site);
+            const dir = path.join(hubUserRoot(), 'clis', site);
             const filePath = path.join(dir, `${command}.js`);
             if (fs.existsSync(filePath)) {
                 console.log(`Adapter already exists: ${filePath}`);
@@ -2614,7 +2938,7 @@ cli({
   name: '${command}',
   description: '', // TODO: describe what this command does
   access: 'read',  // TODO: 'read' for queries, 'write' for remote/account state changes
-  example: 'opencli ${site} ${command} -f yaml',
+  example: 'hub ${site} ${command} -f yaml',
   domain: '${domain}',
   strategy: Strategy.PUBLIC, // TODO: PUBLIC (no auth), COOKIE (needs login), UI (DOM interaction)
   browser: false,            // TODO: set true if needs browser
@@ -2633,8 +2957,8 @@ cli({
             fs.mkdirSync(dir, { recursive: true });
             fs.writeFileSync(filePath, template, 'utf-8');
             console.log(`Created: ${filePath}`);
-            console.log('First time on this site? Run: opencli browser analyze <url>');
-            console.log(`Edit the file to implement your adapter, then run: opencli browser verify ${name}`);
+            console.log('First time on this site? Run: hub browser analyze <url>');
+            console.log(`Edit the file to implement your adapter, then run: hub browser verify ${name}`);
         }
         catch (err) {
             console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -2644,13 +2968,13 @@ cli({
     // ── Verify (test adapter) ──
     browser.command('verify')
         .argument('<name>', 'Adapter name in site/command format (e.g. hn/top)')
-        .option('--write-fixture', 'Write a starter fixture to ~/.opencli/sites/<site>/verify/<command>.json if none exists')
+        .option('--write-fixture', 'Write a starter fixture to ~/.hub/config/sites/<site>/verify/<command>.json if none exists')
         .option('--update-fixture', 'Overwrite an existing fixture with one derived from current output')
         .option('--no-fixture', 'Ignore any fixture file for this run (no value-level validation)')
-        .option('--strict-memory', 'Fail (not just warn) when ~/.opencli/sites/<site>/endpoints.json or notes.md is missing')
+        .option('--strict-memory', 'Fail (not just warn) when ~/.hub/config/sites/<site>/endpoints.json or notes.md is missing')
         .option('--seed-args <value>', 'Seed args when no fixture exists; use JSON array/object for multiple args or flags')
         .option('--trace <mode>', 'Trace capture for the adapter subprocess: off, on, retain-on-failure', 'off')
-        .description('Execute an adapter and validate output; uses fixture at ~/.opencli/sites/<site>/verify/<cmd>.json when present')
+        .description('Execute an adapter and validate output; uses fixture at ~/.hub/config/sites/<site>/verify/<cmd>.json when present')
         .action(async (name, opts = {}) => {
         try {
             const parts = name.split('/');
@@ -2667,10 +2991,10 @@ cli({
             }
             const { execFileSync } = await import('node:child_process');
             const { loadFixture, writeFixture, deriveFixture, validateRows, validateRowShape, fixturePath, expandFixtureArgs, parseSeedArgs } = await import('./browser/verify-fixture.js');
-            const filePath = path.join(os.homedir(), '.opencli', 'clis', site, `${command}.js`);
+            const filePath = path.join(hubUserRoot(), 'clis', site, `${command}.js`);
             if (!fs.existsSync(filePath)) {
                 console.error(`Adapter not found: ${filePath}`);
-                console.error(`Run "opencli browser init ${name}" to create it.`);
+                console.error(`Run "hub browser init ${name}" to create it.`);
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
                 return;
             }
@@ -2705,7 +3029,7 @@ cli({
                 });
             }
             catch (err) {
-                console.log(`  Executing: opencli ${site} ${command} ${argDisplay}\n`);
+                console.log(`  Executing: hub ${site} ${command} ${argDisplay}\n`);
                 const execErr = err;
                 if (execErr.stdout)
                     console.log(String(execErr.stdout));
@@ -2715,7 +3039,7 @@ cli({
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
                 return;
             }
-            console.log(`  Executing: opencli ${site} ${command} ${argDisplay}\n`);
+            console.log(`  Executing: hub ${site} ${command} ${argDisplay}\n`);
             let rows;
             try {
                 rows = normalizeVerifyRows(JSON.parse(rawJson));
@@ -2799,6 +3123,949 @@ cli({
         await page.closeWindow?.();
         console.log('Browser session tab lease released');
     }));
+    // ── Built-in: bookmarks (Phase 4.2 — BrowserClaw Bookmarks CDP domain) ──
+    //
+    // Browser-level domain exposed by the BrowserClaw extension. These commands
+    // connect a browser session named "bookmarks" (same UnifiedPage path every
+    // browser command uses) and call Bookmarks.* via page.cdp().
+    const bookmarksCmd = program
+        .command('bookmarks')
+        .description('Bookmark management — list, search, add, update, move, remove (Phase 4.2)');
+    function formatBookmarkNode(node) {
+        const typeLabel = node?.type === 'folder' ? '[folder]' : '[url]';
+        const title = node?.title ?? '(untitled)';
+        if (node?.type === 'folder')
+            return `- ${typeLabel} ${title} (id: ${node.id})`;
+        return `- ${typeLabel} ${title} — ${node?.url ?? ''} (id: ${node.id})`;
+    }
+    function formatBookmarkList(nodes) {
+        if (!Array.isArray(nodes) || nodes.length === 0)
+            return '(no bookmarks)';
+        return nodes.map(formatBookmarkNode).join('\n');
+    }
+    bookmarksCmd.command('list')
+        .option('--folder <folderId>', 'Only list bookmarks under this folder')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('List bookmarks (all, or under --folder)')
+        .action(browserAction(async (page, opts) => {
+        const params = {};
+        if (opts?.folder !== undefined && String(opts.folder).trim())
+            params.folderId = String(opts.folder).trim();
+        const result = await page.cdp('Bookmarks.getBookmarks', params);
+        const nodes = result?.nodes ?? [];
+        if (opts?.json) {
+            console.log(JSON.stringify({ nodes, count: nodes.length }, null, 2));
+            return;
+        }
+        console.log(formatBookmarkList(nodes));
+    }, { session: 'bookmarks' }));
+    bookmarksCmd.command('search')
+        .argument('<query>', 'Search query')
+        .option('--limit <n>', 'Max results', '100')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Search bookmarks')
+        .action(browserAction(async (page, query, opts) => {
+        const limit = parseIntOption(opts?.limit, 'limit', 100);
+        if (limit && typeof limit === 'object' && 'error' in limit) {
+            console.log(JSON.stringify({ error: { code: 'usage_error', message: limit.error } }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await page.cdp('Bookmarks.searchBookmarks', {
+            query: String(query),
+            ...(typeof limit === 'number' && limit > 0 ? { maxResults: limit } : {}),
+        });
+        const results = result?.results ?? [];
+        if (opts?.json) {
+            console.log(JSON.stringify({ results, count: results.length }, null, 2));
+            return;
+        }
+        if (results.length === 0) {
+            console.log('(no matching bookmarks)');
+            return;
+        }
+        console.log(formatBookmarkList(results));
+    }, { session: 'bookmarks' }));
+    bookmarksCmd.command('add')
+        .option('--title <title>', 'Bookmark/folder title (required)')
+        .option('--url <url>', 'URL for a bookmark (omit to create a folder)')
+        .option('--folder', 'Create a folder instead of a URL bookmark', false)
+        .option('--parent <parentId>', 'Parent folder id')
+        .option('--index <n>', 'Position within the parent folder')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Add a bookmark (or a folder with --folder)')
+        .action(browserAction(async (page, opts) => {
+        const title = typeof opts?.title === 'string' && opts.title.trim() ? opts.title.trim() : undefined;
+        if (!title) {
+            console.log(JSON.stringify({ error: { code: 'usage_error', message: '--title is required' } }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const params = { title };
+        if (!opts?.folder) {
+            const url = typeof opts?.url === 'string' && opts.url.trim() ? opts.url.trim() : undefined;
+            if (!url) {
+                console.log(JSON.stringify({
+                    error: { code: 'usage_error', message: '--url is required unless --folder is used', hint: 'hub bookmarks add --title "文件夹" --folder' },
+                }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            params.url = url;
+        }
+        if (opts?.parent !== undefined && String(opts.parent).trim())
+            params.parentId = String(opts.parent).trim();
+        if (opts?.index !== undefined && opts.index !== '') {
+            const index = parseIntOption(opts.index, 'index', undefined);
+            if (index && typeof index === 'object' && 'error' in index) {
+                console.log(JSON.stringify({ error: { code: 'usage_error', message: index.error } }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            if (typeof index === 'number')
+                params.index = index;
+        }
+        const result = await page.cdp('Bookmarks.createBookmark', params);
+        const node = result?.node;
+        if (opts?.json) {
+            console.log(JSON.stringify({ node }, null, 2));
+            return;
+        }
+        console.log(`Created ${node?.type === 'folder' ? 'folder' : 'bookmark'} ${node?.id ?? ''}${node?.title ? ` (${node.title})` : ''}`);
+    }, { session: 'bookmarks' }));
+    bookmarksCmd.command('update')
+        .argument('<id>', 'Bookmark id')
+        .option('--title <title>', 'New title')
+        .option('--url <url>', 'New URL')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Update a bookmark')
+        .action(browserAction(async (page, id, opts) => {
+        const params = { id: String(id) };
+        if (opts?.title !== undefined && opts.title !== '')
+            params.title = String(opts.title);
+        if (opts?.url !== undefined && opts.url !== '')
+            params.url = String(opts.url);
+        if (params.title === undefined && params.url === undefined) {
+            console.log(JSON.stringify({
+                error: { code: 'usage_error', message: 'Pass --title and/or --url' },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await page.cdp('Bookmarks.updateBookmark', params);
+        const node = result?.node;
+        if (opts?.json) {
+            console.log(JSON.stringify({ node }, null, 2));
+            return;
+        }
+        console.log(`Updated bookmark ${id}${node?.title ? ` (${node.title})` : ''}`);
+    }, { session: 'bookmarks' }));
+    bookmarksCmd.command('move')
+        .argument('<id>', 'Bookmark id')
+        .option('--parent <parentId>', 'Destination folder id')
+        .option('--index <n>', 'Position within the destination folder')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Move a bookmark to another folder / index')
+        .action(browserAction(async (page, id, opts) => {
+        const params = { id: String(id) };
+        if (opts?.parent !== undefined && String(opts.parent).trim())
+            params.parentId = String(opts.parent).trim();
+        if (opts?.index !== undefined && opts.index !== '') {
+            const index = parseIntOption(opts.index, 'index', undefined);
+            if (index && typeof index === 'object' && 'error' in index) {
+                console.log(JSON.stringify({ error: { code: 'usage_error', message: index.error } }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            if (typeof index === 'number')
+                params.index = index;
+        }
+        const result = await page.cdp('Bookmarks.moveBookmark', params);
+        const node = result?.node;
+        if (opts?.json) {
+            console.log(JSON.stringify({ node }, null, 2));
+            return;
+        }
+        console.log(`Moved bookmark ${id}${node?.parentId ? ` to folder ${node.parentId}` : ''}`);
+    }, { session: 'bookmarks' }));
+    bookmarksCmd.command('remove')
+        .argument('<id>', 'Bookmark id')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Remove a bookmark')
+        .action(browserAction(async (page, id, opts) => {
+        await page.cdp('Bookmarks.removeBookmark', { id: String(id) });
+        if (opts?.json) {
+            console.log(JSON.stringify({ removed: String(id) }, null, 2));
+            return;
+        }
+        console.log(`Removed bookmark ${id}`);
+    }, { session: 'bookmarks' }));
+
+    // ── Built-in: history (Phase 4.3 — History CDP domain / fork history tool) ──
+    const historyCmd = program
+        .command('history')
+        .description('Browser history — list and search (Phase 4.3)');
+    function parseHistorySince(raw) {
+        if (raw === undefined || raw === null || raw === '')
+            return undefined;
+        const str = String(raw).trim();
+        const numeric = Number(str);
+        const ts = str !== '' && Number.isFinite(numeric) ? numeric : Date.parse(str);
+        if (!Number.isFinite(ts))
+            return { error: `--since must be an ISO date (e.g. 2025-01-01) or a millisecond timestamp, got "${raw}"` };
+        return ts;
+    }
+    function filterHistoryByDomain(entries, domain) {
+        if (!domain)
+            return entries;
+        const d = String(domain).toLowerCase().replace(/^\./, '');
+        return (entries ?? []).filter((e) => {
+            try {
+                const host = new URL(e.url ?? '').hostname.toLowerCase();
+                return host === d || host.endsWith('.' + d);
+            }
+            catch {
+                return false;
+            }
+        });
+    }
+    function formatHistoryEntries(entries) {
+        if (!Array.isArray(entries) || entries.length === 0)
+            return '(no history)';
+        return entries.map((e) => {
+            const dest = e.title ? `${e.title} (${e.url})` : e.url;
+            const visits = e.visitCount === 1 ? 'visit' : 'visits';
+            const when = e.lastVisitTime
+                ? new Date(e.lastVisitTime).toISOString().replace('.000Z', 'Z')
+                : 'unknown';
+            return `- ${dest} — last visited ${when}; ${e.visitCount ?? 0} ${visits}; ${e.typedCount ?? 0} typed`;
+        }).join('\n');
+    }
+    historyCmd.command('list')
+        .option('--limit <n>', 'Max entries', '100')
+        .option('--since <date>', 'Only entries visited at or after this ISO date / millisecond timestamp')
+        .option('--domain <domain>', 'Only entries from this host/domain (e.g. github.com)')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('List recent browser history (reuses the fork history tool)')
+        .action(browserAction(async (page, opts) => {
+        const limit = parseIntOption(opts?.limit, 'limit', 100);
+        if (limit && typeof limit === 'object' && 'error' in limit) {
+            console.log(JSON.stringify({ error: { code: 'usage_error', message: limit.error } }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const since = parseHistorySince(opts?.since);
+        if (since && typeof since === 'object' && 'error' in since) {
+            console.log(JSON.stringify({ error: { code: 'usage_error', message: since.error } }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await runForkBrowserTool('history', {
+            ...(typeof limit === 'number' && limit > 0 ? { maxResults: limit } : {}),
+        }, page);
+        if (result.isError) {
+            printForkToolResult(result, { json: opts?.json === true });
+            return;
+        }
+        let entries = result.structuredContent?.entries ?? [];
+        if (typeof since === 'number')
+            entries = entries.filter((e) => Number(e.lastVisitTime ?? 0) >= since);
+        entries = filterHistoryByDomain(entries, opts?.domain);
+        if (opts?.json) {
+            console.log(JSON.stringify({ entries, count: entries.length }, null, 2));
+            return;
+        }
+        console.log(formatHistoryEntries(entries));
+    }, { session: 'history' }));
+    historyCmd.command('search')
+        .argument('<query>', 'Search query')
+        .option('--limit <n>', 'Max results', '100')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Search browser history (History.search CDP domain)')
+        .action(browserAction(async (page, query, opts) => {
+        const limit = parseIntOption(opts?.limit, 'limit', 100);
+        if (limit && typeof limit === 'object' && 'error' in limit) {
+            console.log(JSON.stringify({ error: { code: 'usage_error', message: limit.error } }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const result = await page.cdp('History.search', {
+            query: String(query),
+            ...(typeof limit === 'number' && limit > 0 ? { maxResults: limit } : {}),
+        });
+        const entries = result?.entries ?? [];
+        if (opts?.json) {
+            console.log(JSON.stringify({ entries, count: entries.length }, null, 2));
+            return;
+        }
+        if (entries.length === 0) {
+            console.log('(no matching history entries)');
+            return;
+        }
+        console.log(formatHistoryEntries(entries));
+    }, { session: 'history' }));
+
+    // ── Built-in: replay (Phase 4.6 — claw-server-rust HTTP API) ──
+    //
+    // Endpoints (see apps/claw-server-rust/src/api/http/{mod,replay,sessions}.rs
+    // and contracts/claw-api/paths/recordings.yaml):
+    //   GET /api/v1/sessions                          -> SessionList { items }
+    //   GET /api/v1/sessions/{id}/recording           -> RecordingMetadata
+    //   GET /api/v1/sessions/{id}/recording/events    -> newline-delimited rrweb events
+    const REPLAY_DEFAULT_BASE_URL = 'http://127.0.0.1:9200';
+    function replayBaseUrl(opts = {}) {
+        if (typeof opts.baseUrl === 'string' && opts.baseUrl.trim())
+            return opts.baseUrl.trim().replace(/\/+$/, '');
+        const envUrl = process.env.CLAW_SERVER_URL || process.env.BROWSEROS_SERVER_URL;
+        if (envUrl && envUrl.trim())
+            return envUrl.trim().replace(/\/+$/, '');
+        const envPort = process.env.BROWSEROS_SERVER_PORT;
+        if (envPort && /^\d+$/.test(envPort))
+            return `http://127.0.0.1:${envPort}`;
+        return REPLAY_DEFAULT_BASE_URL;
+    }
+    async function replayFetchJson(url, timeoutMs = 5000) {
+        const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+        if (!res.ok) {
+            let detail = '';
+            try {
+                const body = await res.json();
+                detail = body?.error?.message ?? body?.message ?? JSON.stringify(body);
+            }
+            catch {
+                detail = await res.text().catch(() => '');
+            }
+            const err = new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
+            err.status = res.status;
+            throw err;
+        }
+        return res.json();
+    }
+    async function replayFetchText(url, timeoutMs = 10000) {
+        const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+        if (!res.ok) {
+            let detail = '';
+            try {
+                detail = await res.text();
+            }
+            catch { /* no body */ }
+            const err = new Error(`HTTP ${res.status}${detail ? `: ${detail.slice(0, 300)}` : ''}`);
+            err.status = res.status;
+            throw err;
+        }
+        return res.text();
+    }
+    function replayDependencyHint(baseUrl) {
+        return `replay depends on the BrowserClaw server (claw-server-rust) HTTP API at ${baseUrl}. ` +
+            'Start it (e.g. `browseros-dev watch --claw`), or point this CLI at it with --base-url / CLAW_SERVER_URL / BROWSEROS_SERVER_PORT.';
+    }
+    function printReplayError(err, baseUrl) {
+        // HTTP errors carry a status; anything else is a transport failure
+        // (Bun's fetch throws name:'Error' with "Unable to connect...", Node
+        // uses TypeError "fetch failed", undici ECONNREFUSED, etc.).
+        const isHttpError = !!err && typeof err.status === 'number';
+        if (isHttpError) {
+            console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        else {
+            console.error(`Error: could not reach the BrowserClaw server at ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`);
+            console.error(replayDependencyHint(baseUrl));
+        }
+        process.exitCode = EXIT_CODES.SERVICE_UNAVAIL;
+    }
+    function replayTimeline(ndjson) {
+        const lines = ndjson.split('\n').filter((l) => l.trim().length > 0);
+        const counts = new Map();
+        const timestamps = [];
+        for (const line of lines) {
+            try {
+                const evt = JSON.parse(line);
+                counts.set(evt.type, (counts.get(evt.type) ?? 0) + 1);
+                if (typeof evt.timestamp === 'number')
+                    timestamps.push(evt.timestamp);
+            }
+            catch { /* skip malformed lines */ }
+        }
+        return {
+            events: lines.length,
+            types: Object.fromEntries(counts),
+            ...(timestamps.length
+                ? { firstEventAt: Math.min(...timestamps), lastEventAt: Math.max(...timestamps) }
+                : {}),
+        };
+    }
+    const replayCmd = program
+        .command('replay')
+        .description('Recording replay — list, show, and export session recordings from the BrowserClaw server (Phase 4.6)');
+    replayCmd.command('list')
+        .option('--limit <n>', 'Max sessions to list (and probe for recordings)', '20')
+        .option('--no-recordings', 'Skip per-session recording probes (faster)')
+        .option('--base-url <url>', 'BrowserClaw server base URL (default: CLAW_SERVER_URL env or http://127.0.0.1:9200)')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('List sessions from the BrowserClaw server, annotated with recording presence')
+        .action(async (opts) => {
+        const baseUrl = replayBaseUrl(opts ?? {});
+        try {
+            const data = await replayFetchJson(`${baseUrl}/api/v1/sessions`);
+            const all = data?.items ?? [];
+            const limit = parseIntOption(opts?.limit, 'limit', 20);
+            if (limit && typeof limit === 'object' && 'error' in limit) {
+                console.log(JSON.stringify({ error: { code: 'usage_error', message: limit.error } }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            const sessions = typeof limit === 'number' && limit >= 0 ? all.slice(0, limit) : all;
+            let rows = sessions;
+            if (opts?.recordings !== false) {
+                const annotated = [];
+                let idx = 0;
+                async function worker() {
+                    while (idx < sessions.length) {
+                        const session = sessions[idx++];
+                        try {
+                            const meta = await replayFetchJson(
+                                `${baseUrl}/api/v1/sessions/${encodeURIComponent(session.sessionId)}/recording`,
+                                1500,
+                            );
+                            annotated.push({ ...session, recording: meta ?? null });
+                        }
+                        catch {
+                            annotated.push({ ...session, recording: null });
+                        }
+                    }
+                }
+                const workers = Math.max(1, Math.min(8, sessions.length));
+                await Promise.all(Array.from({ length: workers }, () => worker()));
+                rows = annotated;
+            }
+            if (opts?.json) {
+                console.log(JSON.stringify({ baseUrl, sessions: rows, count: rows.length }, null, 2));
+                return;
+            }
+            if (rows.length === 0) {
+                console.log('(no sessions — start a BrowserClaw session first)');
+                return;
+            }
+            for (const s of rows) {
+                const when = s.startedAt ? new Date(s.startedAt).toISOString() : '?';
+                const recording = s.recording
+                    ? `[recording ${s.recording.sizeBytes ?? 0} bytes${s.recording.complete === false ? ', incomplete' : ''}]`
+                    : (s.recording === null ? '[no recording]' : '');
+                console.log(`- ${s.sessionId}  ${s.status ?? ''}  ${s.name || s.slug || ''}  started ${when}  ${recording}`.trimEnd());
+            }
+        }
+        catch (err) {
+            printReplayError(err, baseUrl);
+        }
+    });
+    replayCmd.command('show')
+        .argument('<sessionId>', 'Session id')
+        .option('--timeline', 'Include the operation timeline (rrweb event types / counts)', false)
+        .option('--base-url <url>', 'BrowserClaw server base URL')
+        .option('--json', 'Print a JSON envelope', false)
+        .description('Show recording metadata for a session')
+        .action(async (sessionId, opts) => {
+        const baseUrl = replayBaseUrl(opts ?? {});
+        try {
+            const meta = await replayFetchJson(`${baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/recording`);
+            let timeline = undefined;
+            if (opts?.timeline) {
+                const ndjson = await replayFetchText(`${baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/recording/events`);
+                timeline = replayTimeline(ndjson);
+            }
+            if (opts?.json) {
+                console.log(JSON.stringify({
+                    sessionId,
+                    recording: meta,
+                    ...(timeline ? { timeline } : {}),
+                }, null, 2));
+                return;
+            }
+            console.log(`Session ${sessionId}`);
+            console.log(`  hasData: ${meta?.hasData ?? false}`);
+            console.log(`  complete: ${meta?.complete ?? false}`);
+            console.log(`  sizeBytes: ${meta?.sizeBytes ?? 0}`);
+            if (meta?.firstEventAt)
+                console.log(`  firstEventAt: ${new Date(meta.firstEventAt).toISOString()}`);
+            if (meta?.lastEventAt)
+                console.log(`  lastEventAt: ${new Date(meta.lastEventAt).toISOString()}`);
+            const tabs = meta?.tabs ?? [];
+            console.log(`  tabs: ${tabs.length}`);
+            for (const tab of tabs) {
+                const segs = tab?.segments ?? [];
+                const first = tab?.firstEventAt ? new Date(tab.firstEventAt).toISOString() : '?';
+                const last = tab?.lastEventAt ? new Date(tab.lastEventAt).toISOString() : '?';
+                console.log(`    tab ${tab.tabId} — ${tab.complete === false ? 'incomplete' : 'complete'} — ${segs.length} segment(s) — first ${first} last ${last}`);
+                for (const seg of segs ?? []) {
+                    console.log(`      segment ${seg.documentId ?? ''} — ${seg.eventCount ?? 0} event(s) — ${seg.sizeBytes ?? 0} bytes${seg.hasGap ? ' (gap)' : ''}`);
+                }
+            }
+            if (timeline) {
+                console.log(`  timeline: ${timeline.events} event(s)`);
+                for (const [type, count] of Object.entries(timeline.types ?? {}))
+                    console.log(`    ${type}: ${count}`);
+            }
+        }
+        catch (err) {
+            printReplayError(err, baseUrl);
+        }
+    });
+    replayCmd.command('export')
+        .argument('<sessionId>', 'Session id')
+        .option('--format <format>', 'Export format: ndjson (raw event stream, default) or json (JSON array)', 'ndjson')
+        .option('--out <path>', 'Write to a file instead of stdout')
+        .option('--base-url <url>', 'BrowserClaw server base URL')
+        .option('--json', 'Print a JSON envelope with the export summary', false)
+        .description('Export a session recording (rrweb events) from the BrowserClaw server')
+        .action(async (sessionId, opts) => {
+        const baseUrl = replayBaseUrl(opts ?? {});
+        try {
+            const ndjson = await replayFetchText(`${baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/recording/events`);
+            const format = String(opts?.format ?? 'ndjson').toLowerCase();
+            if (format !== 'ndjson' && format !== 'json') {
+                console.log(JSON.stringify({
+                    error: { code: 'usage_error', message: `--format must be "ndjson" or "json", got "${opts?.format}"` },
+                }, null, 2));
+                process.exitCode = EXIT_CODES.USAGE_ERROR;
+                return;
+            }
+            const count = ndjson.split('\n').filter((l) => l.trim().length > 0).length;
+            if (opts?.out !== undefined && String(opts.out).trim()) {
+                const { writeFileSync, mkdirSync } = await import('node:fs');
+                const { dirname, resolve } = await import('node:path');
+                const target = resolve(String(opts.out).trim());
+                mkdirSync(dirname(target), { recursive: true });
+                if (format === 'json') {
+                    const parsed = ndjson.split('\n').filter((l) => l.trim().length > 0)
+                        .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+                        .filter((v) => v !== null);
+                    writeFileSync(target, JSON.stringify(parsed, null, 2), 'utf-8');
+                }
+                else {
+                    writeFileSync(target, ndjson, 'utf-8');
+                }
+                if (opts?.json) {
+                    console.log(JSON.stringify({ sessionId, format, out: target, events: count }, null, 2));
+                    return;
+                }
+                console.log(`Exported ${count} event line(s) for ${sessionId} (${format}) to: ${target}`);
+                return;
+            }
+            if (opts?.json) {
+                console.log(JSON.stringify({ sessionId, format, events: count }, null, 2));
+                return;
+            }
+            process.stdout.write(ndjson);
+            if (!ndjson.endsWith('\n'))
+                process.stdout.write('\n');
+        }
+        catch (err) {
+            printReplayError(err, baseUrl);
+        }
+    });
+
+    // ── Built-in: space (Phase 3 — task spaces, shared cookie + agent tab isolation) ──
+    //
+    // TaskSpaceManager lives in the unified Core (src/space/task-space-manager.ts,
+    // hub-browser). These commands are thin wrappers: create/list/switch/handoff/
+    // takeover/current are ledger-only (no browser needed); close needs a browser
+    // gateway to close the space's tabs (uses the daemon singleton when present).
+    const spaceCmd = program
+        .command('space')
+        .description('Task-space management — create, list, switch, close, handoff, takeover (Phase 3)');
+    const LOCAL_SPACE_IDENTITY = () => ({
+        agentId: process.env.HUB_AGENT_ID || 'cli:local',
+        displayName: 'hub local operator',
+    });
+    async function loadSpaceManager(opts = {}) {
+        const { TaskSpaceManager, defaultStoragePath } = await import('../space/task-space-manager.ts');
+        return new TaskSpaceManager({
+            storagePath: process.env.HUB_SPACES_FILE || defaultStoragePath(),
+            ...(opts.gateway ? { gateway: opts.gateway } : {}),
+        });
+    }
+    // ── Phase 3 B: `browser` commands are space-aware ──
+    //
+    // The CLI and the daemon share the ledger (HUB_SPACES_FILE or the default
+    // path). When the local agent has a current space:
+    //   - `browser open` routes through the manager's openTab path (a fresh
+    //     tab is created in the space and made active, so subsequent commands
+    //     operate on it);
+    //   - `browser tab list` is scoped to the current space's tabs;
+    //   - `browser tab new/close` keep the ledger in sync.
+    // D3 (2026-08-03): without a current space the group is closed — `open`,
+    //   `tab select/close/new` are rejected with no-space, `tab list` is empty.
+    async function currentSpaceForBrowser(gateway) {
+        // bug 1 (D5 CLI read paths): pass the browser gateway through so the
+        // manager's lazy tab-group reconcile (syncWithTabGroups) runs before
+        // answering. No gateway (browser unreachable) → reconcile is a no-op
+        // and behavior is unchanged.
+        const manager = await loadSpaceManager(gateway ? { gateway } : {});
+        const space = await manager.currentSpace(LOCAL_SPACE_IDENTITY().agentId);
+        return { manager, space };
+    }
+    /** D3 (2026-08-03): the local agent owns no space — browser tab operations
+     *  are rejected (mirrors execution.js / TaskSpaceManager no-space). */
+    async function noSpaceErrorForBrowser() {
+        const { SpaceGuardError } = await import('../space/task-space-manager.ts');
+        return new SpaceGuardError(
+            'no-space',
+            `agent has no space; run 'hub space create <name>' first`,
+            { hint: 'create a task space first, then operate on its tabs' },
+        );
+    }
+    /** Open a tab inside the current space via manager.openTab. D3 — throws
+     *  no-space when the agent has no current space (no legacy goto fallback). */
+    async function openIntoCurrentSpace(page, url) {
+        const { manager, space } = await currentSpaceForBrowser();
+        if (!space) throw await noSpaceErrorForBrowser();
+        const { gatewayFromPage } = await import('../space/task-space-manager.ts');
+        // background:false — the space tab becomes the active tab so the next
+        // browser command (state/snapshot/click/...) operates on it.
+        // reuse:'exact' — ego openOrReuseTab semantics: the same URL inside the
+        // current space reuses the open tab (switches to it) instead of
+        // opening a duplicate; the result reports reused:true.
+        const { pageId, reused } = await manager.openTabWithReuse(
+            LOCAL_SPACE_IDENTITY().agentId,
+            space.id,
+            url,
+            { background: false, reuse: 'exact' },
+            gatewayFromPage(page),
+        );
+        return { pageId, spaceId: space.id, reused };
+    }
+    /** Scope a live tabs list to the current space by tab identity (bug #5: URL
+     *  filtering leaked another space's same-URL tabs). D3 — without a current
+     *  space the list is EMPTY (no legacy unfiltered listing). */
+    async function scopeTabsToCurrentSpace(tabs, gateway) {
+        const { manager, space } = await currentSpaceForBrowser(gateway);
+        if (!space) return [];
+        const refs = await manager.listTabs(space.id);
+        const pageIds = new Set(refs.map((t) => t.pageId).filter((id) => typeof id === 'number'));
+        return tabs.filter((t) => pageIds.has(t.pageId));
+    }
+    /** Reject a tab that doesn't belong to the current space (bug #4). D3 —
+     *  without a current space the operation is rejected too (no legacy no-op).
+     *  Mirrors the MCP guard message. */
+    async function assertTabInCurrentSpace(page, targetId) {
+        const { manager, space } = await currentSpaceForBrowser();
+        if (!space) throw await noSpaceErrorForBrowser();
+        const tabs = await page.tabs();
+        const info = Array.isArray(tabs) ? tabs.find((t) => t && t.targetId === String(targetId)) : undefined;
+        if (typeof info?.pageId !== 'number') {
+            throw new Error(`tab ${targetId} is not in your space`);
+        }
+        const sid = await manager.spaceIdForPage(info.pageId);
+        if (sid !== space.id) {
+            throw new Error(`tab ${targetId} is not in your space`);
+        }
+    }
+    /** Close a tab through the current space's ledger when it belongs to the space. */
+    async function closeTabThroughCurrentSpace(page, targetId) {
+        try {
+            const { manager, space } = await currentSpaceForBrowser();
+            if (!space) return false;
+            const tabs = await page.tabs();
+            const info = tabs.find((t) => t.targetId === targetId);
+            if (typeof info?.pageId !== 'number') return false;
+            const sid = await manager.spaceIdForPage(info.pageId);
+            if (sid !== space.id) return false;
+            const { gatewayFromPage } = await import('../space/task-space-manager.ts');
+            await manager.closeTab(
+                LOCAL_SPACE_IDENTITY().agentId,
+                space.id,
+                info.pageId,
+                gatewayFromPage(page),
+            );
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
+    /**
+     * Space close/refresh need a browser gateway to close the space's tabs.
+     * Returns `{ gateway, cleanup }`: `gateway` is undefined when no browser is
+     * reachable; `cleanup` is defined only when this call created its own
+     * BrowserBridge (direct-connect path) and must be awaited by the caller
+     * before the process exits (bug #9 — otherwise the CDP connection keeps
+     * the event loop alive and `space close`/`space refresh` hang). The
+     * daemon-singleton path shares the daemon's connection and needs no
+     * cleanup. Honors the __HubBrowserBridgeOverride test seam like
+     * getBrowserPage().
+     */
+    async function spaceGatewayFromBrowser() {
+        try {
+            const singleton = globalThis.__HubBrowserFactory;
+            if (singleton && singleton._cdp && singleton._session) {
+                const { gatewayFromPage } = await import('../space/task-space-manager.ts');
+                return { gateway: gatewayFromPage(await singleton.connect()), cleanup: undefined };
+            }
+            const { BrowserBridge } = await import('./browser/index.js');
+            const { gatewayFromPage } = await import('../space/task-space-manager.ts');
+            const BridgeCtor = globalThis.__HubBrowserBridgeOverride ?? BrowserBridge;
+            const bridge = new BridgeCtor();
+            const cleanup = async () => {
+                if (bridge && typeof bridge.close === 'function') {
+                    try { await bridge.close(); } catch { /* best-effort */ }
+                }
+            };
+            try {
+                const page = await bridge.connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT });
+                return { gateway: gatewayFromPage(page), cleanup };
+            }
+            catch {
+                // Connection failed: still hand the caller a cleanup so the
+                // half-open bridge is torn down and the process can exit.
+                return { gateway: undefined, cleanup };
+            }
+        }
+        catch {
+            return { gateway: undefined, cleanup: undefined };
+        }
+    }
+    function printSpaceError(err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`Error: ${message}`);
+        if (err && typeof err === 'object' && 'code' in err && err.code === 'user-controlling') {
+            console.error(`Hint: the space is currently controlled by the user. Ask the user to confirm, then run: hub space takeover <id>`);
+        }
+        if (err && typeof err === 'object' && 'code' in err && err.code === 'no-gateway') {
+            console.error(`Hint: start the hub daemon (hub) with BROWSEROS_CDP_PORT set, or pass --keep to close only the space ledger.`);
+        }
+        process.exitCode = EXIT_CODES.GENERIC_ERROR;
+    }
+    function formatSpaceTable(spaces) {
+        const rows = spaces.map((s) => [
+            s.id,
+            s.name,
+            s.ownership,
+            String(s.tabIds.length),
+            s.createdAt,
+        ]);
+        const widths = [0, 0, 0, 0, 0];
+        const header = ['ID', 'Name', 'Status', 'Tabs', 'Created'];
+        for (const row of [header, ...rows]) {
+            for (let i = 0; i < row.length; i++) widths[i] = Math.max(widths[i], row[i].length);
+        }
+        const line = (row) => row.map((cell, i) => cell.padEnd(widths[i])).join(' | ').trimEnd();
+        return [line(header), rows.map(line).join('\n')].filter(Boolean).join('\n');
+    }
+    spaceCmd.command('create')
+        .description('Create a task space and make it current; returns the space id')
+        .argument('<name>', 'Task-space name, e.g. "search github issues"')
+        .option('--task <taskId>', 'Optional task id the space belongs to')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (name, opts) => {
+        try {
+            const manager = await loadSpaceManager();
+            const space = await manager.create(LOCAL_SPACE_IDENTITY().agentId, name, opts.task);
+            if (opts.json) {
+                console.log(JSON.stringify({ space }, null, 2));
+                return;
+            }
+            console.log(space.id);
+        }
+        catch (err) { printSpaceError(err); }
+    });
+    spaceCmd.command('list')
+        .description('List task spaces owned by the local agent (ID | Name | Status | Tabs | Created)')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (opts) => {
+        let cleanup;
+        try {
+            // bug 1 (D5): read paths carry the browser gateway so tab-group
+            // edits (拖入/拖出) reconcile into the ledger before answering.
+            // No gateway (browser unreachable) → sync is a no-op (unchanged).
+            const gw = await spaceGatewayFromBrowser();
+            const gateway = gw?.gateway;
+            cleanup = gw?.cleanup;
+            const manager = await loadSpaceManager({ gateway });
+            const spaces = await manager.listSpaces(LOCAL_SPACE_IDENTITY().agentId);
+            if (opts.json) {
+                console.log(JSON.stringify({ spaces, count: spaces.length }, null, 2));
+                return;
+            }
+            if (spaces.length === 0) {
+                console.log('(no task spaces)');
+                return;
+            }
+            console.log(formatSpaceTable(spaces));
+        }
+        catch (err) { printSpaceError(err); }
+        finally {
+            // bug #9: a direct-connect BrowserBridge keeps the event loop alive;
+            // tear it down and exit like `space close`/`space refresh`. Daemon
+            // mode must never exit (the daemon process stays resident).
+            if (globalThis.__HubDaemonMode) return;
+            if (cleanup) {
+                try { await cleanup(); } catch { /* best-effort */ }
+                process.exit(process.exitCode || 0);
+            }
+        }
+    });
+    spaceCmd.command('switch')
+        .description('Switch the current task space (affects subsequent space.open_tab / tab-group coloring)')
+        .argument('<id>', 'Space id')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (id, opts) => {
+        let cleanup;
+        try {
+            // bug 1 (D5): same gateway plumbing as the other read paths so a
+            // switch lands on a reconciled ledger (tab-group edits applied).
+            const gw = await spaceGatewayFromBrowser();
+            const gateway = gw?.gateway;
+            cleanup = gw?.cleanup;
+            const manager = await loadSpaceManager({ gateway });
+            const space = await manager.switch(LOCAL_SPACE_IDENTITY().agentId, id);
+            if (opts.json) {
+                console.log(JSON.stringify({ switched: id, current: space }, null, 2));
+                return;
+            }
+            console.log(`switched to space ${space.id} ("${space.name}")`);
+        }
+        catch (err) { printSpaceError(err); }
+        finally {
+            if (globalThis.__HubDaemonMode) return;
+            if (cleanup) {
+                try { await cleanup(); } catch { /* best-effort */ }
+                process.exit(process.exitCode || 0);
+            }
+        }
+    });
+    spaceCmd.command('close')
+        .description('Close a task space (closes all its tabs by default; user-held spaces must be claimed first)')
+        .argument('<id>', 'Space id')
+        .option('--keep', 'Keep the browser tabs open; close only the space ledger', false)
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (id, opts) => {
+        let cleanup;
+        try {
+            const gw = opts.keep ? undefined : await spaceGatewayFromBrowser();
+            const gateway = gw?.gateway;
+            cleanup = gw?.cleanup;
+            const manager = await loadSpaceManager({ gateway });
+            await manager.closeSpace(LOCAL_SPACE_IDENTITY().agentId, id, { keep: !!opts.keep });
+            if (opts.json) {
+                console.log(JSON.stringify({ closed: id, keep: !!opts.keep }, null, 2));
+                return;
+            }
+            console.log(`closed space ${id}${opts.keep ? ' (ledger only, tabs kept open)' : ''}`);
+        }
+        catch (err) { printSpaceError(err); }
+        finally {
+            // bug #9: a direct-connect BrowserBridge keeps the event loop alive;
+            // tear it down and exit like the `browser` commands do. Daemon mode
+            // must never exit (the daemon process stays resident).
+            if (globalThis.__HubDaemonMode) return;
+            if (cleanup) {
+                try { await cleanup(); } catch { /* best-effort */ }
+                process.exit(process.exitCode || 0);
+            }
+        }
+    });
+    spaceCmd.command('refresh')
+        .description('Recycle every tab in a task space: close all tabs and reopen each URL in a fresh tab (space id/name/ownership preserved). Use it to refresh a long-running task mid-way, e.g. after a tab wedges (screenshot hint: tab-wedged). Default conservative: never automatic — only run this explicitly.')
+        .argument('<id>', 'Space id')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (id, opts) => {
+        let cleanup;
+        try {
+            const gw = await spaceGatewayFromBrowser();
+            const gateway = gw?.gateway;
+            cleanup = gw?.cleanup;
+            const manager = await loadSpaceManager({ gateway });
+            const result = await manager.recycleSpaceTabs(LOCAL_SPACE_IDENTITY().agentId, id, gateway);
+            if (opts.json) {
+                console.log(JSON.stringify({
+                    spaceId: id,
+                    recycled: result.recycled,
+                    tabs: result.tabs,
+                    ...(result.failed !== undefined ? { failed: result.failed } : {}),
+                }, null, 2));
+                return;
+            }
+            console.log(`recycled ${result.recycled} tab(s) in space ${id}`);
+            for (const t of result.tabs ?? []) {
+                console.log(`  ${t.url} -> page ${t.newPageId}`);
+            }
+        }
+        catch (err) { printSpaceError(err); }
+        finally {
+            // bug #9: same direct-connect bridge teardown + exit as space close.
+            if (globalThis.__HubDaemonMode) return;
+            if (cleanup) {
+                try { await cleanup(); } catch { /* best-effort */ }
+                process.exit(process.exitCode || 0);
+            }
+        }
+    });
+    spaceCmd.command('handoff')
+        .description('Hand control of a task space over to the user (agent → agentDelegatedToUser); agent operations then fail with "user is controlling"')
+        .argument('<id>', 'Space id')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (id, opts) => {
+        try {
+            const manager = await loadSpaceManager();
+            const space = await manager.handOff(LOCAL_SPACE_IDENTITY().agentId, id);
+            if (opts.json) {
+                console.log(JSON.stringify({ space }, null, 2));
+                return;
+            }
+            console.log(`handed off space ${space.id} ("${space.name}") to the user`);
+        }
+        catch (err) { printSpaceError(err); }
+    });
+    spaceCmd.command('takeover')
+        .description('Take control of a task space back from the user (user → agent). The user typing this command IS the confirmation.')
+        .argument('<id>', 'Space id')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (id, opts) => {
+        try {
+            const manager = await loadSpaceManager();
+            const space = await manager.takeOver(LOCAL_SPACE_IDENTITY().agentId, id, { confirmed: true });
+            if (opts.json) {
+                console.log(JSON.stringify({ space }, null, 2));
+                return;
+            }
+            console.log(`agent now controls space ${space.id} ("${space.name}")`);
+        }
+        catch (err) { printSpaceError(err); }
+    });
+    spaceCmd.command('current')
+        .description('Show the current task space of the local agent')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (opts) => {
+        let cleanup;
+        try {
+            // bug 1 (D5): read path carries the browser gateway so raw
+            // tab-group edits (拖入/拖出) reconcile into the ledger before
+            // answering — `space current` tabIds stays truthful. No gateway
+            // (browser unreachable) → sync is a no-op (unchanged).
+            const gw = await spaceGatewayFromBrowser();
+            const gateway = gw?.gateway;
+            cleanup = gw?.cleanup;
+            const manager = await loadSpaceManager({ gateway });
+            const space = await manager.currentSpace(LOCAL_SPACE_IDENTITY().agentId);
+            if (opts.json) {
+                console.log(JSON.stringify({ space: space ?? null }, null, 2));
+                return;
+            }
+            if (!space) {
+                console.log('(no current space)');
+                return;
+            }
+            console.log(`${space.id}  "${space.name}" (${space.ownership}) tabs: ${space.tabIds.length}`);
+        }
+        catch (err) { printSpaceError(err); }
+        finally {
+            if (globalThis.__HubDaemonMode) return;
+            if (cleanup) {
+                try { await cleanup(); } catch { /* best-effort */ }
+                process.exit(process.exitCode || 0);
+            }
+        }
+    });
     // ── Built-in: completion ──────────────────────────────────────────
     program
         .command('completion')
@@ -2808,7 +4075,7 @@ cli({
         printCompletionScript(shell);
     });
     // ── Plugin management ──────────────────────────────────────────────────────
-    const pluginCmd = program.command('plugin').description('Manage opencli plugins');
+    const pluginCmd = program.command('plugin').description('Manage hub plugins');
     // Snapshot before applyRootSubcommandSummaries() rewrites .description() to a child-name listing.
     const originalPluginDescription = pluginCmd.description();
     pluginCmd
@@ -2919,15 +4186,15 @@ cli({
         const plugins = listPlugins();
         if (plugins.length === 0) {
             console.log('  No plugins installed.');
-            console.log('  Install one with: opencli plugin install github:user/repo');
+            console.log('  Install one with: hub plugin install github:user/repo');
             return;
         }
         if (opts.format === 'json') {
             renderOutput(plugins, {
                 fmt: 'json',
                 columns: ['name', 'commands', 'source'],
-                title: 'opencli/plugins',
-                source: 'opencli plugin list',
+                title: 'hub/plugins',
+                source: 'hub plugin list',
             });
             return;
         }
@@ -2987,8 +4254,8 @@ cli({
             console.log();
             console.log('  Next steps:');
             console.log(`    cd ${result.dir}`);
-            console.log(`    opencli plugin install file://${result.dir}`);
-            console.log(`    opencli ${name} hello`);
+            console.log(`    hub plugin install file://${result.dir}`);
+            console.log(`    hub ${name} hello`);
         }
         catch (err) {
             console.error(`Error: ${getErrorMessage(err)}`);
@@ -3004,7 +4271,7 @@ cli({
         .description('Show which sites have local overrides vs using official baseline')
         .action(async () => {
         const os = await import('node:os');
-        const userClisDir = path.join(os.homedir(), '.opencli', 'clis');
+        const userClisDir = path.join(hubUserRoot(), 'clis');
         const builtinClisDir = BUILTIN_CLIS;
         try {
             const userEntries = await fs.promises.readdir(userClisDir, { withFileTypes: true });
@@ -3019,7 +4286,7 @@ cli({
                 console.log('No local adapter overrides. All sites use the official baseline.');
                 return;
             }
-            console.log(`Local overrides in ~/.opencli/clis/ (${userSites.length} sites):\n`);
+            console.log(`Local overrides in ~/.hub/clis/ (${userSites.length} sites):\n`);
             for (const site of userSites) {
                 const isOfficial = builtinSites.includes(site);
                 const label = isOfficial ? 'override' : 'custom';
@@ -3033,11 +4300,11 @@ cli({
     });
     adapterCmd
         .command('eject')
-        .description('Copy an official adapter to ~/.opencli/clis/ for local editing')
+        .description('Copy an official adapter to ~/.hub/clis/ for local editing')
         .argument('<site>', 'Site name (e.g. twitter, bilibili)')
         .action(async (site) => {
         const os = await import('node:os');
-        const userClisDir = path.join(os.homedir(), '.opencli', 'clis');
+        const userClisDir = path.join(hubUserRoot(), 'clis');
         const builtinSiteDir = path.join(BUILTIN_CLIS, site);
         const userSiteDir = path.join(userClisDir, site);
         try {
@@ -3050,13 +4317,13 @@ cli({
         }
         try {
             await fs.promises.access(userSiteDir);
-            console.error(`Site "${site}" already exists in ~/.opencli/clis/. Use "opencli adapter reset ${site}" first to restore official version.`);
+            console.error(`Site "${site}" already exists in ~/.hub/clis/. Use "hub adapter reset ${site}" first to restore official version.`);
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
         catch { /* good, doesn't exist yet */ }
         fs.cpSync(builtinSiteDir, userSiteDir, { recursive: true });
-        console.log(`✅ Ejected "${site}" to ~/.opencli/clis/${site}/`);
+        console.log(`✅ Ejected "${site}" to ~/.hub/clis/${site}/`);
         console.log('You can now edit the adapter files. Changes take effect immediately.');
         console.log('Note: Official updates to this adapter will overwrite your changes.');
     });
@@ -3067,7 +4334,7 @@ cli({
         .option('--all', 'Reset all local overrides')
         .action(async (site, opts) => {
         const os = await import('node:os');
-        const userClisDir = path.join(os.homedir(), '.opencli', 'clis');
+        const userClisDir = path.join(hubUserRoot(), 'clis');
         if (opts.all) {
             try {
                 const userEntries = await fs.promises.readdir(userClisDir, { withFileTypes: true });
@@ -3150,8 +4417,8 @@ cli({
         renderOutput(rows, {
             fmt: opts.format,
             columns: ['name', 'package', 'binary', 'installed', 'description', 'homepage', 'tags'],
-            title: 'opencli/external/list',
-            source: 'opencli external list',
+            title: 'hub/external/list',
+            source: 'hub external list',
         });
     });
     function passthroughExternal(name, parsedArgs) {
@@ -3232,8 +4499,8 @@ cli({
     // When an ancestor command declares a leading positional via `.usage(...)`
     // (e.g. `browser` -> `<session> <command> [options]`), inject the positional
     // between that ancestor's name and the next path segment so the help Usage
-    // line is accurate: `Usage: opencli browser <session> click [target] [options]`
-    // instead of `opencli browser click [target] [options]`. Commander does NOT
+    // line is accurate: `Usage: hub browser <session> click [target] [options]`
+    // instead of `hub browser click [target] [options]`. Commander does NOT
     // inherit configureHelp into subcommands, so we walk the descendant tree and
     // apply the override on each.
     const ancestorAwareCommandUsage = (cmd) => {
@@ -3260,7 +4527,7 @@ cli({
         const binary = operands[0];
         console.error(`error: unknown command '${binary}'`);
         if (isBinaryInstalled(binary)) {
-            console.error(`  Tip: '${binary}' exists on your PATH. Use 'opencli external register ${binary}' to add it as an external CLI.`);
+            console.error(`  Tip: '${binary}' exists on your PATH. Use 'hub external register ${binary}' to add it as an external CLI.`);
         }
         program.outputHelp();
         process.exitCode = EXIT_CODES.USAGE_ERROR;
@@ -3287,7 +4554,7 @@ export function resolveBrowserVerifyInvocation(opts = {}) {
     }
     const sourceEntry = path.join(projectRoot, 'src', 'main.ts');
     if (!fileExists(sourceEntry)) {
-        throw new Error(`Could not find opencli entrypoint under ${projectRoot}. Expected built entry from package.json or src/main.ts.`);
+        throw new Error(`Could not find hub entrypoint under ${projectRoot}. Expected built entry from package.json or src/main.ts.`);
     }
     const localTsxBin = path.join(projectRoot, 'node_modules', '.bin', platform === 'win32' ? 'tsx.cmd' : 'tsx');
     if (fileExists(localTsxBin)) {

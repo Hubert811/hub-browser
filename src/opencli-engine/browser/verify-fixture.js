@@ -2,7 +2,7 @@
  * Verify fixture: structural expectations for `opencli browser verify` output.
  *
  * The adapter-author skill runbook says every published adapter must write a
- * fixture under `~/.opencli/sites/<site>/verify/<command>.json` so later verify
+ * fixture under `<root>/config/sites/<site>/verify/<command>.json` so later verify
  * runs can catch shape regressions (missing columns, wrong types, bleeding
  * values) without relying on exact content match — BBS / news / market data is
  * too volatile for value equality.
@@ -28,8 +28,8 @@
  *   }
  */
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
+import { hubUserRoot } from '../discovery.js';
 const DEFAULT_MAX_TOP_LEVEL_KEYS = 12;
 const DEFAULT_MAX_NESTED_DEPTH = 1;
 const ID_SHAPED_KEY_PATTERNS = [
@@ -51,7 +51,7 @@ const ID_SHAPED_KEY_PATTERNS = [
     /^uri$/i,
 ];
 export function fixturePath(site, command) {
-    return path.join(os.homedir(), '.opencli', 'sites', site, 'verify', `${command}.json`);
+    return path.join(hubUserRoot(), 'config', 'sites', site, 'verify', `${command}.json`);
 }
 export function loadFixture(site, command) {
     const p = fixturePath(site, command);

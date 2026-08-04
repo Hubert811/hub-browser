@@ -13,7 +13,6 @@ import { getRegistry, fullName, } from './registry.js';
 import { pathToFileURL } from 'node:url';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import { executePipeline } from './pipeline/index.js';
 import { adapterLoadError, ArgumentError, CommandExecutionError, attachTraceReceipt, getErrorMessage } from './errors.js';
 import { shouldUseBrowserSession } from './capabilityRouting.js';
@@ -24,10 +23,11 @@ import { isElectronApp } from './electron-apps.js';
 import { probeCDP, resolveElectronEndpoint } from './launcher.js';
 import { ObservationSession, exportObservationSession } from './observation/index.js';
 import { resolveAdapterSourcePath } from './adapter-source.js';
+import { hubUserRoot } from './discovery.js';
 const _loadedModules = new Map();
 /** Track mtime of loaded user adapter files for hot-reload. */
 const _moduleMtimes = new Map();
-const _userClisDir = `${os.homedir()}/.opencli/clis/`;
+const _userClisDir = `${hubUserRoot()}/clis/`;
 function normalizeTraceMode(raw) {
     if (raw === undefined || raw === null || raw === '' || raw === 'off')
         return 'off';
@@ -170,6 +170,210 @@ async function shouldRunPreNav(cmd, page, siteSession, preNavUrl) {
     const currentUrl = await page.getCurrentUrl?.().catch(() => null);
     return !urlMatchesDomain(currentUrl, cmd.domain);
 }
+
+// ── Space binding for adapter commands (修复 3: bug #1/#2/#6) ──────────────
+//
+// Adapter commands (`hub <site> <command>`) used to run against the shared
+// browser's *active tab* with no space attribution:
+//   - bug #1: they could navigate another agent's space tab (no ownership);
+//   - bug #2: tabs they opened had no owner, so `space close` could not clean
+//     them up (residual tabs);
+//   - bug #6: their tab was invisible/not operable for the owning agent's
+//     space/MCP tools.
+// The binding below routes the command onto a tab attributed to the local
+// agent's current space via TaskSpaceManager.openTabWithReuse — the same
+// path `browser <session> open` uses.
+//
+// D3 (2026-08-03): space is a HARD precondition. When the agent owns no space
+// the command is rejected with a SpaceGuardError('no-space') and never runs
+// (no legacy active-tab fallback). Only non-precondition failures (manager
+// load / gateway / openTab) keep the best-effort fallback to the original
+// page so a flaky browser never crashes the CLI.
+
+/** Current pageId of a unified page handle (`session` = "page-<id>"), else undefined. */
+function pageIdOf(page) {
+    if (page && typeof page.session === 'string' && /^page-\d+$/.test(page.session)) {
+        return Number(page.session.slice('page-'.length));
+    }
+    return undefined;
+}
+
+/**
+ * Best-effort DNS-domain check for adapter `cmd.domain` values. Rejects
+ * values that are already full URLs, contain whitespace or host-illegal
+ * characters (e.g. the comma-separated multi-domain edge case), or have no
+ * dot (localhost / local app slugs) — those fall through to the current-URL
+ * fallback instead of producing an invalid `https://…` target.
+ */
+function isDnsDomainName(domain) {
+    if (typeof domain !== 'string' || !domain)
+        return false;
+    const d = domain.trim();
+    if (!d || /\s/.test(d))
+        return false;
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(d))
+        return false;
+    if (/[^a-z0-9.\u00a1-\uffff-]/i.test(d))
+        return false;
+    const host = d.split('/')[0].split(':')[0];
+    return host.includes('.') && host.length > 1 && !host.startsWith('.') && !host.endsWith('.');
+}
+
+/**
+ * Resolve the URL an adapter command should be bound to inside the current
+ * space. Priority (best-effort; null → caller skips space binding):
+ *   1. cmd.navigateBefore (a concrete URL string after strategy expansion)
+ *   2. `https://<cmd.domain>` when the domain is a real DNS domain
+ *   3. the page's current URL
+ */
+async function resolveSpaceTargetUrl(cmd, page) {
+    const preNavUrl = resolvePreNav(cmd);
+    if (preNavUrl)
+        return preNavUrl;
+    if (isDnsDomainName(cmd.domain))
+        return `https://${cmd.domain}`;
+    try {
+        const currentUrl = await page?.getCurrentUrl?.();
+        if (typeof currentUrl === 'string' && currentUrl)
+            return currentUrl;
+    }
+    catch { /* best-effort */ }
+    return null;
+}
+
+/**
+ * 修复 3 + D3 — bind an adapter command to the local agent's current space.
+ *
+ * When the agent has a current space, the command's target URL is opened (or
+ * reused) inside the space through TaskSpaceManager.openTabWithReuse and the
+ * returned page handle is used for the adapter logic.
+ *
+ * D3 (2026-08-03): when the agent owns NO space this throws a
+ * SpaceGuardError('no-space') — the command must not run (callers surface the
+ * error with a non-zero exit). The catch block distinguishes the explicit
+ * no-space rejection (rethrow) from genuine infrastructure failures (manager
+ * load / gateway / openTab) which keep the best-effort fallback to the
+ * original page.
+ *
+ * `manager` / `storagePath` are injectable for tests; production callers pass
+ * neither (the manager is created from HUB_SPACES_FILE or the default ledger
+ * path — same rule cli.js uses).
+ *
+ * @returns {{ page: object, space?: object, bound: boolean }}
+ *   page  — page handle to run the adapter command on (equals the input page
+ *           on infra-failure fallback paths; may be a fresh handle bound to
+ *           the space tab when the resolved pageId differs from the input page)
+ *   space — current SpaceInfo when one was found (undefined otherwise)
+ *   bound — true when the command was routed onto a space-attributed tab
+ * @throws {SpaceGuardError} code 'no-space' when the agent owns no space.
+ */
+export async function bindAdapterPageToSpace({ page, browser, cdpEndpoint, cmd, agentId, storagePath, manager }) {
+    try {
+        const { TaskSpaceManager, SpaceGuardError, gatewayFromPage, defaultStoragePath } = await import('../space/task-space-manager.ts');
+        const gateway = gatewayFromPage(page);
+        const mgr = manager ?? new TaskSpaceManager({
+            storagePath: storagePath ?? (process.env.HUB_SPACES_FILE || defaultStoragePath()),
+            gateway,
+        });
+        const space = await mgr.currentSpace(agentId);
+        if (!space) {
+            // D3: space is a hard precondition for adapter commands. Reject
+            // instead of falling back to the legacy active tab.
+            throw new SpaceGuardError(
+                'no-space',
+                `agent has no space; run 'hub space create <name>' first`,
+                { hint: 'create a task space first, then re-run the adapter command' },
+            );
+        }
+        const targetUrl = await resolveSpaceTargetUrl(cmd, page);
+        if (targetUrl === null)
+            return { page, space, bound: false, pageId: undefined, manager: mgr, agentId };
+        const { pageId } = await mgr.openTabWithReuse(
+            agentId,
+            space.id,
+            targetUrl,
+            { background: false, reuse: 'exact' },
+            gateway,
+        );
+        // The page handle normally already follows the gateway's newTab /
+        // selectTab (UnifiedPage self-rebinds). When the resolved pageId
+        // differs (e.g. a gateway that resolves page ids via listTabs, or a
+        // failed activation), bind a fresh handle to the space tab. Reusing
+        // the same browser instance keeps the underlying CDP session
+        // untouched — no second connection in daemon or direct mode.
+        if (typeof pageId === 'number' && pageId !== pageIdOf(page)) {
+            const boundPage = await browser.connect({ pageId, cdpEndpoint });
+            return { page: boundPage, space, bound: true, pageId, manager: mgr, agentId };
+        }
+        return { page, space, bound: true, pageId, manager: mgr, agentId };
+    }
+    catch (err) {
+        // D3: an explicit "no space" is a hard precondition — never fall back.
+        // Only infrastructure failures (manager load / gateway / openTab) keep
+        // the best-effort fallback to the original page.
+        if (isNoSpaceGuardError(err)) throw err;
+        log.warn(`[space] adapter command space-bind failed for ${fullName(cmd)}, falling back to legacy active-tab behavior: ${getErrorMessage(err)}`);
+        return { page, space: undefined, bound: false, pageId: undefined, manager: undefined, agentId };
+    }
+}
+
+/**
+ * D3 marker: SpaceGuardError with code 'no-space'. Structural check (name +
+ * code) so it works even when the caught value comes from another copy of the
+ * task-space-manager module.
+ */
+function isNoSpaceGuardError(err) {
+    return err instanceof Error && err.name === 'SpaceGuardError' && err.code === 'no-space';
+}
+
+/**
+ * Read the (possibly rebound) page handle's current URL, best-effort — same
+ * source as collectObservationEvidence (authoritative getCurrentUrl
+ * round-trip first, active-page object fallback for page handles that carry
+ * a url field directly). Never throws.
+ */
+async function readBoundPageUrl(page) {
+    try {
+        const url = await page?.getCurrentUrl?.().catch(() => null);
+        if (typeof url === 'string' && url)
+            return url;
+        const active = page?.getActivePage?.();
+        if (active && typeof active === 'object' && typeof active.url === 'string' && active.url)
+            return active.url;
+    }
+    catch { /* best-effort */ }
+    return null;
+}
+
+/**
+ * bug #7 — after an adapter command navigated a space-bound tab, sync the
+ * ledger URL to what the browser actually shows (TaskSpaceManager
+ * .updateTabUrl). Strictly best-effort: no binding / unreadable URL → no-op
+ * returning false; manager failure → log.warn and swallow. Never throws and
+ * never touches the ledger when the command did not run inside a space.
+ */
+export async function syncBoundTabUrl(binding, page) {
+    if (!binding || binding.bound !== true || !binding.space ||
+        typeof binding.pageId !== 'number' || !binding.manager) {
+        return false;
+    }
+    const pageUrl = await readBoundPageUrl(page);
+    if (!pageUrl)
+        return false;
+    try {
+        return await binding.manager.updateTabUrl(
+            binding.agentId,
+            binding.space.id,
+            binding.pageId,
+            pageUrl,
+        );
+    }
+    catch (err) {
+        log.warn(`[space] ledger URL sync failed after adapter navigation (space ${binding.space.id}, page ${binding.pageId}): ${getErrorMessage(err)}`);
+        return false;
+    }
+}
+
 export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
     let kwargs;
     try {
@@ -213,7 +417,22 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
             const session = resolveAdapterBrowserSession(cmd, siteSession);
             const keepTab = resolveKeepTab(siteSession, opts.keepTab);
             const windowMode = resolveBrowserWindowMode(cmd.defaultWindowMode ?? 'background', opts.windowMode);
-            result = await browserSession(BrowserFactory, async (page) => {
+            result = await browserSession(BrowserFactory, async (page, browser) => {
+                // 修复 3 + D3: bind the adapter command onto the local agent's
+                // current space tab. D3: when the agent owns no space this
+                // throws SpaceGuardError('no-space') and the command is
+                // rejected (exit non-zero) — no legacy active-tab fallback.
+                // Other failures keep the best-effort original-page fallback.
+                // Must happen before any navigation / command execution.
+                // The binding result is kept for the bug #7 URL sync below.
+                const binding = await bindAdapterPageToSpace({
+                    page,
+                    browser,
+                    cdpEndpoint,
+                    cmd,
+                    agentId: process.env.HUB_AGENT_ID || 'cli:local',
+                });
+                page = binding.page;
                 const observation = traceMode === 'off'
                     ? null
                     : new ObservationSession({
@@ -295,6 +514,11 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                         await collectObservationEvidence(observation, page).catch(() => { });
                         exportTraceArtifact(observation, 'success', undefined, opts.onTraceExport);
                     }
+                    // bug #7: the adapter command may have navigated the bound
+                    // space tab — sync the ledger URL to the browser's actual
+                    // URL (best-effort, only when this command ran inside a
+                    // space; failure only warns and never affects the result).
+                    await syncBoundTabUrl(binding, page).catch(() => { });
                     // Adapter commands are one-shot — release the current tab lease immediately
                     // instead of waiting for the 30s idle timeout. The automation container
                     // window stays open for reuse.
@@ -320,6 +544,15 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                             exportTraceArtifact(observation, 'failure', err, opts.onTraceExport);
                         }
                     }
+                    // bug #7 (catch path): even when the adapter command FAILED
+                    // it may already have navigated the bound space tab — sync
+                    // the ledger URL to the browser's actual URL so exact-reuse
+                    // matching sees the true URL instead of the stale ledger
+                    // value (which caused duplicate tabs on a retry). Strictly
+                    // best-effort: syncBoundTabUrl never throws (failure only
+                    // warns), and must never mask the original error — the
+                    // .catch below is belt-and-braces only.
+                    await syncBoundTabUrl(binding, page).catch(() => { });
                     // Release the tab lease on failure too — without this, the lease lingers
                     // until the extension's idle timer fires (unreliable on Windows where
                     // MV3 service workers may be suspended before setTimeout triggers).

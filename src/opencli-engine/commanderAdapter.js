@@ -152,7 +152,7 @@ function emitAutoFixHint(envelope, cmdName, traceMode) {
     const runnable = cmdName.replace('/', ' ');
     return envelope
         + `# AutoFix: re-run with --trace=retain-on-failure for trace artifact\n`
-        + `# opencli ${runnable} --trace retain-on-failure\n`;
+        + `# hub ${runnable} --trace retain-on-failure\n`;
 }
 function renderError(err, cmdName, verbose, traceMode) {
     const envelope = toEnvelope(err);

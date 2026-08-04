@@ -10,11 +10,11 @@
  * Entries expire after DEFAULT_TTL_MS (24h).
  */
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
+import { hubUserRoot } from '../discovery.js';
 export const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 function getDefaultCacheDir() {
-    return process.env.OPENCLI_CACHE_DIR || path.join(os.homedir(), '.opencli', 'cache');
+    return process.env.OPENCLI_CACHE_DIR || path.join(hubUserRoot(), 'cache');
 }
 export function getCachePath(session, baseDir = getDefaultCacheDir()) {
     const safe = session.replace(/[^a-zA-Z0-9_-]+/g, '_');

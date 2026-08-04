@@ -35,7 +35,7 @@ export function createPluginScaffold(name, opts = {}) {
     const manifest = {
         name,
         version: '0.1.0',
-        description: opts.description ?? `An opencli plugin: ${name}`,
+        description: opts.description ?? `A hub plugin: ${name}`,
         opencli: `>=${PKG_VERSION}`,
     };
     writeFile(targetDir, 'opencli-plugin.json', JSON.stringify(manifest, null, 2) + '\n');
@@ -45,7 +45,7 @@ export function createPluginScaffold(name, opts = {}) {
         name: `opencli-plugin-${name}`,
         version: '0.1.0',
         type: 'module',
-        description: opts.description ?? `An opencli plugin: ${name}`,
+        description: opts.description ?? `A hub plugin: ${name}`,
         peerDependencies: {
             '@jackwener/opencli': `>=${PKG_VERSION}`,
         },
@@ -101,16 +101,16 @@ cli({
     // README.md
     const readme = `# opencli-plugin-${name}
 
-${opts.description ?? `An opencli plugin: ${name}`}
+${opts.description ?? `A hub plugin: ${name}`}
 
 ## Install
 
 \`\`\`bash
 # From local development directory
-opencli plugin install file://${targetDir}
+hub plugin install file://${targetDir}
 
 # From GitHub (after publishing)
-opencli plugin install github:<user>/opencli-plugin-${name}
+hub plugin install github:<user>/opencli-plugin-${name}
 \`\`\`
 
 ## Commands
@@ -124,14 +124,14 @@ opencli plugin install github:<user>/opencli-plugin-${name}
 
 \`\`\`bash
 # Install locally for development (symlinked, changes reflect immediately)
-opencli plugin install file://${targetDir}
+hub plugin install file://${targetDir}
 
 # Verify commands are registered
-opencli list | grep ${name}
+hub list | grep ${name}
 
 # Run a command
-opencli ${name} hello
-opencli ${name} greet --name World
+hub ${name} hello
+hub ${name} greet --name World
 \`\`\`
 `;
     writeFile(targetDir, 'README.md', readme);

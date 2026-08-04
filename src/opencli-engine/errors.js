@@ -1,3 +1,8 @@
+// SpaceGuardError (task-space-manager) is imported so toEnvelope can preserve
+// its structured code (e.g. 'no-space') instead of collapsing to 'UNKNOWN'.
+// task-space-manager has zero relative imports (node builtins only), so this
+// introduces no cycle.
+import { SpaceGuardError } from '../space/task-space-manager.ts';
 // ── Exit code table ──────────────────────────────────────────────────────────
 export const EXIT_CODES = {
     SUCCESS: 0,
@@ -136,6 +141,17 @@ function serializeCause(cause, depth = 0) {
     }
     return String(cause);
 }
+/** True for a TaskSpaceManager guard error (instanceof, plus a structural
+ *  fallback by name+code so copies from other module graphs are still
+ *  recognized). */
+function isSpaceGuardError(err) {
+    if (err instanceof SpaceGuardError)
+        return true;
+    if (!(err instanceof Error) || err.name !== 'SpaceGuardError')
+        return false;
+    return typeof err.code === 'string' && err.code.length > 0;
+}
+
 /** Build an ErrorEnvelope from any caught value. */
 export function toEnvelope(err) {
     const cause = err instanceof Error && err.cause ? serializeCause(err.cause) : undefined;
@@ -155,6 +171,22 @@ export function toEnvelope(err) {
                 message: err.message,
                 ...(err.hint ? { help: err.hint } : {}),
                 exitCode: err.exitCode,
+                ...(cause ? { cause } : {}),
+            },
+            ...(trace ? { trace } : {}),
+        };
+    }
+    if (isSpaceGuardError(err)) {
+        // bug 4: SpaceGuardError is not a CliError — previously the structured
+        // envelope collapsed its code to 'UNKNOWN'. Preserve the code (e.g.
+        // 'no-space') so callers can branch on it.
+        return {
+            ok: false,
+            error: {
+                code: err.code,
+                message: err.message,
+                ...(err.hint ? { hint: err.hint } : {}),
+                exitCode: EXIT_CODES.GENERIC_ERROR,
                 ...(cause ? { cause } : {}),
             },
             ...(trace ? { trace } : {}),

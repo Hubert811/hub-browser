@@ -38,7 +38,10 @@ export async function browserSession(BrowserFactory, fn, opts = {}) {
            session: opts.session,
            cdpEndpoint: opts.cdpEndpoint,
        });
-        return await fn(page);
+        // `browser` is passed to the callback so space binding can re-connect
+        // to a specific pageId on the SAME underlying session/connection —
+        // no second CDP connection in direct mode, daemon singleton untouched.
+        return await fn(page, browser);
     }
     finally {
         await browser.close().catch(() => { });

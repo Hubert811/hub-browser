@@ -1,8 +1,8 @@
 /**
  * Plugin management: install, uninstall, and list plugins.
  *
- * Plugins live in ~/.opencli/plugins/<name>/.
- * Monorepo clones live in ~/.opencli/monorepos/<repo-name>/.
+ * Plugins live in <root>/plugins/<name>/.
+ * Monorepo clones live in <root>/monorepos/<repo-name>/.
  * Install source format: "github:user/repo", "github:user/repo/subplugin",
  * "https://github.com/user/repo", "file:///local/plugin", or a local directory path.
  */
@@ -11,24 +11,21 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { PLUGINS_DIR } from './discovery.js';
+import { PLUGINS_DIR, hubUserRoot } from './discovery.js';
 import { getErrorMessage, PluginError } from './errors.js';
 import { log } from './logger.js';
 import { isRecord } from './utils.js';
 import { readPluginManifest, isMonorepo, getEnabledPlugins, checkCompatibility, } from './plugin-manifest.js';
 const isWindows = process.platform === 'win32';
 const LOCAL_PLUGIN_SOURCE_PREFIX = 'local:';
-/** Get home directory, respecting HOME environment variable for test isolation. */
-function getHomeDir() {
-    return process.env.HOME || process.env.USERPROFILE || os.homedir();
-}
+/** User data root (方案 C): ~/.hub by default; BROWSEROS_DIR overrides. */
 /** Path to the lock file that tracks installed plugin versions. */
 export function getLockFilePath() {
-    return path.join(getHomeDir(), '.opencli', 'plugins.lock.json');
+    return path.join(hubUserRoot(), 'plugins.lock.json');
 }
-/** Monorepo clones directory: ~/.opencli/monorepos/ */
+/** Monorepo clones directory: <root>/monorepos/ */
 export function getMonoreposDir() {
-    return path.join(getHomeDir(), '.opencli', 'monorepos');
+    return path.join(hubUserRoot(), 'monorepos');
 }
 function parseStoredPluginSource(source) {
     if (!source)
@@ -608,7 +605,7 @@ function installSinglePlugin(cloneDir, cloneUrl, name, manifest) {
     const pluginName = manifest?.name ?? name;
     const targetDir = path.join(PLUGINS_DIR, pluginName);
     if (fs.existsSync(targetDir)) {
-        throw new PluginError(`Plugin "${pluginName}" is already installed at ${targetDir}`, 'Use "opencli plugin uninstall" first, or pick a different name.');
+        throw new PluginError(`Plugin "${pluginName}" is already installed at ${targetDir}`, 'Use "hub plugin uninstall" first, or pick a different name.');
     }
     ensureStandalonePluginReady(cloneDir);
     publishStandalonePlugin(cloneDir, targetDir, (commitHash) => {
@@ -643,7 +640,7 @@ function installLocalPlugin(localPath, name) {
     const pluginName = manifest?.name ?? name;
     const targetDir = path.join(PLUGINS_DIR, pluginName);
     if (fs.existsSync(targetDir)) {
-        throw new PluginError(`Plugin "${pluginName}" is already installed at ${targetDir}`, 'Use "opencli plugin uninstall" first, or pick a different name.');
+        throw new PluginError(`Plugin "${pluginName}" is already installed at ${targetDir}`, 'Use "hub plugin uninstall" first, or pick a different name.');
     }
     const validation = validatePluginStructure(localPath);
     if (!validation.valid) {

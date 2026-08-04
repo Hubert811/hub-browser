@@ -21,40 +21,40 @@ export const BUILTIN_COMMANDS = [
 ];
 // ── Shell script generators ────────────────────────────────────────────────
 export function bashCompletionScript() {
-    return `# Bash completion for opencli
-# Add to ~/.bashrc:  eval "$(opencli completion bash)"
-_opencli_completions() {
+    return `# Bash completion for hub
+# Add to ~/.bashrc:  eval "$(hub completion bash)"
+_hub_completions() {
   local cur words cword
   _get_comp_words_by_ref -n : cur words cword
 
   local completions
-  completions=$(opencli --get-completions --cursor "$cword" "\${words[@]:1}" 2>/dev/null)
+  completions=$(hub --get-completions --cursor "$cword" "\${words[@]:1}" 2>/dev/null)
 
   COMPREPLY=( $(compgen -W "$completions" -- "$cur") )
   __ltrim_colon_completions "$cur"
 }
-complete -F _opencli_completions opencli
+complete -F _hub_completions hub
 `;
 }
 export function zshCompletionScript() {
-    return `# Zsh completion for opencli
-# Add to ~/.zshrc:  eval "$(opencli completion zsh)"
-_opencli() {
+    return `# Zsh completion for hub
+# Add to ~/.zshrc:  eval "$(hub completion zsh)"
+_hub() {
   local -a completions
   local cword=$((CURRENT - 1))
-  completions=(\${(f)"$(opencli --get-completions --cursor "$cword" "\${words[@]:1}" 2>/dev/null)"})
+  completions=(\${(f)"$(hub --get-completions --cursor "$cword" "\${words[@]:1}" 2>/dev/null)"})
   compadd -a completions
 }
-compdef _opencli opencli
+compdef _hub hub
 `;
 }
 export function fishCompletionScript() {
-    return `# Fish completion for opencli
-# Add to ~/.config/fish/config.fish:  opencli completion fish | source
-complete -c opencli -f -a '(
+    return `# Fish completion for hub
+# Add to ~/.config/fish/config.fish:  hub completion fish | source
+complete -c hub -f -a '(
   set -l tokens (commandline -cop)
   set -l cursor (count (commandline -cop))
-  opencli --get-completions --cursor $cursor $tokens[2..] 2>/dev/null
+  hub --get-completions --cursor $cursor $tokens[2..] 2>/dev/null
 )'
 `;
 }

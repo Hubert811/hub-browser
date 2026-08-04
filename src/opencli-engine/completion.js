@@ -1,5 +1,5 @@
 /**
- * Shell tab-completion support for opencli.
+ * Shell tab-completion support for hub.
  *
  * Provides:
  *  - Shell script generators for bash, zsh, and fish
@@ -15,7 +15,7 @@ export { bashCompletionScript, zshCompletionScript, fishCompletionScript };
  * Return completion candidates given the current command-line words and cursor index.
  * Requires full CLI discovery to have been run (uses getRegistry()).
  *
- * @param words  - The argv after 'opencli' (words[0] is the first arg, e.g. site name)
+ * @param words  - The argv after 'hub' (words[0] is the first arg, e.g. site name)
  * @param cursor - 1-based position of the word being completed (1 = first arg)
  */
 export function getCompletions(words, cursor) {

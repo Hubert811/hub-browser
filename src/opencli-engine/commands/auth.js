@@ -1,11 +1,11 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { InvalidArgumentError, Option } from 'commander';
 import { AuthRequiredError, CliError, getErrorMessage } from '../errors.js';
 import { executeCommand } from '../execution.js';
 import { fullName, getRegistry, } from '../registry.js';
+import { hubUserRoot } from '../discovery.js';
 import { render as renderOutput } from '../output.js';
 const AUTH_REFRESH_STATE_VERSION = 1;
 const AUTH_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -25,7 +25,7 @@ function parseSiteFilter(raw) {
     return sites.length > 0 ? new Set(sites) : null;
 }
 function defaultAuthRefreshStatePath() {
-    return join(homedir(), '.opencli', 'auth-refresh.json');
+    return join(hubUserRoot(), 'state', 'auth-refresh.json');
 }
 function emptyAuthRefreshState() {
     return { version: AUTH_REFRESH_STATE_VERSION, sites: {} };
@@ -400,7 +400,7 @@ export function registerAuthCommands(program) {
             fmt,
             fmtExplicit: status.getOptionValueSource('format') === 'cli',
             columns: ['site', 'status', 'identity', 'checked', 'error'],
-            title: 'opencli/auth status',
+            title: 'hub/auth status',
             source: opts.full ? 'full whoami probe' : 'quick auth check',
         });
     });
@@ -426,7 +426,7 @@ export function registerAuthCommands(program) {
             fmt,
             fmtExplicit: refresh.getOptionValueSource('format') === 'cli',
             columns: ['site', 'status', 'last_touched_at', 'next_refresh_at', 'error'],
-            title: 'opencli/auth refresh',
+            title: 'hub/auth refresh',
             source: opts.all ? 'forced persistent touch' : 'persistent touch with 24h throttle',
         });
     });

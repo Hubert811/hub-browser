@@ -112,7 +112,7 @@ export async function launchDetachedApp(executable, args, label) {
         });
         const onError = (err) => {
             if (err.code === 'ENOENT') {
-                reject(new CommandExecutionError(`Could not launch ${label}: executable not found at ${executable}`, `Install ${label}, reinstall it, or register a custom app path in ~/.opencli/apps.yaml`));
+                reject(new CommandExecutionError(`Could not launch ${label}: executable not found at ${executable}`, `Install ${label}, reinstall it, or register a custom app path in ~/.hub/config/apps.yaml`));
                 return;
             }
             reject(new CommandExecutionError(`Failed to launch ${label}`, err.message));
@@ -143,9 +143,9 @@ export async function launchElectronApp(appPath, app, args, label) {
         }
     }
     if (executables.length > 1) {
-        throw new CommandExecutionError(`Could not launch ${label}: no compatible executable found in ${path.join(appPath, 'Contents', 'MacOS')}`, `Tried: ${executables.map((executable) => path.basename(executable)).join(', ')}. Install ${label}, reinstall it, or register a custom app path in ~/.opencli/apps.yaml`);
+        throw new CommandExecutionError(`Could not launch ${label}: no compatible executable found in ${path.join(appPath, 'Contents', 'MacOS')}`, `Tried: ${executables.map((executable) => path.basename(executable)).join(', ')}. Install ${label}, reinstall it, or register a custom app path in ~/.hub/config/apps.yaml`);
     }
-    throw lastMissingExecutableError ?? new CommandExecutionError(`Could not launch ${label}`, `Install ${label}, reinstall it, or register a custom app path in ~/.opencli/apps.yaml`);
+    throw lastMissingExecutableError ?? new CommandExecutionError(`Could not launch ${label}`, `Install ${label}, reinstall it, or register a custom app path in ~/.hub/config/apps.yaml`);
 }
 export function electronLaunchArgs(port, extraArgs = []) {
     return [
@@ -174,7 +174,7 @@ async function pollForReady(port) {
 export async function resolveElectronEndpoint(site) {
     const app = getElectronApp(site);
     if (!app) {
-        throw new CommandExecutionError(`No Electron app registered for site "${site}"`, 'Register the app in ~/.opencli/apps.yaml or check the site name.');
+        throw new CommandExecutionError(`No Electron app registered for site "${site}"`, 'Register the app in ~/.hub/config/apps.yaml or check the site name.');
     }
     const { port, processName, displayName } = app;
     const label = displayName ?? processName;
@@ -205,7 +205,7 @@ export async function resolveElectronEndpoint(site) {
     // Step 3: Discover path
     const appPath = discoverAppPath(label);
     if (!appPath) {
-        throw new CommandExecutionError(`Could not find ${label} on this machine.`, `Install ${label} or register a custom path in ~/.opencli/apps.yaml`);
+        throw new CommandExecutionError(`Could not find ${label} on this machine.`, `Install ${label} or register a custom path in ~/.hub/config/apps.yaml`);
     }
     // Step 4: Launch
     //

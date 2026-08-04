@@ -60,7 +60,7 @@ function formatValuePlaceholder(name) {
 export function formatCommandExample(cmd) {
     if (cmd.example?.trim())
         return cmd.example.trim();
-    const parts = ['opencli', cmd.site, cmd.name];
+    const parts = ['hub', cmd.site, cmd.name];
     for (const arg of cmd.args) {
         if (arg.positional && arg.required) {
             parts.push(formatValuePlaceholder(arg.name));

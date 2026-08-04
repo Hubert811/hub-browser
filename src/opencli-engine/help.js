@@ -130,8 +130,8 @@ export function formatRootAdapterHelpText(groups) {
     lines.push(...formatGroupSection('External CLIs', groups.external.map(cli => cli.label)));
     lines.push(...formatGroupSection('App adapters', groups.apps));
     lines.push(...formatGroupSection('Site adapters', groups.sites));
-    lines.push("Run 'opencli list' for full command details, or 'opencli <site> --help' to inspect one site.");
-    lines.push("Agent tip: use 'opencli <site> --help -f yaml' for all command args/options in one structured response.");
+    lines.push("Run 'hub list' for full command details, or 'hub <site> --help' to inspect one site.");
+    lines.push("Agent tip: use 'hub <site> --help -f yaml' for all command args/options in one structured response.");
     lines.push('');
     return lines.join('\n');
 }
@@ -194,7 +194,7 @@ function compactCommanderOptions(options) {
  *
  * Example: `browser` declares `.usage('<session> <command> [options]')`,
  * so `commanderPath(browserClickCmd)` becomes
- * `['opencli', 'browser', '<session>', 'click']`.
+ * `['hub', 'browser', '<session>', 'click']`.
  */
 export function leadingPositionalFromUsage(command) {
     const usage = command._usage;
@@ -365,12 +365,12 @@ export function formatCommandListTerm(cmd) {
 }
 function formatUsage(cmd) {
     const positionalText = formatPositionals(positionals(cmd));
-    return `opencli ${cmd.site} ${cmd.name}${positionalText ? ` ${positionalText}` : ''} [options]`;
+    return `hub ${cmd.site} ${cmd.name}${positionalText ? ` ${positionalText}` : ''} [options]`;
 }
 function compactCommand(cmd) {
     return {
         name: cmd.name,
-        command: `opencli ${cmd.site} ${cmd.name}`,
+        command: `hub ${cmd.site} ${cmd.name}`,
         usage: formatUsage(cmd),
         access: cmd.access,
         description: cmd.description,
@@ -413,9 +413,9 @@ export function rootHelpData(program, groups) {
             sites: [...groups.sites].sort(sortLocale),
         },
         next: [
-            'opencli <site> --help -f yaml',
-            'opencli list -f yaml',
-            'opencli <site> <command> -f yaml',
+            'hub <site> --help -f yaml',
+            'hub list -f yaml',
+            'hub <site> <command> -f yaml',
         ],
     };
 }
@@ -429,8 +429,8 @@ export function siteHelpData(site, commands) {
         common_options: COMMON_OPTIONS.map(compactCommonOption),
         ...(unique.some(cmd => cmd.browser) ? { browser_common_options: BROWSER_COMMON_OPTIONS.map(compactCommonOption) } : {}),
         next: [
-            `opencli ${site} <command> --help -f yaml`,
-            `opencli ${site} <command> -f yaml`,
+            `hub ${site} <command> --help -f yaml`,
+            `hub ${site} <command> -f yaml`,
         ],
     };
 }
@@ -483,7 +483,7 @@ export function formatSiteHelpText(site, commands) {
     const unique = [...new Map(commands.map(cmd => [fullName(cmd), cmd])).values()]
         .sort((a, b) => a.name.localeCompare(b.name));
     const lines = [
-        `Usage: opencli ${site} <command> [args] [options]`,
+        `Usage: hub ${site} <command> [args] [options]`,
         '',
         wrapCommaList(unique.map(cmd => cmd.name), { indent: '' }),
         '',
@@ -493,7 +493,7 @@ export function formatSiteHelpText(site, commands) {
         formatCommonOptionsHelpText(),
         ...(unique.some(cmd => cmd.browser) ? ['', formatBrowserCommonOptionsHelpText()] : []),
         '',
-        `Agent tip: use 'opencli ${site} --help -f yaml' to get all command args/options in one structured response.`,
+        `Agent tip: use 'hub ${site} --help -f yaml' to get all command args/options in one structured response.`,
         '',
     ];
     return lines.join('\n');

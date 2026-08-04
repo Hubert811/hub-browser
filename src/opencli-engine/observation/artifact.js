@@ -1,13 +1,13 @@
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { redactValue } from './redaction.js';
 import { pruneTraceArtifacts, traceExpiresAt } from './retention.js';
 import { CliError, getErrorMessage } from '../errors.js';
 import { log } from '../logger.js';
+import { hubUserRoot } from '../discovery.js';
 import { PKG_VERSION } from '../version.js';
 function baseOpenCliDir() {
-    return process.env.OPENCLI_CONFIG_DIR || path.join(os.homedir(), '.opencli');
+    return process.env.OPENCLI_CONFIG_DIR || hubUserRoot();
 }
 function safeSegment(value) {
     const safe = (value || 'default').replace(/[^a-zA-Z0-9_-]+/g, '_');
@@ -162,7 +162,7 @@ function renderSummary(session, events, opts) {
         '## How To Use',
         '',
         '- Start with this summary, then inspect `trace.jsonl` only when the evidence below is insufficient.',
-        '- For adapter repair policy and retry limits, use the `opencli-autofix` skill.',
+        '- For adapter repair policy and retry limits, use the `hub-autofix` skill.',
         '- `adapterSourcePathExists: false` means the path is a best-effort hint, not a confirmed editable file.',
         '',
         '## Error',

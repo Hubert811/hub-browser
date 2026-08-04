@@ -819,7 +819,7 @@ export function generateSnapshotJs(opts = {}) {
       if (!doc || !doc.body) {
         const attrs = serializeAttrs(el);
         const frameLabel = '[F' + crossOriginIndex + ']';
-        lines.push(indent + '|iframe|' + frameLabel + '<iframe' + (attrs ? ' ' + attrs : '') + ' /> (cross-origin, use: opencli browser frames + browser eval --frame <index>)');
+        lines.push(indent + '|iframe|' + frameLabel + '<iframe' + (attrs ? ' ' + attrs : '') + ' /> (cross-origin, use: hub browser frames + browser eval --frame <index>)');
         crossOriginIndex++;
         return false;
       }
@@ -834,7 +834,7 @@ export function generateSnapshotJs(opts = {}) {
     } catch {
       const attrs = serializeAttrs(el);
       const frameLabel = '[F' + crossOriginIndex + ']';
-      lines.push(indent + '|iframe|' + frameLabel + '<iframe' + (attrs ? ' ' + attrs : '') + ' /> (blocked, use: opencli browser frames + browser eval --frame <index>)');
+      lines.push(indent + '|iframe|' + frameLabel + '<iframe' + (attrs ? ' ' + attrs : '') + ' /> (blocked, use: hub browser frames + browser eval --frame <index>)');
       crossOriginIndex++;
       return false;
     }

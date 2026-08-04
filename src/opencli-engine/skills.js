@@ -21,12 +21,12 @@ export function listOpenCliSkills(packageRoot) {
 export function readOpenCliSkill(target, relpath = '', packageRoot) {
     const { name, pathInSkill } = parseSkillTarget(target, relpath);
     if (!name.startsWith('opencli-')) {
-        throw new ArgumentError(`Unknown OpenCLI skill: ${name}`, 'Run "opencli skills list" to see available OpenCLI skills.');
+        throw new ArgumentError(`Unknown OpenCLI skill: ${name}`, 'Run "hub skills list" to see available OpenCLI skills.');
     }
     const skillsRoot = getSkillsRoot(packageRoot);
     const skillRoot = path.join(skillsRoot, name);
     if (!isDirectory(skillRoot) || !fs.existsSync(path.join(skillRoot, 'SKILL.md'))) {
-        throw new ArgumentError(`Unknown OpenCLI skill: ${name}`, 'Run "opencli skills list" to see available OpenCLI skills.');
+        throw new ArgumentError(`Unknown OpenCLI skill: ${name}`, 'Run "hub skills list" to see available OpenCLI skills.');
     }
     const relativePath = normalizeSkillPath(pathInSkill || 'SKILL.md');
     const absolutePath = path.resolve(skillRoot, relativePath);
@@ -35,7 +35,7 @@ export function readOpenCliSkill(target, relpath = '', packageRoot) {
         throw new ArgumentError(`Invalid skill path: ${relativePath}`, 'Skill paths must stay inside the selected OpenCLI skill.');
     }
     if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
-        throw new ArgumentError(`Skill file not found: ${name}/${relativePath}`, 'Run "opencli skills list <skill>" is not supported yet; read SKILL.md or a known references/... file.');
+        throw new ArgumentError(`Skill file not found: ${name}/${relativePath}`, 'Run "hub skills list <skill>" is not supported yet; read SKILL.md or a known references/... file.');
     }
     return {
         skill: name,

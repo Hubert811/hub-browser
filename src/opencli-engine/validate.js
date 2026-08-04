@@ -112,7 +112,7 @@ function validateCommand(cmd) {
 }
 export function renderValidationReport(report) {
     const lines = [
-        `opencli validate: ${report.ok ? 'PASS' : 'FAIL'}`,
+        `hub validate: ${report.ok ? 'PASS' : 'FAIL'}`,
         `Checked ${report.commands} command(s)`,
         `Errors: ${report.errors}  Warnings: ${report.warnings}`,
     ];

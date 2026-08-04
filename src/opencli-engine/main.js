@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * opencli — Make any website your CLI. AI-powered.
+ * hub — Make any website your CLI. AI-powered.
  */
 // Ensure standard system paths are available for child processes.
 // Some environments (GUI apps, cron, IDE terminals) launch with a minimal PATH
@@ -17,17 +17,23 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getCompletionsFromManifest, hasAllManifests, printCompletionScriptFast } from './completion-fast.js';
-import { getCliManifestPath } from './package-paths.js';
+import { getCliManifestPath, findPackageRoot } from './package-paths.js';
 import { PKG_VERSION } from './version.js';
 import { EXIT_CODES } from './errors.js';
 import { isSupportedNodeVersion, MIN_SUPPORTED_NODE_MAJOR } from './runtime-detect.js';
 import { isIgnorableDaemonPortEnv, unsupportedDaemonPortEnvMessage } from './constants.js';
+import { hubUserRoot, migrateLegacyUserClis } from './discovery.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Adapters are JS-first and live at <package-root>/clis/.
-// hub-browser: clis/ lives at the project root (process.cwd()).
-const BUILTIN_CLIS = path.join(process.cwd(), 'clis');
-const USER_CLIS = path.join(os.homedir(), '.opencli', 'clis');
+// Resolve from the package root (walks up to the hubBrowserRoot package.json),
+// NOT process.cwd(): the globally-installed `hub` must find its own clis/
+// regardless of the caller's working directory. Works from src/ (dev) and
+// dist/opencli-engine/ (published build) alike.
+const BUILTIN_CLIS = path.join(findPackageRoot(__filename), 'clis');
+// User adapters live under the product-owned root (方案 C): <root>/clis
+// (default root: ~/.hub; BROWSEROS_DIR overrides).
+const USER_CLIS = path.join(hubUserRoot(), 'clis');
 // ── Ultra-fast path: lightweight commands bypass full discovery ──────────
 // These are high-frequency or trivial paths that must not pay the startup tax.
 const argv = process.argv.slice(2);
@@ -45,7 +51,7 @@ if (!isIgnorableDaemonPortEnv(process.env.OPENCLI_DAEMON_PORT)) {
     process.exit(EXIT_CODES.CONFIG_ERROR);
 }
 // Fast path: --version (only when it's the top-level intent, not passed to a subcommand)
-// e.g. `opencli --version` or `opencli -V`, but NOT `opencli gh --version`
+// e.g. `hub --version` or `hub -V`, but NOT `hub gh --version`
 if (argv[0] === '--version' || argv[0] === '-V') {
     process.stdout.write(PKG_VERSION + '\n');
     process.exit(EXIT_CODES.SUCCESS);
@@ -102,7 +108,7 @@ installNodeNetwork();
 // Parallelise independent startup I/O:
 //  - Built-in adapter discovery has no dependency on user-dir setup.
 //  - ensureUserCliCompatShims and ensureUserAdapters operate on different paths
-//    (~/.opencli/node_modules/ vs ~/.opencli/clis/ + adapter-manifest.json).
+//    (<root>/node_modules/ vs <root>/clis/ + adapter-manifest.json).
 //  - registerCommand() overwrites on name collision (see registry.ts), so
 //    user-CLI discovery MUST run after built-in discovery to preserve the
 //    intended override order (user adapters override built-in ones).
@@ -112,9 +118,13 @@ if (skipUserDiscovery) {
     await discoverClis(BUILTIN_CLIS);
 }
 else {
-    const [, ,] = await Promise.all([
+    // Parallelise independent startup I/O. migrateLegacyUserClis() is a
+    // best-effort one-time copy of ~/.opencli/clis/ → <root>/clis/ and must
+    // not block startup on failure.
+    const [, , ,] = await Promise.all([
         ensureUserCliCompatShims(),
         ensureUserAdapters(),
+        migrateLegacyUserClis(),
         discoverClis(BUILTIN_CLIS),
     ]);
     await discoverClis(USER_CLIS);
@@ -144,9 +154,9 @@ if (getCompIdx !== -1) {
     process.stdout.write(candidates.join('\n') + '\n');
     process.exit(EXIT_CODES.SUCCESS);
 }
-// Rewrite `opencli browser <session> <subcommand> ...` so commander (which
+// Rewrite `hub browser <session> <subcommand> ...` so commander (which
 // can't combine a parent positional with subcommand dispatch) sees the internal
-// `--session <name>` flag form. Also refuses the retired `opencli browser
+// `--session <name>` flag form. Also refuses the retired `hub browser
 // --session foo ...` user form with a friendly usage error.
 const { rewriteBrowserArgv, BrowserSessionArgvError, escapeLeadingDashPositional } = await import('./cli-argv-preprocess.js');
 try {

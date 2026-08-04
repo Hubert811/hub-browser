@@ -2,12 +2,12 @@
  * Electron app registry — maps site names to launch metadata.
  *
  * Builtin apps are defined here. User-defined apps are loaded
- * from ~/.opencli/apps.yaml (additive only, does not override builtins).
+ * from <root>/config/apps.yaml (additive only, does not override builtins).
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as os from 'node:os';
 import yaml from 'js-yaml';
+import { hubUserRoot } from './discovery.js';
 export const builtinApps = {
     cursor: { port: 9226, processName: 'Cursor', bundleId: 'com.todesktop.runtime.Cursor', displayName: 'Cursor' },
     codex: { port: 9238, processName: 'Codex', bundleId: 'com.openai.codex', displayName: 'Codex' },
@@ -62,7 +62,7 @@ function ensureLoaded() {
         return _apps;
     let userApps;
     try {
-        const yamlPath = path.join(os.homedir(), '.opencli', 'apps.yaml');
+        const yamlPath = path.join(hubUserRoot(), 'config', 'apps.yaml');
         if (fs.existsSync(yamlPath)) {
             const content = fs.readFileSync(yamlPath, 'utf-8');
             const parsed = yaml.load(content);
