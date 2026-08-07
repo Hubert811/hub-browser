@@ -27,10 +27,10 @@ npm install -g @hub/browser
 
 ```bash
 cd hub-browser
-npm pack          # 生成 hub-browser-<version>.tgz（当前 0.1.1，自动跑 prepack 构建）
+npm pack          # 生成 hub-browser-<version>.tgz（当前 0.1.5，自动跑 prepack 构建）
 ```
 
-把生成的 `hub-browser-<version>.tgz`（如 `hub-browser-0.1.1.tgz`）拷贝到目标机器，然后：
+把生成的 `hub-browser-<version>.tgz`（如 `hub-browser-0.1.5.tgz`）拷贝到目标机器，然后：
 
 ```bash
 npm install -g ./hub-browser-<version>.tgz
@@ -44,7 +44,7 @@ npm install -g ./hub-browser-<version>.tgz
 # 默认分支（https 方式，任何机器可装，无需配置 GitHub ssh key）
 npm install -g git+https://github.com/Hubert811/hub-browser.git
 # 指定 tag / 分支
-npm install -g git+https://github.com/Hubert811/hub-browser.git#v0.1.0
+npm install -g git+https://github.com/Hubert811/hub-browser.git#v0.1.5
 ```
 
 npm 会 clone 仓库并执行 `prepack`（构建）与 `postinstall`（符号链接）。

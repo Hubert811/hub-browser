@@ -126,8 +126,9 @@ uv run browseros build --preset release --product browserclaw --arch arm64 \
 ### 6.6 签名
 
 ```bash
-# macOS 代码签名
-browseros sign --chromium-src ~/work/chromium/src
+# macOS 代码签名是 release build 的一部分
+uv run browseros build --preset release --product browserclaw --arch arm64 \
+  --chromium-src ~/work/chromium/src --provision none --no-download --sign
 ```
 
 如果没有 Apple 开发者证书，可以用 ad-hoc 签名（本地开发够用）。
@@ -135,19 +136,22 @@ browseros sign --chromium-src ~/work/chromium/src
 ### 6.7 打包
 
 ```bash
-# 打包成 .app
-browseros package --chromium-src ~/work/chromium/src
-# → 输出到 ~/work/chromium/src/out/Release/BrowserOS.app
+# 打包由同一 build 命令的 package_macos 阶段完成
+uv run browseros build --preset debug --product browserclaw --arch arm64 \
+  --chromium-src ~/work/chromium/src --provision none --no-download \
+  --from package_macos
+# → 调试产物：BrowserOS neo Dev.app
+#   Release 产物：BrowserOS neo.app
 ```
 
 ### 6.8 验证
 
 ```bash
-# 拷贝到 Applications
-cp -r ~/work/chromium/src/out/Release/BrowserOS.app /Applications/
+# 拷贝到 Applications（按实际 out/ 路径替换）
+cp -r ~/work/chromium/src/out/*browserclaw*/BrowserOS\ neo*.app /Applications/
 
 # 启动
-open -a BrowserOS
+open -a "BrowserOS neo"
 
 # 验证 CDP 端口
 curl http://127.0.0.1:9000/json/version
