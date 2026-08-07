@@ -2,7 +2,7 @@
  * Browser connection error helpers.
  *
  * Simplified — no more token/extension/CDP classification.
- * Browser connection failure modes (BrowserClaw CDP direct connection).
+ * Browser connection failure modes (BrowserOS neo CDP direct connection).
  */
  import { BrowserConnectError } from '../errors.js';
  /**
@@ -89,9 +89,9 @@ export function isTransientBrowserError(err) {
 export function formatBrowserConnectError(kind, detail) {
     switch (kind) {
         case 'daemon-not-running':
-            return new BrowserConnectError('Cannot connect to browser.' + (detail ? `\n\n${detail}` : ''), 'Make sure BrowserClaw is running on the configured CDP port.', kind);
+            return new BrowserConnectError('Cannot connect to browser.' + (detail ? `\n\n${detail}` : ''), 'Make sure BrowserOS neo is running on the configured CDP port.', kind);
         case 'extension-not-connected':
-            return new BrowserConnectError('Browser connection failed.' + (detail ? `\n\n${detail}` : ''), 'Make sure BrowserClaw is running.', kind);
+            return new BrowserConnectError('Browser connection failed.' + (detail ? `\n\n${detail}` : ''), 'Make sure BrowserOS neo is running.', kind);
         case 'command-failed':
             return new BrowserConnectError(`Browser command failed: ${detail ?? 'unknown error'}`, undefined, kind);
         default:

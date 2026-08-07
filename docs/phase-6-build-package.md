@@ -7,7 +7,7 @@
 
 ## 目标
 
-用 BrowserClaw 的构建系统，把融合后的 Chromium patches 编译成可分发的浏览器 .app。
+用 BrowserOS neo（原 BrowserClaw）的构建系统，把融合后的 Chromium patches 编译成可分发的浏览器 .app。
 
 ## 前置条件
 
@@ -86,12 +86,12 @@ browseros source ensure --root ~/work/chromium --step sync
 ### 6.4 应用补丁
 
 ```bash
-# 应用所有 BrowserClaw 补丁 + 我们的融合改动
+# 应用所有 BrowserOS neo 补丁 + 我们的融合改动
 browseros apply --chromium-src ~/work/chromium/src
 ```
 
 这会把 `chromium_patches/` 里的所有补丁打到 Chromium 源码上，包括：
-- BrowserClaw 原有补丁（server/CDP 域/品牌/onboarding 等）
+- BrowserOS neo 原有补丁（server/CDP 域/品牌/onboarding 等）
 - （可选）Phase 5.4 的真隔离补丁（若启用）
 - （可选）Phase 7 的 Space UI 补丁（若已开发）
 
@@ -223,7 +223,7 @@ browseros dev extract --file path/to/modified/file.cc
 - [ ] Task Space 可创建
 - [x] 统一 TS/JS 双份文件（见 6.9，2026-08-04）
 - [x] CLI 以 npm 包分发 ✅（D6：`@hub/browser`，`files` 白名单 + prepack/postinstall 自建符号链接，2026-08-04）
-- [x] CDP 端口自动探测 BrowserClaw 配置 ✅（D7：`BROWSEROS_CDP_PORT` → config `ports.cdp` → 9005，2026-08-04）
+- [x] CDP 端口自动探测 BrowserOS neo 配置 ✅（D7：`BROWSEROS_CDP_PORT` → config `ports.cdp` → 9005，2026-08-04）
 
 ## 6.9 统一 src/opencli/ 与 src/opencli-engine/browser/ 重复文件
 
@@ -301,7 +301,7 @@ browseros dev extract --file path/to/modified/file.cc
 
 **完成标志**：
 - [x] 核心工具（snapshot/act/click/fill）的 handler 改为调用 `UnifiedPage` ✅（2026-08-04：`src/browser-mcp` fork 的**全部**工具都走 UnifiedPage，不只是核心工具）
-- [ ] Agent 扩展 `/chat` 路径验证通过（BrowserClaw `apps/app` 产品面，非 hub-browser 范围）
+- [ ] Agent 扩展 `/chat` 路径验证通过（BrowserOS neo `apps/app` 产品面，非 hub-browser 范围）
 - [x] 外部 MCP `/mcp` 路径验证通过 ✅（`hub --mcp` stdio server 即 fork + UnifiedPage，冒烟通过）
 - [x] OpenCLI 路径不受影响 ✅（本就是 UnifiedPage）
 - [x] 两条路径的 ref 解析行为一致 ✅（MCP 工具与 CLI 共用 UnifiedPage target-resolver）
@@ -327,7 +327,7 @@ browseros dev extract --file path/to/modified/file.cc
 - 运行时依赖 vendor 三包：`@browseros/browser-core`（248K）、`cdp-protocol`（688K）、`shared`（128K）——**纯 TS 源码无 dist**，经 workspace 链接。
 - 适配器 `clis/`（13MB）+ `cli-manifest.json`（1MB）需随包发布（合计 ~15MB，可接受）。
 - ABI shim：适配器 `import '@jackwener/opencli/*'`，方案 C 在 `~/.hub/node_modules` 建符号链接（postinstall/首次运行自建）。
-- `hub` 驱动外部浏览器（`BROWSEROS_CDP_PORT`），包不含浏览器（BrowserClaw `.app` 是另一层）。
+- `hub` 驱动外部浏览器（`BROWSEROS_CDP_PORT`），包不含浏览器（BrowserOS neo `.app` 是另一层）。
 
 **实现要点**：
 1. `bun run build`（`tsc --outDir dist`）把 TS（src/space、src/browser-mcp、src/page.ts、src/factory.ts、vendor 三包）编译进 dist。
@@ -336,13 +336,13 @@ browseros dev extract --file path/to/modified/file.cc
 4. `publishConfig.access: public`。
 5. 验证：`npm pack --dry-run` 看包内容；`npm i -g <tgz>` 干净环境测 `hub list`、`hub --mcp`、建 space + 适配器命令。
 
-## 决策 D7（2026-08-04）：CDP 端口自动探测 BrowserClaw 配置
+## 决策 D7（2026-08-04）：CDP 端口自动探测 BrowserOS neo 配置
 
-**问题**：`hub` 默认找 `9005` 端口，但 BrowserClaw 的 CDP 端口是配置动态分配的（本机 `~/.browseros/config.json` 的 `ports.cdp = 9110`），另一台机器装完 BrowserClaw 不设 `BROWSEROS_CDP_PORT` 就连不上（"CDP discovery failed ... fetch failed"）。
+**问题**：`hub` 默认找 `9005` 端口，但 BrowserOS neo（原 BrowserClaw）的 CDP 端口是配置动态分配的（本机 `~/.browseros/config.json` 的 `ports.cdp = 9110`），另一台机器装完 BrowserOS neo 不设 `BROWSEROS_CDP_PORT` 就连不上（"CDP discovery failed ... fetch failed"）。
 
-**方案**：`src/factory.ts` 端口解析加 BrowserClaw 配置探测：
+**方案**：`src/factory.ts` 端口解析加 BrowserOS neo 配置探测：
 1. `BROWSEROS_CDP_PORT` 环境变量优先（显式覆盖）；
-2. 未设置 → 读 BrowserClaw config.json 的 `ports.cdp`（macOS: `~/Library/Application Support/BrowserClaw/.browseros/config.json`；dev: `.browseros-dev`；Windows/Linux 对应路径；也可探测 `BROWSERCLAW_DIR`）；
+2. 未设置 → 读 BrowserOS neo config.json 的 `ports.cdp`（配置目录仍叫 `BrowserClaw`；macOS: `~/Library/Application Support/BrowserClaw/.browseros/config.json`；dev: `.browseros-dev`；Windows/Linux 对应路径；也可探测 `BROWSERCLAW_DIR`）；
 3. 读不到 → fallback 9005。
 - 探测结果做进程内缓存（避免每次 connect 读盘）；配置文件不存在/无 ports.cdp 时静默 fallback。
 - 这是唯一入口：engine 的 `getBrowserFactory` 返回 `UnifiedBrowserFactory`，vendor `browser-core/cdp.ts` 只接收 port，无需改 vendor。

@@ -5,14 +5,12 @@
     "": {
       "name": "@hub/browser",
       "dependencies": {
-        "@browseros/browser-core": "workspace:*",
-        "@browseros/cdp-protocol": "workspace:*",
-        "@browseros/shared": "workspace:*",
         "@modelcontextprotocol/sdk": "1.29.0",
         "@mozilla/readability": "^0.6.0",
         "cli-table3": "^0.6.5",
         "commander": "^14.0.3",
         "js-yaml": "^4.1.0",
+        "jsonc-parser": "^3.3.1",
         "turndown": "^7.2.2",
         "turndown-plugin-gfm": "^1.0.2",
         "undici": "^6.27.0",
@@ -47,7 +45,7 @@
         "@ai-sdk/provider-utils": "^4.0.26",
       },
       "peerDependencies": {
-        "acpx": ">=0.8.0",
+        "acpx": "^0.13.0",
         "ai": ">=6.0.0",
       },
     },

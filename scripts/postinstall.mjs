@@ -27,29 +27,29 @@ function prefer(primary, fallback) {
 }
 
 const engineRoot = prefer(
-  path.join(root, 'dist', 'opencli-engine'),
   path.join(root, 'src', 'opencli-engine'),
+  path.join(root, 'dist', 'opencli-engine'),
 );
 
 const vendorRoot = path.join(root, 'vendor', 'browseros', 'packages', 'browseros-agent', 'packages');
 const vendorTargets = {
   '@browseros/browser-core': prefer(
-    path.join(root, 'dist', 'vendor', 'browser-core'),
     path.join(vendorRoot, 'browser-core'),
+    path.join(root, 'dist', 'vendor', 'browser-core'),
   ),
   '@browseros/cdp-protocol': prefer(
-    path.join(root, 'dist', 'vendor', 'cdp-protocol'),
     path.join(vendorRoot, 'cdp-protocol'),
+    path.join(root, 'dist', 'vendor', 'cdp-protocol'),
   ),
   '@browseros/shared': prefer(
-    path.join(root, 'dist', 'vendor', 'shared'),
     path.join(vendorRoot, 'shared'),
+    path.join(root, 'dist', 'vendor', 'shared'),
   ),
 };
 
 const mcpRoot = prefer(
-  path.join(root, 'dist', 'browser-mcp'),
   path.join(root, 'src', 'browser-mcp'),
+  path.join(root, 'dist', 'browser-mcp'),
 );
 
 function link(pkgName, target) {

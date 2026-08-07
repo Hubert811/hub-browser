@@ -15,11 +15,20 @@
       "@browseros/browser-core": [
         "./vendor/browseros/packages/browseros-agent/packages/browser-core/src"
       ],
+      "@browseros/browser-core/*": [
+        "./vendor/browseros/packages/browseros-agent/packages/browser-core/src/*"
+      ],
       "@browseros/cdp-protocol": [
         "./vendor/browseros/packages/browseros-agent/packages/cdp-protocol/src"
       ],
+      "@browseros/cdp-protocol/*": [
+        "./vendor/browseros/packages/browseros-agent/packages/cdp-protocol/src/generated/*"
+      ],
       "@browseros/shared": [
         "./vendor/browseros/packages/browseros-agent/packages/shared/src"
+      ],
+      "@browseros/shared/*": [
+        "./vendor/browseros/packages/browseros-agent/packages/shared/src/*"
       ]
     },
     "types": [

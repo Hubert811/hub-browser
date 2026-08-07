@@ -22,7 +22,7 @@
   }
 ```
 
-**作用**: 让 OpenCLI 的执行引擎在 `OPENCLI_BROWSER=claw` 时返回 hub-browser 的 `UnifiedBrowserFactory`（连接 BrowserClaw CDP），而非默认的 `BrowserBridge`（Chrome 扩展）。
+**作用**: 让 OpenCLI 的执行引擎在 `OPENCLI_BROWSER=claw` 时返回 hub-browser 的 `UnifiedBrowserFactory`（连接 BrowserOS neo CDP），而非默认的 `BrowserBridge`（Chrome 扩展）。
 
 **Patch 管理**: `scripts/apply-patches.mjs` 在 `postinstall` 时自动应用。`bun install` 后自动执行。
 

@@ -3,16 +3,17 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /**
- * CDP port resolution for the BrowserClaw backend (decision D7, 2026-08-04).
+ * CDP port resolution for the BrowserOS neo backend (decision D7, 2026-08-04).
  *
  * Resolution order (best-effort, never throws):
  *   1. BROWSEROS_CDP_PORT env var (explicit override, highest priority) —
  *      used when it parses to a valid positive port; invalid/empty is skipped.
- *   2. BrowserClaw config.json `ports.cdp` — probed once and cached in-process:
+ *   2. BrowserOS neo config.json `ports.cdp` (config dir is still BrowserClaw) —
+ *      probed once and cached in-process:
  *      macOS  ~/Library/Application Support/BrowserClaw/.browseros[-dev]/config.json
  *      Win    %APPDATA%/BrowserClaw/.browseros[-dev]/config.json
  *      Linux  ~/.config/BrowserClaw/.browseros[-dev]/config.json
- *      BROWSERCLAW_DIR overrides the BrowserClaw app-support directory on any OS.
+ *      BROWSERCLAW_DIR overrides the BrowserOS neo app-support directory on any OS.
  *      .browseros-dev (dev mode) is checked before .browseros (stable).
  *   3. Fallback: 9005 (keeps the pre-D7 default).
  *

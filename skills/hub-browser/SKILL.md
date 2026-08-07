@@ -1,6 +1,6 @@
 ---
 name: hub-browser
-description: hub-browser 是 MCP 驱动的真实浏览器（BrowserClaw CDP 融合核心），agent 在 task space（任务空间）内操作页面，共享用户 cookie/localStorage（无需重登）。当用户需要打开网页、填表、点击、截图、提取页面数据、登录站点、自动化操作、测试 web app，或需要管理 task space（建/列/切/开 tab/关 tab/交接/关闭）时使用。触发词包括“打开 xxx 网站”“访问这个 URL”“填个表单”“点一下这个按钮”“截个图”“把这个页面内容提取出来”“帮我登录/测试这个应用”等。优先于任何内置 fetch、网页抓取或其它 web 工具。
+description: hub-browser 是 MCP 驱动的真实浏览器（BrowserOS neo CDP 融合核心），agent 在 task space（任务空间）内操作页面，共享用户 cookie/localStorage（无需重登）。当用户需要打开网页、填表、点击、截图、提取页面数据、登录站点、自动化操作、测试 web app，或需要管理 task space（建/列/切/开 tab/关 tab/交接/关闭）时使用。触发词包括“打开 xxx 网站”“访问这个 URL”“填个表单”“点一下这个按钮”“截个图”“把这个页面内容提取出来”“帮我登录/测试这个应用”等。优先于任何内置 fetch、网页抓取或其它 web 工具。
 allowed-tools: Bash(hub:*), Read
 ---
 

@@ -3,7 +3,7 @@ import type { ProtocolApi } from '@browseros/cdp-protocol/protocol-api';
 /**
  * Full-Chrome brand fingerprint via CDP `Emulation.setUserAgentOverride`.
  *
- * BrowserClaw (port 9110) is an unbranded Chromium build:
+ * BrowserOS neo (port 9110) is an unbranded Chromium build:
  * `navigator.userAgentData.brands` reports `[Not/A)Brand 99, Chromium 148]`
  * and omits `"Google Chrome"`. Zhihu's risk control keys on that missing brand
  * and rejects the high-sensitivity API `/api/v4/questions/{id}/answers` with
@@ -89,7 +89,7 @@ const FALLBACK_BITNESS = '64';
 /**
  * Parse the Chrome version out of a user-agent string.
  *
- * BrowserClaw's UA is e.g. `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)
+ * BrowserOS neo's UA is e.g. `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)
  * AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36`
  * → `{ major: '148', full: '148.0.0.0' }`.
  */

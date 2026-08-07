@@ -1,6 +1,6 @@
 # @hub/browser
 
-把任何网站变成 CLI 的浏览器自动化工具（hub）。`hub` 驱动真实浏览器（BrowserClaw / Chromium CDP），agent 在 **task space（任务空间）** 内操作页面，共享用户 cookie / localStorage，无需重复登录。
+把任何网站变成 CLI 的浏览器自动化工具（hub）。`hub` 驱动真实浏览器（BrowserOS neo / Chromium CDP），agent 在 **task space（任务空间）** 内操作页面，共享用户 cookie / localStorage，无需重复登录。
 
 - **纯 Node CLI**：`node >= 20`，无 Bun 依赖，无浏览器打包（驱动外部浏览器 CDP）。
 - **MCP 原生**：`hub --mcp` 作为 stdio MCP server，外部 agent 可直接接入。
@@ -69,7 +69,7 @@ npm install -g @hub/browser --registry http://your-verdaccio:4873
 
 ```bash
 # 1. 浏览器依赖：确认 CDP 端口可达（v0.1.1 起自动探测，无需手动设端口）
-curl http://127.0.0.1:9110/json/version   # 本机 BrowserClaw 的 CDP 端口；见「浏览器依赖」
+curl http://127.0.0.1:9110/json/version   # 本机 BrowserOS neo 的 CDP 端口；见「浏览器依赖」
 
 # 2. 看有哪些命令 / 站点
 hub list -f json          # 全部命令（JSON，agent 友好）
@@ -101,14 +101,14 @@ BROWSEROS_CDP_PORT=9110 hub --mcp   # 端口可省略：v0.1.1 起自动探测�
 
 | 变量 | 默认 | 用途 |
 |---|---|---|
-| `BROWSEROS_CDP_PORT` | 自动探测（env → BrowserClaw 配置 `ports.cdp` → `9005`） | 浏览器 CDP 调试端口显式覆盖；不设时自动读 BrowserClaw 配置（v0.1.1 起，决策 D7） |
+| `BROWSEROS_CDP_PORT` | 自动探测（env → BrowserOS neo 配置 `ports.cdp` → `9005`） | 浏览器 CDP 调试端口显式覆盖；不设时自动读 BrowserOS neo 配置（v0.1.1 起，决策 D7） |
 | `BROWSEROS_DIR` | `~/.hub` | 用户数据根目录（space 账本、缓存、适配器等） |
 | `HUB_DAEMON_PORT` | `9300` | hub daemon 端口（CLI 转发给常驻 daemon） |
 | `HUB_SPACES_FILE` | `$BROWSEROS_DIR/state/hub-spaces.json` | space 账本文件覆盖 |
 | `HUB_AGENT_ID` | `cli:local` | 身份标识（多 agent 并发时各自唯一） |
-| `BROWSERCLAW_DIR` | — | 覆盖 BrowserClaw 配置目录（用于 `ports.cdp` 自动探测；默认 macOS `~/Library/Application Support/BrowserClaw`、Windows `%APPDATA%/BrowserClaw`、Linux `~/.config/BrowserClaw`） |
+| `BROWSERCLAW_DIR` | — | 覆盖 BrowserOS neo 配置目录（底层仍使用 `BrowserClaw` 目录名；用于 `ports.cdp` 自动探测；默认 macOS `~/Library/Application Support/BrowserClaw`、Windows `%APPDATA%/BrowserClaw`、Linux `~/.config/BrowserClaw`） |
 | `HUB_MCP` / `--mcp` | — | 以 stdio MCP server 模式运行 |
-| `OPENCLI_BROWSER` | `claw`（hub 强制） | 浏览器后端，由 `bin/hub.mjs` 固定设为 `claw`（BrowserClaw），不是用户配置项 |
+| `OPENCLI_BROWSER` | `claw`（hub 强制） | 浏览器后端，由 `bin/hub.mjs` 固定设为 `claw`（BrowserOS neo），不是用户配置项 |
 
 ---
 
@@ -116,17 +116,17 @@ BROWSEROS_CDP_PORT=9110 hub --mcp   # 端口可省略：v0.1.1 起自动探测�
 
 `hub` 本身**不含浏览器**——它通过 CDP 驱动一个已运行的浏览器。推荐：
 
-- **BrowserClaw**（融合目标，默认）：启动后 CDP 端口由 BrowserClaw 配置决定（本机通常 9110）；
+- **BrowserOS neo**（原 BrowserClaw，融合目标，默认）：启动后 CDP 端口由 BrowserOS neo 配置决定（本机通常 9110）；
 - 任意支持 CDP 的 Chrome / Chromium：用 `--remote-debugging-port` 启动后把 `BROWSEROS_CDP_PORT` 指过去。
 
-### 安装 BrowserClaw（推荐）
+### 安装 BrowserOS neo（推荐）
 
-**BrowserClaw** 是一个免费、开源的浏览器：像普通浏览器一样安装，登录你日常使用的网站，然后你的 AI（Claude Code / Codex / Cursor 或任何 MCP 客户端）就能用你已经登录的账号驱动它。agent 在自己的 tab 里干活，你可以实时观看，还能像看视频一样回放每一个 session。
+**BrowserOS neo**（原 BrowserClaw）是一个免费、开源的浏览器：像普通浏览器一样安装，登录你日常使用的网站，然后你的 AI（Claude Code / Codex / Cursor 或任何 MCP 客户端）就能用你已经登录的账号驱动它。agent 在自己的 tab 里干活，你可以实时观看，还能像看视频一样回放每一个 session。
 
-[![Download for macOS](https://img.shields.io/badge/Download-macOS-black?style=flat&logo=apple&logoColor=white)](https://cdn.browseros.com/download/BrowserClaw.dmg)
-[![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D4?style=flat&logo=windows&logoColor=white)](https://cdn.browseros.com/download/BrowserClaw_installer.exe)
+[![Download for macOS](https://img.shields.io/badge/Download-macOS-black?style=flat&logo=apple&logoColor=white)](https://cdn.browseros.com/download/BrowserOS_neo.dmg)
+[![Download for Windows](https://img.shields.io/badge/Download-Windows-0078D4?style=flat&logo=windows&logoColor=white)](https://cdn.browseros.com/download/BrowserOS_neo_installer.exe)
 
-1. **下载并安装** BrowserClaw：macOS 用 `.dmg`，Windows 用 `.exe`（系统要求与 Google Chrome 一致）；
+1. **下载并安装** BrowserOS neo：macOS 用 `.dmg`，Windows 用 `.exe`（系统要求与 Google Chrome 一致）；
 2. **登录你常用的网站**（zhihu / bilibili / …）——`hub` 直接继承这些登录态，无需重复登录；
 3. **用 `hub` 连上它**：
 
@@ -140,12 +140,12 @@ hub zhihu hot -f plain                    # 直接以你的登录态跑适配器
 - **纯本地。** session、截图、历史都存放在 `~/.browserclaw/`，不会离开你的机器。
 - **有回放。** 每个 session 都会被录制成可拖拽回放的视频，带一步步的操作时间线。
 
-> 项目主页：<https://www.browseros.com/agents> · 文档：<https://docs.browseros.com/browserclaw>
+> 项目主页：<https://www.browseros.com/agents> · 文档：<https://docs.browseros.com/neo>
 
 **CDP 端口自动探测（v0.1.1 起，决策 D7）**：不再需要手动设端口，解析顺序：
 
 1. `BROWSEROS_CDP_PORT` 环境变量（显式覆盖，最高优先）；
-2. BrowserClaw `config.json` 的 `ports.cdp`——macOS `~/Library/Application Support/BrowserClaw/.browseros/config.json`、Windows `%APPDATA%/BrowserClaw/.browseros/config.json`、Linux `~/.config/BrowserClaw/.browseros/config.json`；`BROWSERCLAW_DIR` 可覆盖整个配置目录；dev 变体 `.browseros-dev` 优先探测；结果进程内缓存，不重复读盘；
+2. BrowserOS neo 的 `config.json` 的 `ports.cdp`（配置目录仍叫 `BrowserClaw`）——macOS `~/Library/Application Support/BrowserClaw/.browseros/config.json`、Windows `%APPDATA%/BrowserClaw/.browseros/config.json`、Linux `~/.config/BrowserClaw/.browseros/config.json`；`BROWSERCLAW_DIR` 可覆盖整个配置目录；dev 变体 `.browseros-dev` 优先探测；结果进程内缓存，不重复读盘；
 3. 都读不到 → fallback `9005`（v0.1.1 之前的旧默认）。
 
 登录态：浏览器里登录过的站点（zhihu / bilibili / …），`hub` 直接继承 cookie，无需重复登录。

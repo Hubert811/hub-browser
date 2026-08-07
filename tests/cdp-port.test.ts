@@ -1,7 +1,7 @@
 /**
- * D7 (2026-08-04): CDP port auto-detection from BrowserClaw config.
+ * D7 (2026-08-04): CDP port auto-detection from BrowserOS neo config.
  *
- * Resolution order: BROWSEROS_CDP_PORT env (explicit override) → BrowserClaw
+ * Resolution order: BROWSEROS_CDP_PORT env (explicit override) → BrowserOS neo
  * config.json `ports.cdp` (probed once, cached in-process) → fallback 9005.
  * All probes are best-effort and silent: missing/corrupt configs fall back.
  */
@@ -54,7 +54,7 @@ describe('resolveCdpPort — BROWSEROS_CDP_PORT env override', () => {
   })
 })
 
-describe('resolveCdpPort — BrowserClaw config probe', () => {
+describe('resolveCdpPort — BrowserOS neo config probe', () => {
   it('returns ports.cdp from an injected config when env is unset', () => {
     const configPath = join(tmpDir, 'config.json')
     writeFileSync(

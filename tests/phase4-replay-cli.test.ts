@@ -268,7 +268,7 @@ describe('opencli replay command group (Phase 4.6)', () => {
     try {
       const out = await env.run(['replay', 'list'])
       expect(out).toContain('ERR')
-      expect(out).toContain('replay depends on the BrowserClaw server')
+      expect(out).toContain('replay depends on the BrowserOS neo server')
       expect(out).toContain(base)
       expect(process.exitCode).toBe(69) // EX_UNAVAILABLE
     } finally {

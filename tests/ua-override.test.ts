@@ -9,7 +9,7 @@
  * 14.5/MacIntel profile, and fall back to the macOS profile only when the
  * live read is unavailable.
  *
- * Background (confirmed on BrowserClaw 9110): the browser is an unbranded
+ * Background (confirmed on BrowserOS neo 9110): the browser is an unbranded
  * Chromium build whose navigator.userAgentData.brands is
  * [Not/A)Brand 99, Chromium 148] — missing "Google Chrome" — which triggers
  * zhihu 40362 on /api/v4/questions/{id}/answers. navigator.userAgentData is
@@ -30,7 +30,7 @@ const BROWSERCLAW_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36'
 
 describe('parseChromeVersion', () => {
-  it('parses major + full version from the BrowserClaw UA (Chrome 148)', () => {
+  it('parses major + full version from the BrowserOS neo UA (Chrome 148)', () => {
     expect(parseChromeVersion(BROWSERCLAW_UA)).toEqual({
       major: '148',
       full: '148.0.0.0',

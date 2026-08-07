@@ -3141,9 +3141,9 @@ cli({
         await page.closeWindow?.();
         console.log('Browser session tab lease released');
     }));
-    // ── Built-in: bookmarks (Phase 4.2 — BrowserClaw Bookmarks CDP domain) ──
+    // ── Built-in: bookmarks (Phase 4.2 — BrowserOS neo Bookmarks CDP domain) ──
     //
-    // Browser-level domain exposed by the BrowserClaw extension. These commands
+    // Browser-level domain exposed by the BrowserOS neo extension. These commands
     // connect a browser session named "bookmarks" (same UnifiedPage path every
     // browser command uses) and call Bookmarks.* via page.cdp().
     const bookmarksCmd = program
@@ -3474,7 +3474,7 @@ cli({
         return res.text();
     }
     function replayDependencyHint(baseUrl) {
-        return `replay depends on the BrowserClaw server (claw-server-rust) HTTP API at ${baseUrl}. ` +
+        return `replay depends on the BrowserOS neo server (claw-server-rust) HTTP API at ${baseUrl}. ` +
             'Start it (e.g. `browseros-dev watch --claw`), or point this CLI at it with --base-url / CLAW_SERVER_URL / BROWSEROS_SERVER_PORT.';
     }
     function printReplayError(err, baseUrl) {
@@ -3486,7 +3486,7 @@ cli({
             console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
         }
         else {
-            console.error(`Error: could not reach the BrowserClaw server at ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`);
+            console.error(`Error: could not reach the BrowserOS neo server at ${baseUrl}: ${err instanceof Error ? err.message : String(err)}`);
             console.error(replayDependencyHint(baseUrl));
         }
         process.exitCode = EXIT_CODES.SERVICE_UNAVAIL;
@@ -3514,13 +3514,13 @@ cli({
     }
     const replayCmd = program
         .command('replay')
-        .description('Recording replay — list, show, and export session recordings from the BrowserClaw server (Phase 4.6)');
+        .description('Recording replay — list, show, and export session recordings from the BrowserOS neo server (Phase 4.6)');
     replayCmd.command('list')
         .option('--limit <n>', 'Max sessions to list (and probe for recordings)', '20')
         .option('--no-recordings', 'Skip per-session recording probes (faster)')
-        .option('--base-url <url>', 'BrowserClaw server base URL (default: CLAW_SERVER_URL env or http://127.0.0.1:9200)')
+        .option('--base-url <url>', 'BrowserOS neo server base URL (default: CLAW_SERVER_URL env or http://127.0.0.1:9200)')
         .option('--json', 'Print a JSON envelope', false)
-        .description('List sessions from the BrowserClaw server, annotated with recording presence')
+        .description('List sessions from the BrowserOS neo server, annotated with recording presence')
         .action(async (opts) => {
         const baseUrl = replayBaseUrl(opts ?? {});
         try {
@@ -3561,7 +3561,7 @@ cli({
                 return;
             }
             if (rows.length === 0) {
-                console.log('(no sessions — start a BrowserClaw session first)');
+                console.log('(no sessions — start a BrowserOS neo session first)');
                 return;
             }
             for (const s of rows) {
@@ -3579,7 +3579,7 @@ cli({
     replayCmd.command('show')
         .argument('<sessionId>', 'Session id')
         .option('--timeline', 'Include the operation timeline (rrweb event types / counts)', false)
-        .option('--base-url <url>', 'BrowserClaw server base URL')
+        .option('--base-url <url>', 'BrowserOS neo server base URL')
         .option('--json', 'Print a JSON envelope', false)
         .description('Show recording metadata for a session')
         .action(async (sessionId, opts) => {
@@ -3632,9 +3632,9 @@ cli({
         .argument('<sessionId>', 'Session id')
         .option('--format <format>', 'Export format: ndjson (raw event stream, default) or json (JSON array)', 'ndjson')
         .option('--out <path>', 'Write to a file instead of stdout')
-        .option('--base-url <url>', 'BrowserClaw server base URL')
+        .option('--base-url <url>', 'BrowserOS neo server base URL')
         .option('--json', 'Print a JSON envelope with the export summary', false)
-        .description('Export a session recording (rrweb events) from the BrowserClaw server')
+        .description('Export a session recording (rrweb events) from the BrowserOS neo server')
         .action(async (sessionId, opts) => {
         const baseUrl = replayBaseUrl(opts ?? {});
         try {

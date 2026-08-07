@@ -8,7 +8,7 @@
  * 3. MCP (hub --mcp | HUB_MCP=true): stdio MCP server backed by the @hub/browser-mcp fork,
  *    which routes every browser tool through UnifiedPage.
  *
- * Daemon uses the same CdpBackend from @browseros/browser-core as BrowserClaw's apps/server,
+ * Daemon uses the same CdpBackend from @browseros/browser-core as BrowserOS neo's apps/server,
  * with built-in keepalive + auto-reconnect. Chrome supports multiple CDP clients simultaneously,
  * so daemon and apps/server can each maintain independent WebSocket connections to the same port.
  */
