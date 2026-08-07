@@ -536,7 +536,7 @@ describe('bug 2 — failed adapter command still syncs the bound tab URL (catch 
     const setup = new TaskSpaceManager({ storagePath, persist: true })
     const space = await setup.create('agent-a', 'space A')
 
-    // Fake BrowserClaw session over a shared tab registry. The singleton
+    // Fake BrowserOS neo session over a shared tab registry. The singleton
     // (__HubBrowserFactory) seam lets UnifiedBrowserFactory.connect() reuse
     // this session without any real CDP connection.
     const tabs: Array<{

@@ -1,6 +1,6 @@
 # Phase 6 — Chromium 构建 + 打包
 
-> 状态：⏳ 部分完成（2026-08-04：D6 npm 分发 + D7 CDP 端口自动探测已落地；Chromium 构建部分未开始）
+> 状态：⏳ 部分完成（2026-08-04：D6 npm 分发 + D7 CDP 端口自动探测已落地；2026-08-05：BrowserClaw 基线 debug 构建已跑通；BrowserOS 0.49.6 同步后产物名改为 BrowserOS neo）
 > 预估：5-7 天
 > 依赖：Phase 3 + Phase 5 完成
 > 注：Phase 7（Space 浏览器 UI）依赖本阶段的构建产物，其 UI 补丁在本阶段构建管线中迭代（可与 5.4 补丁同批次）。
@@ -75,22 +75,26 @@ uv pip install -e .
 
 ```bash
 # ~40GB 下载
-browseros source ensure --root ~/work/chromium --step checkout
+uv run browseros source ensure --root ~/work/chromium --step checkout
 # 这步会拉取 Chromium 148 的源码
 
 # 安装依赖
-browseros source ensure --root ~/work/chromium --step sync
+uv run browseros source ensure --root ~/work/chromium --step sync
 # 这步安装 Chromium 构建需要的工具链
 ```
 
 ### 6.4 应用补丁
 
 ```bash
-# 应用所有 BrowserOS neo 补丁 + 我们的融合改动
-browseros apply --chromium-src ~/work/chromium/src
+cd ~/hermes-tmp/browseros/packages/browseros
+export PATH="$HOME/depot_tools:$PATH" BROWSEROS_NINJA_JOBS=8
+# 应用 BrowserOS neo 原有补丁 + 我们的融合改动
+uv run browseros build --preset debug --product browserclaw --arch arm64 \
+  --chromium-src ~/work/chromium/src --provision none --no-download \
+  --modules resources,bundled_extensions,chromium_replace,string_replaces,patches
 ```
 
-这会把 `chromium_patches/` 里的所有补丁打到 Chromium 源码上，包括：
+这会把 `chromium_patches/` 里的所有补丁以及资源 staging 打到 Chromium 源码上，包括：
 - BrowserOS neo 原有补丁（server/CDP 域/品牌/onboarding 等）
 - （可选）Phase 5.4 的真隔离补丁（若启用）
 - （可选）Phase 7 的 Space UI 补丁（若已开发）
@@ -100,18 +104,24 @@ browseros apply --chromium-src ~/work/chromium/src
 ### 6.5 构建
 
 ```bash
-# Release 构建
-browseros build --preset release --chromium-src ~/work/chromium/src
+# 调试构建（增量续跑）
+uv run browseros build --preset debug --product browserclaw --arch arm64 \
+  --chromium-src ~/work/chromium/src --provision none --no-download \
+  --from configure
 
-# 调试构建（更快但更大）
-browseros build --preset debug --chromium-src ~/work/chromium/src
+# Release 构建
+uv run browseros build --preset release --product browserclaw --arch arm64 \
+  --chromium-src ~/work/chromium/src --provision none --no-download
 ```
 
 构建参数：
-- `--preset release|debug`：构建配置
+- `--preset debug|release`：构建配置
+- `--product browserclaw|browseros`：产品；BrowserOS neo 仍使用 `browserclaw` 产品 ID
+- `--arch arm64|x64`：目标架构
 - `--chromium-src`：Chromium 源码路径
-- `--modules`：指定构建模块（setup/prep/build/sign/package/upload）
-- 可以只跑部分阶段：`--modules build` 只编译
+- `--provision none --no-download`：本地无 R2 密钥时跳过私有下载
+- `--from configure`：从 configure 开始增量续跑（compile → package_macos）
+- `--modules`：只跑指定构建模块（resources/patches/configure/compile/package_macos 等）
 
 ### 6.6 签名
 
@@ -159,15 +169,17 @@ OPENCLI_BROWSER=claw opencli browser state
 ## 构建系统命令参考
 
 ```bash
-browseros source ensure --root <path>           # 拉取 Chromium 源码
-browseros apply --chromium-src <path>           # 应用补丁
-browseros build --preset <release|debug>         # 编译
-browseros package --chromium-src <path>          # 打包
-browseros sign --chromium-src <path>             # 签名
-browseros dev --help                             # 开发用补丁管理
-browseros release --help                         # 发布自动化
-browseros ext --help                             # 扩展打包
-browseros ota --help                             # OTA 更新
+uv run browseros source ensure --root <path> --step checkout   # 拉取 Chromium 源码
+uv run browseros source ensure --root <path> --step sync       # 安装 Chromium 依赖
+uv run browseros build --preset debug --product browserclaw --arch arm64 \
+  --chromium-src <path> --provision none --no-download \
+  --modules resources,bundled_extensions,chromium_replace,string_replaces,patches  # 资源 + 补丁
+uv run browseros build --preset debug --product browserclaw --arch arm64 \
+  --chromium-src <path> --provision none --no-download --from configure          # 编译 + 打包
+uv run browseros build --preset release --product browserclaw --arch arm64 \
+  --chromium-src <path> --provision none --no-download                           # Release
+uv run browseros release --help                                                   # 发布自动化
+uv run browseros dev --help                                                       # 开发/补丁管理
 ```
 
 ## 补丁管理
@@ -190,20 +202,20 @@ browseros dev extract --file path/to/modified/file.cc
 
 ## 可能的问题
 
-1. **内存不够**：M4 Pro 24GB 编译 Chromium 可能 OOM。解决：限制并行度 `browseros build -- -j4`
+1. **内存不够**：M4 Pro 24GB 编译 Chromium 可能 OOM。解决：限制并行度 `BROWSEROS_NINJA_JOBS=8`（24GB 安全上限，不要继续加大）
 2. **编译时间过长**：首次 2-6 小时。增量编译会快很多（改一个文件只需几分钟）
-3. **签名失败**：没有 Apple 开发者证书。解决：用 ad-hoc 签名 `codesign --force --deep --sign - BrowserOS.app`
+3. **签名失败**：没有 Apple 开发者证书。解决：用 ad-hoc 签名 `codesign --force --deep --sign - "BrowserOS neo.app"`
 4. **depot_tools 版本不匹配**：Chromium 148 需要特定版本的 depot_tools
 
 ## 验证标准
 
 | 验证项 | 命令 | 预期结果 |
 |---|---|---|
-| 源码拉取 | `browseros source ensure` | 无报错 |
-| 补丁应用 | `browseros apply` | 所有 features applied |
-| 编译成功 | `browseros build` | 无编译错误 |
-| .app 生成 | `browseros package` | 生成 BrowserOS.app |
-| 启动 | `open -a BrowserOS` | 浏览器正常打开 |
+| 源码拉取 | `uv run browseros source ensure --root <path> --step checkout` | 无报错 |
+| 资源/补丁 | `uv run browseros build --modules resources,...,patches` | 无报错 |
+| 编译成功 | `uv run browseros build --preset debug ... --from configure` | 无编译错误 |
+| .app 生成 | 同一 build 命令的 package_macos 阶段 | 生成 BrowserOS neo.app / BrowserOS neo Dev.app |
+| 启动 | `open -a "BrowserOS neo"` | 浏览器正常打开 |
 | CDP 端口 | `curl :9000/json/version` | 返回版本信息 |
 | MCP 端口 | `curl :9100/system/health` | ok |
 | OpenCLI 连接 | `OPENCLI_BROWSER=claw opencli browser state` | 返回快照 |

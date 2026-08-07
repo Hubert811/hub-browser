@@ -4,6 +4,7 @@
 > 预估：3-5 天
 > 依赖：Phase 2 完成（可与 Phase 3 并行）
 > 注：`space` 命令组依赖 Phase 3 内核（TaskSpaceManager）完成，若 Phase 3 未交付则本阶段先跳过该命令组。
+> 2026-08-07 更新：BrowserClaw 现改名 BrowserOS neo；本文历史设计里的 BrowserClaw 均指同一产品。
 
 ## 目标
 

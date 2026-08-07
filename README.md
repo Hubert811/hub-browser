@@ -176,7 +176,7 @@ hub space takeover <id>       # 用户确认后取回
 ```bash
 bun install          # 安装依赖 + postinstall 建符号链接
 bun run build        # 编译 dist/（prepack 会自动跑）
-bun test src/browser-mcp/src src/space tests/*.test.ts
+bun run test:unit    # 核心单元/工具测试（排除 clis/ 与 vendor 测试）
 bun run typecheck
 ```
 

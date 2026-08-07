@@ -76,7 +76,7 @@ bun run build
 ```bash
 bun run typecheck
 bun run build
-bun test
+bun run test:unit
 ```
 
 ## 2. 已确认兼容、不需要改代码
@@ -164,17 +164,17 @@ hub-browser 当前没有 import 这个常量，自己的 `src/browser-mcp` 也�
 
 这会影响构建文档、启动命令、验收路径，但不会改变 `BROWSERCLAW_DIR` / CDP config 探测路径。
 
-## 4. 建议同步的文案/品牌位置
+## 4. 文案/品牌位置（已同步 2026-08-07）
 
-这些改动不影响运行逻辑，但会让 hub-browser 对新版产品名的描述保持一致：
+这些改动不影响运行逻辑，但让 hub-browser 对新版产品名的描述保持一致：
 
-- `README.md`：BrowserClaw 安装/下载/说明段落，以及 `docs.browseros.com/browserclaw` 链接。
-- `skills/hub-browser/SKILL.md`：description 里的 BrowserClaw。
-- `skills/hub-browser-browser/SKILL.md`：端口探测说明里的 BrowserClaw。
-- `src/opencli-engine/cli.js`：replay 命令的 description、`--base-url`、错误提示。
-- `src/opencli-engine/browser/errors.js`：连接错误提示。
-- `tests/phase4-replay-cli.test.ts`：依赖 `replay depends on the BrowserClaw server` 的断言。
-- `docs/phase-*` 中的构建产物名和验收命令。
+- `README.md`：BrowserOS neo 安装/下载/说明段落，以及 `docs.browseros.com/neo` 链接。
+- `skills/hub-browser/SKILL.md`：description 改为 BrowserOS neo。
+- `skills/hub-browser-browser/SKILL.md`：端口探测说明改为 BrowserOS neo，配置目录仍保留 BrowserClaw。
+- `src/opencli-engine/cli.js`：replay 命令的 description、`--base-url`、错误提示已改。
+- `src/opencli-engine/browser/errors.js`：连接错误提示已改。
+- `tests/phase4-replay-cli.test.ts`：断言已改为 BrowserOS neo server。
+- `docs/phase-*`：构建产物名和验收命令已更新为 BrowserOS neo / BrowserOS neo Dev。
 
 注意：只改显示文案，不要改 `src/cdp-port.ts` 中的 `BrowserClaw` 配置目录。
 

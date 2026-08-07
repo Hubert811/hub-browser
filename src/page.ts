@@ -444,7 +444,7 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     return this._browserSession.cdpJsonForPage(this.pageId, method, JSON.stringify(params ?? {}));
   }
 
-  // ── native input → BrowserClaw Input ──
+  // ── native input → BrowserOS neo Input ──
   async nativeClick(x: number, y: number): Promise<void> {
     await this._browserSession.input(this.pageId).clickAt(x, y);
   }

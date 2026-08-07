@@ -1298,7 +1298,7 @@ export class TaskSpaceManager {
    *
    * NOT automatic: callers (space.recycle MCP tool / `hub space refresh`)
    * invoke it explicitly. useOrCreateTaskSpace never auto-recycles a reused
-   * space — official ego/BrowserClaw recycle only at task/session boundaries,
+   * space — official ego/BrowserOS neo recycle only at task/session boundaries,
    * and auto-recycle stays opt-in at the screenshot tool level.
    */
   async recycleSpaceTabs(

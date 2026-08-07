@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit",
     "test": "BROWSEROS_CDP_PORT=9110 bun run tests/test-phase2a.ts",
     "test:session-adapter": "bun tests/session-mode-harness.ts",
+    "test:unit": "bun test --timeout=30000 $(find tests src/space src/browser-mcp/src -name '*.test.ts' -not -path '*/node_modules/*' | tr '\\n' ' ')",
     "prepack": "bun run build"
   },
   "dependencies": {

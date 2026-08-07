@@ -2,6 +2,7 @@
 
 > 九轮审查（Leibniz→Herschel→Goodall→Tesla→Darwin→Hypatia→Einstein→Hooke→Chandrasekhar）后的最终方案
 > 目标：一个项目，两条路径操作同一个浏览器
+> 2026-08-07 更新：BrowserClaw 现改名 BrowserOS neo；本文历史设计里的 BrowserClaw 均指同一产品。
 
 ## 一、目标架构
 

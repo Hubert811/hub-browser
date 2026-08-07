@@ -1,5 +1,5 @@
 /**
- * Phase 4.2 — `opencli bookmarks` command group (BrowserClaw Bookmarks CDP
+ * Phase 4.2 — `opencli bookmarks` command group (BrowserOS neo Bookmarks CDP
  * domain): list / search / add / update / move / remove. Exercised through the
  * real commander program with an injected fake bridge (no CDP needed).
  */

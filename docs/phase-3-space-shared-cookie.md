@@ -3,6 +3,7 @@
 > 状态：✅ 完成（2026-08-03 收尾）
 > 预估：5-8 天
 > 依赖：Phase 2 完成（可与 Phase 4 并行）
+> 2026-08-07 更新：BrowserClaw 现改名 BrowserOS neo；本文历史结论里的 BrowserClaw 均指同一产品。
 
 ## 目标
 

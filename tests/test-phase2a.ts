@@ -46,7 +46,7 @@ async function test1_cdpConnect(): Promise<void> {
 
     // Run every phase2a pass on a FRESH tab: a tab that has accumulated many
     // navigations/Input operations can get its Page.captureScreenshot wedged in
-    // this BrowserClaw/Chromium build (per-tab, persistent, stochastic — fresh
+    // this BrowserOS neo/Chromium build (per-tab, persistent, stochastic — fresh
     // tabs never fail). A fresh tab per run keeps the test deterministic.
     await page.newTab('about:blank');
 
@@ -162,13 +162,13 @@ async function test5_click(): Promise<void> {
       record('click (tryClickAxRef + nativeClick)', true,
         `ref=${targetRef}, ${urlBefore} -> ${urlAfter}`);
     } else {
-      // BrowserClaw Input.dispatchMouseEvent doesn't trigger link navigation
+      // BrowserOS neo Input.dispatchMouseEvent doesn't trigger link navigation
       // Verify the ref was correct by checking JS click works
       await page!.evaluate('document.querySelector("a")?.click()');
       await sleep(2000);
       const urlAfterJs = await page!.evaluate<string>('location.href');
       record('click (tryClickAxRef + nativeClick)', urlAfterJs !== urlBefore,
-        `ref=${targetRef} nativeClick no-nav (BrowserClaw limitation), JS fallback: ${urlBefore} -> ${urlAfterJs}`);
+        `ref=${targetRef} nativeClick no-nav (BrowserOS neo limitation), JS fallback: ${urlBefore} -> ${urlAfterJs}`);
     }
   } catch (e) {
     record('click (tryClickAxRef + nativeClick)', false, (e as Error).message);
@@ -385,7 +385,7 @@ async function main(): Promise<void> {
   try {
     await test1_cdpConnect();
   } catch {
-    console.log('\n⛔ CDP 连接失败,无法继续测试。请确保 BrowserClaw CDP 在 9110 端口运行。');
+    console.log('\n⛔ CDP 连接失败,无法继续测试。请确保 BrowserOS neo CDP 在 9110 端口运行。');
     printSummary();
     return;
   }

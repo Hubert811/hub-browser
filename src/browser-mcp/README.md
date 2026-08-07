@@ -212,15 +212,14 @@ Harnesses:
 ## Verification
 
 - `bun run typecheck` (fork + hub-browser root): pass
-- `bun test` (fork): 32/32 pass, incl. structured-contract (17 tools) & register/mcp-server
-- hub-browser e2e `BROWSEROS_CDP_PORT=9110 bun run tests/test-phase2a.ts`: 24/24 pass
-- Live smoke against Chrome CDP 9110 (`src/smoke-mcp.ts`, in-process) and
-  `src/smoke-stdio-client.ts` (spawns `hub --mcp`, real MCP client):
+- `bun run test:unit`: 304 pass / 0 fail（35 个文件），incl. structured-contract (17 tools) & register/mcp-server
+- hub-browser e2e `BROWSEROS_CDP_PORT=9110 bun run tests/test-phase2a.ts`: 12/12 pass
+- Live smoke against BrowserOS neo CDP 9110 (`src/smoke-mcp.ts`, in-process):
   tabs / navigate / snapshot / read / evaluate / windows / history / diff all pass.
 
 ## Session-replay (rrweb) impact
 
-**None.** The replay chain lives entirely in vendored BrowserClaw and is untouched:
+**None.** The replay chain lives entirely in vendored BrowserOS neo and is untouched:
 
 - `apps/claw-app/entrypoints/recorder.content.ts` — content script collects rrweb
   events → `modules/recorder/recorder-buffer.ts` → `chrome.runtime.sendMessage`

@@ -14,7 +14,7 @@ allowed-tools: Bash(hub:*), Read, Edit, Write
 
 ## 前置检查
 
-hub 直连 Chrome 的 CDP（BrowserOS 核心），**没有 extension / daemon 桥**，也没有 `doctor` 命令。浏览器连不上时：
+hub 直连 BrowserOS neo 的 CDP，**没有 extension / daemon 桥**，也没有 `doctor` 命令。浏览器连不上时：
 
 - **端口一般不用手动设**（v0.1.1 起自动探测，决策 D7）：解析顺序 `BROWSEROS_CDP_PORT` → BrowserOS neo 的 `config.json` 的 `ports.cdp`（配置目录仍叫 `BrowserClaw`）→ fallback 9005；显式覆盖就设 `BROWSEROS_CDP_PORT`。
 - `hub browser <session> state` 本身就是连通性探针 + 端口探针：能返回页面状态 = 桥是通的。

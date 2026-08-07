@@ -207,7 +207,7 @@ describe('opencli space refresh — TabFreshness 整组回收原语 (CLI)', () =
 // into the ledger before answering. Without a gateway the reads degrade
 // gracefully (no sync, same output as before).
 describe('bug 1 — CLI read paths sync tab-group drag-ins via the gateway', () => {
-  /** Fake BrowserClaw page with D5 tab-group support (shared registry). */
+  /** Fake BrowserOS neo page with D5 tab-group support (shared registry). */
   class TabGroupPage {
     constructor(private browser: TabGroupBrowser) {}
     async tabs() {
