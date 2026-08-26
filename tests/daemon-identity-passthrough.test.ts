@@ -90,6 +90,65 @@ function stopDaemon(daemon: ChildProcess): Promise<void> {
   })
 }
 
+describe('daemon audit rows (P2-2 M2)', () => {
+  it('every daemon /command lands a source=daemon audit row with the caller convo', async () => {
+    const port = await freePort()
+    const cdpPort = await freePort()
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-audit-'))
+    const ledger = path.join(root, 'hub-spaces.json')
+    const auditDb = path.join(root, 'audit.db')
+    let daemon: ChildProcess | undefined
+
+    try {
+      daemon = spawn(process.execPath, [HUB_BIN], {
+        env: {
+          ...process.env,
+          HUB_DAEMON: 'true',
+          HUB_DAEMON_PORT: String(port),
+          HUB_AGENT_ID: 'audit-caller',
+          HUB_SPACES_FILE: ledger,
+          HUB_AUDIT_DB: auditDb,
+          BROWSEROS_DIR: root,
+          BROWSEROS_CDP_PORT: String(cdpPort),
+          HUB_DAEMON_IDLE_TIMEOUT: '30000',
+        },
+        cwd: REPO_ROOT,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      expect(await waitForHealth(port)).toBe(true)
+
+      const out = await runCli(port, { HUB_AGENT_ID: 'audit-cli', HUB_SPACES_FILE: ledger }, [
+        'space',
+        'list',
+        '--json',
+      ])
+      expect(out).toBeDefined()
+
+      // The audit row landed in the daemon's DB: source=daemon, the CLI
+      // caller's convo id, byte-count summary (no output content).
+      const { AuditLog } = await import('../src/audit/audit-log.ts')
+      const audit = new AuditLog(auditDb)
+      const rows = audit.listDispatches().filter(
+        (r) => r.source === 'daemon',
+      )
+      audit.close()
+      expect(rows.length).toBeGreaterThanOrEqual(1)
+      const row = rows[0]
+      expect(row.tool_name).toBe('hub space list')
+      expect(row.convo_id).toBe('audit-cli')
+      expect(row.ok).toBe(1)
+      const meta = JSON.parse(row.result_meta!) as { exitCode: number; stdoutBytes: number }
+      expect(meta.exitCode).toBe(0)
+      expect(meta.stdoutBytes).toBeGreaterThan(0)
+    } finally {
+      if (daemon) await stopDaemon(daemon)
+      try {
+        fs.rmSync(root, { recursive: true, force: true })
+      } catch {}
+    }
+  }, 60000)
+})
+
 describe('daemon identity passthrough (bug #3)', () => {
   it('per-command HUB_AGENT_ID reaches the ledger; raw /command without env keeps daemon identity', async () => {
     const port = await freePort()

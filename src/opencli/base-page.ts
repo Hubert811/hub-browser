@@ -11,7 +11,6 @@
 
 import type { BrowserCookie, BrowserEvaluateFunction, FetchJsonOptions, IPage, ScreenshotOptions, SnapshotOptions, WaitOptions } from './types.js';
 import { generateSnapshotJs, getFormStateJs } from './dom-snapshot.js';
-import { buildAxSnapshotFromTrees, findAxRefReplacement, type AxSnapshotTree, type BrowserRef } from './ax-snapshot.js';
 import {
   pressKeyJs,
   waitForTextJs,
@@ -83,10 +82,130 @@ export interface DragResult {
   target_match_level: TargetMatchLevel;
 }
 
-interface CdpFrameTreeNode {
-  frame?: { id?: string; url?: string; unreachableUrl?: string; name?: string };
-  childFrames?: CdpFrameTreeNode[];
+/**
+ * Browser-core action surface for AX refs (P2-8 primitive sinking).
+ *
+ * The subclass with CDP access (UnifiedPage) returns an adapter over
+ * browser-core's Input/Observer/geometry — element-scoped actions resolve the
+ * ref (with stale-ref re-identification by role/name/nth) and dispatch on the
+ * element's own frame session; coordinate actions dispatch the same trusted
+ * CDP input events at viewport positions. BasePage keeps ZERO browser-core
+ * imports: this structural interface is the whole contract, which keeps
+ * opencli-engine portable (it is vendored standalone into dist).
+ *
+ * The base class prefers this channel whenever the ref is a live AX ref the
+ * channel's Observer knows (`eN` from an AX snapshot); DOM-selector refs
+ * (`h1`, `@3`, bare numeric state refs) keep the page-JS resolver path — that
+ * is the opencli-adapter compatibility surface with the full TargetError
+ * contract.
+ */
+export interface AxActionChannel {
+  /**
+   * Whether `ref` is a live AX ref the channel's Observer knows. The Observer
+   * (persisted on the browser session) is the single ref authority — NOT a
+   * per-page-instance mirror — because CLI commands rebuild the page object
+   * per invocation while the session's refs survive.
+   */
+  hasRef(ref: string): boolean;
+  /** Click the element; `clickCount: 2` for dblclick. Trusted input dispatch, js-click fallback on missing geometry. */
+  click(ref: string, opts?: { clickCount?: number }): Promise<void>;
+  hover(ref: string): Promise<void>;
+  focus(ref: string): Promise<void>;
+  /** Click-focus the element, optionally clear, then type. Real key events. */
+  fill(ref: string, value: string, opts?: { clear?: boolean }): Promise<void>;
+  check(ref: string): Promise<boolean>;
+  uncheck(ref: string): Promise<boolean>;
+  /** Set local file paths on a file input via CDP DOM.setFileInputFiles. */
+  uploadFile(ref: string, files: string[]): Promise<void>;
+  dragRefs(sourceRef: string, targetRef: string): Promise<void>;
+  scrollIntoViewRef(ref: string): Promise<void>;
+  /**
+   * Evaluate `expr` (a `function(){ ... this ... }` string) on the resolved
+   * element and return its value — the element-state probe primitive.
+   */
+  readState(ref: string, expr: string): Promise<unknown>;
+  /** Viewport-coordinate actions for the DOM-resolver path's native fallbacks. */
+  clickAt(x: number, y: number, opts?: { clickCount?: number }): Promise<void>;
+  hoverAt(x: number, y: number): Promise<void>;
+  dragAt(from: { x: number; y: number }, to: { x: number; y: number }): Promise<void>;
+  /** Type into whatever currently holds focus (no ref). */
+  typeText(text: string): Promise<void>;
+  press(key: string, modifiers?: string[]): Promise<void>;
+  /** Center point of the resolved element, or null when it has no geometry. */
+  centerRef(ref: string): Promise<{ x: number; y: number } | null>;
 }
+
+/** Shared checkable-state shape for the DOM probe and the AX-channel probe. */
+interface CheckableState {
+  ok?: boolean;
+  checked?: boolean;
+  disabled?: boolean;
+  kind?: string;
+  reason?: string;
+  tag?: string;
+  role?: string;
+}
+
+// ── Element-state probes for the AX channel (P2-8) ──
+// readState evaluates these as `function(){ ... this ... }` on the resolved
+// element (browser-core callOnElement), mirroring the DOM-path probes
+// (readCheckableState / prepareNativeTypeResolvedJs / verifyFilledResolvedJs).
+
+const CHECKABLE_STATE_EXPR = `function(){
+  const el = this;
+  if (!el || el.nodeType !== 1) return { ok: false, reason: 'not_checkable' };
+  const tag = el.tagName.toLowerCase();
+  const role = (el.getAttribute('role') || '').toLowerCase();
+  const type = (el.getAttribute('type') || '').toLowerCase();
+  if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
+    return { ok: true, checked: !!el.checked, disabled: !!el.disabled, kind: type };
+  }
+  if (role === 'checkbox' || role === 'switch' || role === 'menuitemcheckbox' || role === 'radio' || role === 'menuitemradio') {
+    const aria = (el.getAttribute('aria-checked') || '').toLowerCase();
+    return {
+      ok: true,
+      checked: aria === 'true' || aria === 'mixed',
+      disabled: el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled'),
+      kind: role,
+    };
+  }
+  return { ok: false, reason: 'not_checkable', tag, role };
+}`;
+
+const FILE_INPUT_STATE_EXPR = `function(){
+  const el = this;
+  if (!el || el.nodeType !== 1) return { ok: false, reason: 'not_file_input' };
+  const tag = el.tagName.toLowerCase();
+  const type = (el.getAttribute('type') || '').toLowerCase();
+  if (tag !== 'input' || type !== 'file') return { ok: false, reason: 'not_file_input', tag, type };
+  return { ok: true, multiple: !!el.multiple, accept: el.getAttribute('accept') || '' };
+}`;
+
+const FILE_NAMES_EXPR = `function(){
+  const names = [];
+  try {
+    if (this && this.files) { for (let i = 0; i < this.files.length; i++) names.push(this.files[i].name || ''); }
+  } catch (_) {}
+  return names;
+}`;
+
+function fillVerifyExpr(expected: string): string {
+  return `function(){
+    const el = this;
+    if (!el) return { ok: false, reason: 'no_element' };
+    const tag = el.tagName ? el.tagName.toLowerCase() : '';
+    const isInput = el instanceof HTMLInputElement;
+    const isTextarea = el instanceof HTMLTextAreaElement;
+    const mode = el.isContentEditable ? 'contenteditable' : isTextarea ? 'textarea' : isInput ? 'input' : '';
+    if (!mode) return { ok: false, reason: 'not_editable', tag };
+    const actual = mode === 'contenteditable' ? (el.innerText || '') : String(el.value || '');
+    return { ok: actual === ${JSON.stringify(expected)}, actual, length: actual.length, mode };
+  }`;
+}
+
+const TARGET_INFO_EXPR = `function(){
+  return { tag: this.tagName ? this.tagName.toLowerCase() : '', text: (this.textContent || '').trim().slice(0, 80) };
+}`;
 
 /**
  * Execute `resolveTargetJs` once, throw structured `TargetError` on failure.
@@ -142,10 +261,34 @@ export abstract class BasePage implements IPage {
   /** Cached previous snapshot hashes for incremental diff marking */
   protected _prevSnapshotHashes: string | null = null;
   private _cdpTargetMarkerSeq = 0;
-  protected _axRefs = new Map<string, BrowserRef>();
+
+  /**
+   * Browser-core action surface for AX refs — see AxActionChannel. Returns
+   * null on the base class; subclasses with CDP access override this. P2-8:
+   * AX-ref actions ride this channel instead of hub-side page-JS resolution,
+   * which fixes OOPIF input dispatch (events now go through the element's own
+   * frame session) and drops the duplicated hub geometry/dispatch code.
+   */
+  protected axChannel(): AxActionChannel | null {
+    return null;
+  }
+
+  /**
+   * True when `ref` is a live AX ref (`eN`) the channel's Observer knows.
+   * The format check is cheap; validity is the channel's call because the
+   * Observer persists on the browser session across page-instance rebuilds.
+   */
+  protected isAxRef(ref: string): boolean {
+    const channel = this.axChannel();
+    return channel !== null && /^e?\d+$/.test(ref) && channel.hasRef(ref);
+  }
+
+  /** The action channel when `ref` is a live AX ref, else null. */
+  protected axChannelForRef(ref: string): AxActionChannel | null {
+    return this.isAxRef(ref) ? this.axChannel() : null;
+  }
 
   protected resetPageState(): void {
-    this._axRefs.clear();
     this._prevSnapshotHashes = null;
     this._lastUrl = null;
   }
@@ -293,8 +436,18 @@ export abstract class BasePage implements IPage {
   // ── Shared DOM helper implementations ──
 
   async click(ref: string, opts: ResolveOptions = {}): Promise<ResolveSuccess> {
-    const axClick = await this.tryClickAxRef(ref);
-    if (axClick) return axClick;
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        // Channel resolution re-identifies stale refs by (role, name, nth)
+        // internally; from hub's vantage a resolved ref is an exact match.
+        await ax.click(ref);
+        return { matches_n: 1, match_level: 'exact' };
+      } catch {
+        // Stale beyond the channel's re-identification, or a CDP hiccup —
+        // the DOM-resolver path below re-resolves with the TargetError contract.
+      }
+    }
 
     // Phase 1: Resolve target with fingerprint verification
     const resolved = await runResolve(this, ref, opts);
@@ -331,23 +484,24 @@ export abstract class BasePage implements IPage {
     throw new Error(`Click failed: ${result.error ?? 'JS click and CDP fallback both failed'}`);
   }
 
-  /** Uses native CDP click support when the concrete page exposes it. */
+  /** Trusted CDP click at viewport coordinates via the action channel. */
   protected async tryNativeClick(x: number, y: number): Promise<boolean> {
-    const nativeClick = (this as IPage).nativeClick;
-    if (typeof nativeClick !== 'function') return false;
+    const ax = this.axChannel();
+    if (!ax) return false;
     try {
-      await nativeClick.call(this, x, y);
+      await ax.clickAt(x, y);
       return true;
     } catch {
       return false;
     }
   }
 
+  /** Trusted CDP hover (mouseMoved) at viewport coordinates via the action channel. */
   protected async tryNativeMouseMove(x: number, y: number): Promise<boolean> {
-    const cdp = (this as IPage).cdp;
-    if (typeof cdp !== 'function') return false;
+    const ax = this.axChannel();
+    if (!ax) return false;
     try {
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+      await ax.hoverAt(x, y);
       return true;
     } catch {
       return false;
@@ -355,14 +509,10 @@ export abstract class BasePage implements IPage {
   }
 
   protected async tryNativeDoubleClick(x: number, y: number): Promise<boolean> {
-    const cdp = (this as IPage).cdp;
-    if (typeof cdp !== 'function') return false;
+    const ax = this.axChannel();
+    if (!ax) return false;
     try {
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 2 });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 2 });
+      await ax.clickAt(x, y, { clickCount: 2 });
       return true;
     } catch {
       return false;
@@ -370,110 +520,22 @@ export abstract class BasePage implements IPage {
   }
 
   protected async tryNativeDrag(from: { x: number; y: number }, to: { x: number; y: number }): Promise<boolean> {
-    const cdp = (this as IPage).cdp;
-    if (typeof cdp !== 'function') return false;
-    const midX = Math.round((from.x + to.x) / 2);
-    const midY = Math.round((from.y + to.y) / 2);
+    const ax = this.axChannel();
+    if (!ax) return false;
     try {
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', clickCount: 1 });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: midX, y: midY, button: 'left', buttons: 1 });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: to.x, y: to.y, button: 'left', buttons: 1 });
-      await cdp.call(this, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', clickCount: 1 });
+      await ax.dragAt(from, to);
       return true;
     } catch {
       return false;
     }
   }
 
-  protected async tryClickAxRef(ref: string): Promise<ResolveSuccess | null> {
-    if (!/^e?\d+$/.test(ref)) return null;
-    const entry = this._axRefs.get(ref);
-    if (!entry) return null;
-    const nativeClick = (this as IPage).nativeClick;
-    if (typeof nativeClick !== 'function') return null;
-
-    const resolved = await this.resolveAxRefPoint(entry);
-    if (!resolved) return null;
-    try {
-      await nativeClick.call(this, resolved.x, resolved.y);
-      return { matches_n: 1, match_level: resolved.matchLevel };
-    } catch {
-      return null;
-    }
-  }
-
-  private async resolveAxRefPoint(entry: BrowserRef): Promise<{ x: number; y: number; matchLevel: TargetMatchLevel } | null> {
-    const cdp = (this as IPage).cdp;
-    if (typeof cdp !== 'function') return null;
-
-    if (entry.backendNodeId != null) {
-      const point = await this.axBoxCenter(entry.backendNodeId, entry.frame).catch(() => null);
-      if (point) return { ...point, matchLevel: 'exact' };
-    }
-
-    await cdp.call(this, 'Accessibility.enable', axEnableParams(entry.frame));
-    const axTree = await cdp.call(this, 'Accessibility.getFullAXTree', axTreeParams(entry.frame)).catch(() => null);
-    const recovered = findAxRefReplacement(axTree, entry);
-    if (!recovered?.backendNodeId) return null;
-    this._axRefs.set(entry.ref, recovered);
-    const point = await this.axBoxCenter(recovered.backendNodeId, recovered.frame).catch(() => null);
-    return point ? { ...point, matchLevel: 'reidentified' } : null;
-  }
-
-  private async axBoxCenter(backendNodeId: number, frame?: BrowserRef['frame']): Promise<{ x: number; y: number } | null> {
-    const cdp = (this as IPage).cdp;
-    if (typeof cdp !== 'function') return null;
-    const result = await cdp.call(this, 'DOM.getBoxModel', {
-      backendNodeId,
-      ...(frame?.sessionId
-        ? { frameId: frame.frameId, sessionId: frame.sessionId, ...(frame.targetUrl ? { targetUrl: frame.targetUrl } : {}) }
-        : {}),
-    }) as
-      | { model?: { content?: unknown[]; border?: unknown[] } }
-      | null;
-    const quad = Array.isArray(result?.model?.content) && result.model.content.length >= 8
-      ? result.model.content
-      : Array.isArray(result?.model?.border) && result.model.border.length >= 8
-        ? result.model.border
-        : null;
-    if (!quad) return null;
-    const nums = quad.slice(0, 8).map((value) => typeof value === 'number' ? value : Number(value));
-    if (nums.some((value) => !Number.isFinite(value))) return null;
-    return {
-      x: Math.round((nums[0] + nums[2] + nums[4] + nums[6]) / 4),
-      y: Math.round((nums[1] + nums[3] + nums[5] + nums[7]) / 4),
-    };
-  }
-
-  /** Uses native CDP text insertion when the concrete page exposes it. */
+  /** Trusted CDP key events (type into current focus) via the action channel. */
   protected async tryNativeType(text: string): Promise<boolean> {
-    const nativeType = (this as IPage).nativeType;
-    if (typeof nativeType === 'function') {
-      try {
-        await nativeType.call(this, text);
-        return true;
-      } catch {
-        // Fall through to the older dedicated insertText primitive if present.
-      }
-    }
-
-    const insertText = (this as IPage).insertText;
-    if (typeof insertText !== 'function') return false;
+    const ax = this.axChannel();
+    if (!ax) return false;
     try {
-      await insertText.call(this, text);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Uses native CDP key events when the concrete page exposes them. */
-  protected async tryNativeKeyPress(key: string, modifiers: string[]): Promise<boolean> {
-    const nativeKeyPress = (this as IPage).nativeKeyPress;
-    if (typeof nativeKeyPress !== 'function') return false;
-    try {
-      await nativeKeyPress.call(this, key, modifiers);
+      await ax.typeText(text);
       return true;
     } catch {
       return false;
@@ -553,6 +615,17 @@ export abstract class BasePage implements IPage {
   }
 
   async typeText(ref: string, text: string, opts: ResolveOptions = {}): Promise<ResolveSuccess> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        // clear:false = click-focus the element and type at the caret, which
+        // matches the opencli `type` semantics (append, don't wipe).
+        await ax.fill(ref, text, { clear: false });
+        return { matches_n: 1, match_level: 'exact' };
+      } catch {
+        // Fall through to the DOM-resolver path (TargetError contract).
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     let typed = false;
     let nativeScrolled = false;
@@ -582,6 +655,15 @@ export abstract class BasePage implements IPage {
   }
 
   async hover(ref: string, opts: ResolveOptions = {}): Promise<ResolveSuccess> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        await ax.hover(ref);
+        return { matches_n: 1, match_level: 'exact' };
+      } catch {
+        // Fall through to the DOM-resolver path.
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     const nativeScrolled = await this.tryCdpOnResolvedElement('DOM.scrollIntoViewIfNeeded');
     const rect = await this.evaluate(boundingRectResolvedJs({ skipScroll: nativeScrolled })) as
@@ -612,6 +694,17 @@ export abstract class BasePage implements IPage {
   }
 
   async focus(ref: string, opts: ResolveOptions = {}): Promise<ResolveSuccess & { focused: boolean }> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        await ax.focus(ref);
+        // Channel focus succeeds unless CDP throws; the DOM path below is the
+        // one that adds the activeElement double-check.
+        return { matches_n: 1, match_level: 'exact', focused: true };
+      } catch {
+        // Fall through to the DOM-resolver path.
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     let focused = await this.tryCdpOnResolvedElement('DOM.focus') && await this.isResolvedFocused();
     if (!focused) {
@@ -628,6 +721,15 @@ export abstract class BasePage implements IPage {
   }
 
   async dblClick(ref: string, opts: ResolveOptions = {}): Promise<ResolveSuccess> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        await ax.click(ref, { clickCount: 2 });
+        return { matches_n: 1, match_level: 'exact' };
+      } catch {
+        // Fall through to the DOM-resolver path.
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     const nativeScrolled = await this.tryCdpOnResolvedElement('DOM.scrollIntoViewIfNeeded');
     const rect = await this.evaluate(boundingRectResolvedJs({ skipScroll: nativeScrolled })) as
@@ -656,15 +758,29 @@ export abstract class BasePage implements IPage {
     return resolved;
   }
 
-  private async readCheckableState(): Promise<{
-    ok?: boolean;
-    checked?: boolean;
-    disabled?: boolean;
-    kind?: string;
-    reason?: string;
-    tag?: string;
-    role?: string;
-  } | null> {
+  /**
+   * Shared pre-click guards for both setChecked paths (AX channel and DOM
+   * probe): the TargetError contract (not_checkable / disabled / radio) is
+   * identical no matter which surface executed the state probe.
+   */
+  private assertCheckable(before: CheckableState, ref: string, checked: boolean): void {
+    if (before.disabled) {
+      throw new TargetError({
+        code: 'not_checkable',
+        message: `Target "${ref}" is disabled and cannot be ${checked ? 'checked' : 'unchecked'}.`,
+        hint: 'Pick an enabled control, or inspect the form state before retrying.',
+      });
+    }
+    if ((before.kind === 'radio' || before.kind === 'menuitemradio') && !checked) {
+      throw new TargetError({
+        code: 'not_checkable',
+        message: `Target "${ref}" is a radio button and cannot be unchecked directly.`,
+        hint: 'Select another radio option in the same group instead.',
+      });
+    }
+  }
+
+  private async readCheckableState(): Promise<CheckableState | null> {
     return await this.evaluate(`
       (() => {
         const el = window.__resolved;
@@ -691,18 +807,55 @@ export abstract class BasePage implements IPage {
         }
         return { ok: false, reason: 'not_checkable', tag, role };
       })()
-    `) as {
-      ok?: boolean;
-      checked?: boolean;
-      disabled?: boolean;
-      kind?: string;
-      reason?: string;
-      tag?: string;
-      role?: string;
-    } | null;
+    `) as CheckableState | null;
   }
 
   async setChecked(ref: string, checked: boolean, opts: ResolveOptions = {}): Promise<SetCheckedResult> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      let before: CheckableState | null = null;
+      try {
+        before = await ax.readState(ref, CHECKABLE_STATE_EXPR) as CheckableState | null;
+      } catch {
+        before = null; // channel/resolve failure — fall through to the DOM path
+      }
+      if (before && before.ok === true) {
+        this.assertCheckable(before, ref, checked);
+        if (before.checked === checked) {
+          return {
+            matches_n: 1,
+            match_level: 'exact',
+            checked,
+            changed: false,
+            ...(before.kind ? { kind: before.kind } : {}),
+          };
+        }
+        await (checked ? ax.check(ref) : ax.uncheck(ref));
+        const after = await ax.readState(ref, CHECKABLE_STATE_EXPR).catch(() => null) as CheckableState | null;
+        if (after?.ok !== true || after.checked !== checked) {
+          throw new TargetError({
+            code: 'not_checkable',
+            message: `Target "${ref}" did not become ${checked ? 'checked' : 'unchecked'} after click.`,
+            hint: 'The control may be custom, disabled by app logic, or require a different target such as its visible label.',
+          });
+        }
+        return {
+          matches_n: 1,
+          match_level: 'exact',
+          checked,
+          changed: true,
+          ...(after.kind ? { kind: after.kind } : {}),
+        };
+      }
+      if (before && before.ok === false) {
+        // The element answered but is not checkable — same contract as DOM path.
+        throw new TargetError({
+          code: 'not_checkable',
+          message: `Target "${ref}" is not a checkbox, radio, switch, or aria-checked control.`,
+          hint: 'Use `hub browser state` or `browser find` to pick an input[type=checkbox], input[type=radio], or role=checkbox/switch target.',
+        });
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     const before = await this.readCheckableState();
     if (before?.ok !== true) {
@@ -712,20 +865,7 @@ export abstract class BasePage implements IPage {
         hint: 'Use `hub browser state` or `browser find` to pick an input[type=checkbox], input[type=radio], or role=checkbox/switch target.',
       });
     }
-    if (before.disabled) {
-      throw new TargetError({
-        code: 'not_checkable',
-        message: `Target "${ref}" is disabled and cannot be ${checked ? 'checked' : 'unchecked'}.`,
-        hint: 'Pick an enabled control, or inspect the form state before retrying.',
-      });
-    }
-    if ((before.kind === 'radio' || before.kind === 'menuitemradio') && !checked) {
-      throw new TargetError({
-        code: 'not_checkable',
-        message: `Target "${ref}" is a radio button and cannot be unchecked directly.`,
-        hint: 'Select another radio option in the same group instead.',
-      });
-    }
+    this.assertCheckable(before, ref, checked);
     if (before.checked === checked) {
       return {
         ...resolved,
@@ -781,6 +921,45 @@ export abstract class BasePage implements IPage {
         message: 'No files were provided for upload.',
         hint: 'Pass one or more local file paths after the target.',
       });
+    }
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      let state: { ok?: boolean; multiple?: boolean; accept?: string; reason?: string; tag?: string; type?: string } | null = null;
+      try {
+        state = await ax.readState(ref, FILE_INPUT_STATE_EXPR) as typeof state;
+      } catch {
+        state = null; // channel/resolve failure — fall through to the DOM path
+      }
+      if (state && state.ok === true) {
+        if (files.length > 1 && !state.multiple) {
+          throw new TargetError({
+            code: 'not_file_input',
+            message: `Target "${ref}" does not allow multiple files, but ${files.length} files were provided.`,
+            hint: 'Pass one file, or choose a file input with the multiple attribute.',
+          });
+        }
+        await ax.uploadFile(ref, files);
+        const names = await ax.readState(ref, FILE_NAMES_EXPR).catch(() => null) as string[] | null;
+        const fileNames = Array.isArray(names) ? names.map((value) => String(value)) : [];
+        return {
+          matches_n: 1,
+          match_level: 'exact',
+          uploaded: true,
+          files: fileNames.length || files.length,
+          file_names: fileNames,
+          target: ref,
+          multiple: !!state.multiple,
+          ...(state.accept ? { accept: state.accept } : {}),
+        };
+      }
+      if (state && state.ok === false) {
+        // The element answered but is not a file input — same contract as DOM path.
+        throw new TargetError({
+          code: 'not_file_input',
+          message: `Target "${ref}" is not an input[type=file].`,
+          hint: 'Use `hub browser find --css "input[type=file]"` or inspect `compound` output from browser state/find.',
+        });
+      }
     }
     const resolved = await runResolve(this, ref, opts);
     const markerAttr = 'data-opencli-upload-target';
@@ -865,6 +1044,25 @@ export abstract class BasePage implements IPage {
     target: string,
     opts: { from?: ResolveOptions; to?: ResolveOptions } = {},
   ): Promise<DragResult> {
+    const ax = this.axChannel();
+    if (ax && this.isAxRef(source) && this.isAxRef(target)) {
+      try {
+        // Input.drag rejects cross-frame-session pairs; the DOM path below
+        // measures hub-side geometry and drags in viewport coordinates.
+        await ax.dragRefs(source, target);
+        return {
+          dragged: true,
+          source,
+          target,
+          source_matches_n: 1,
+          target_matches_n: 1,
+          source_match_level: 'exact',
+          target_match_level: 'exact',
+        };
+      } catch {
+        // Fall through to the DOM-resolver path.
+      }
+    }
     const sourceResolved = await runResolve(this, source, opts.from ?? {});
     const sourceScrolled = await this.tryCdpOnResolvedElement('DOM.scrollIntoViewIfNeeded');
     const sourceRect = await this.evaluate(`
@@ -944,6 +1142,36 @@ export abstract class BasePage implements IPage {
   }
 
   async fillText(ref: string, text: string, opts: ResolveOptions = {}): Promise<FillTextResult> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        await ax.fill(ref, text);
+        const verification = await ax.readState(ref, fillVerifyExpr(text)).catch(() => null) as FillResolvedResult | null;
+        if (verification && verification.ok === false && (verification as { reason?: string }).reason === 'not_editable') {
+          // The element answered but is not fillable — same contract as DOM path.
+          throw new TargetError({
+            code: 'not_editable',
+            message: `Target "${ref}" is not a fillable input, textarea, or contenteditable element.`,
+            hint: 'Use `hub browser state` to pick an editable target, or use `browser type` for keyboard-like interactions.',
+          });
+        }
+        const actual = verification && 'actual' in verification ? verification.actual : '';
+        const mode = verification && 'mode' in verification ? verification.mode : undefined;
+        return {
+          matches_n: 1,
+          match_level: 'exact',
+          filled: true,
+          verified: verification?.ok === true,
+          expected: text,
+          actual,
+          length: actual.length,
+          ...(mode ? { mode } : {}),
+        };
+      } catch (err) {
+        if (err instanceof TargetError) throw err;
+        // Channel/resolve failure — fall through to the DOM-resolver path.
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     let nativeScrolled = false;
     let nativeFocused = false;
@@ -996,12 +1224,34 @@ export abstract class BasePage implements IPage {
 
   async pressKey(key: string): Promise<void> {
     const parsed = parseKeyChord(key);
-    if (!await this.tryNativeKeyPress(parsed.key, parsed.modifiers)) {
-      await this.evaluate(pressKeyJs(parsed.key, parsed.modifiers));
+    const ax = this.axChannel();
+    if (ax) {
+      try {
+        await ax.press(parsed.key, parsed.modifiers);
+        return;
+      } catch {
+        // Fall through to page-JS KeyboardEvents (synthetic, but portable).
+      }
     }
+    await this.evaluate(pressKeyJs(parsed.key, parsed.modifiers));
   }
 
   async scrollTo(ref: string, opts: ResolveOptions = {}): Promise<unknown> {
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      try {
+        await ax.scrollIntoViewRef(ref);
+        const info = await ax.readState(ref, TARGET_INFO_EXPR).catch(() => null) as { tag?: string; text?: string } | null;
+        return {
+          ...(info ?? {}),
+          scrolled: true,
+          matches_n: 1,
+          match_level: 'exact',
+        };
+      } catch {
+        // Fall through to the DOM-resolver path.
+      }
+    }
     const resolved = await runResolve(this, ref, opts);
     const nativeScrolled = await this.tryCdpOnResolvedElement('DOM.scrollIntoViewIfNeeded');
     const result = (await this.evaluate(scrollResolvedJs({ skipScroll: nativeScrolled }))) as Record<string, unknown> | null;
@@ -1023,12 +1273,10 @@ export abstract class BasePage implements IPage {
    * be resolved or measured — callers fall back to their normal path.
    */
   async refCenter(ref: string): Promise<{ x: number; y: number } | null> {
-    if (/^e?\d+$/.test(ref)) {
-      const entry = this._axRefs.get(ref);
-      if (entry) {
-        const point = await this.resolveAxRefPoint(entry).catch(() => null);
-        if (point) return { x: point.x, y: point.y };
-      }
+    const ax = this.axChannelForRef(ref);
+    if (ax) {
+      const point = await ax.centerRef(ref).catch(() => null);
+      if (point) return point;
     }
     try {
       await runResolve(this, ref);
@@ -1094,25 +1342,11 @@ export abstract class BasePage implements IPage {
   }
 
   async snapshot(opts: SnapshotOptions = {}): Promise<unknown> {
-    if (opts.source === 'ax') {
-      const cdp = (this as IPage).cdp;
-      if (typeof cdp !== 'function') {
-        throw new CliError(
-          'BROWSER_AX_UNAVAILABLE',
-          'AX snapshot requires CDP support from the active browser backend.',
-          'Use the default DOM state, or update/reload the Browser Bridge extension.',
-        );
-      }
-      const axTrees = await this.collectAxSnapshotTrees(cdp);
-      const built = buildAxSnapshotFromTrees(axTrees, {
-        maxDepth: opts.maxDepth,
-        interactiveOnly: opts.interactive,
-      });
-      this._axRefs = built.refs;
-      return built.text;
-    }
-
-    this._axRefs.clear();
+    // P2-8: the AX capture path (`source: 'ax'` and the default on UnifiedPage)
+    // lives in the subclass override on browser-core's Observer channel — this
+    // base implementation only carries the DOM-generator view (opencli
+    // compatibility surface). AX refs stay valid on the Observer across views;
+    // their lifecycle is the Observer's documentId semantics.
     const snapshotJs = generateSnapshotJs({
       viewportExpand: opts.viewportExpand ?? 2000,
       maxDepth: Math.max(1, Math.min(Number(opts.maxDepth) || 50, 200)),
@@ -1140,26 +1374,6 @@ export abstract class BasePage implements IPage {
       }
       return this._basicSnapshot(opts);
     }
-  }
-
-  private async collectAxSnapshotTrees(
-    cdp: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
-  ): Promise<AxSnapshotTree[]> {
-    await cdp.call(this, 'Accessibility.enable', {});
-    const rootTree = await cdp.call(this, 'Accessibility.getFullAXTree', {});
-    const trees: AxSnapshotTree[] = [{ tree: rootTree }];
-
-    const frameTreeResult = await cdp.call(this, 'Page.getFrameTree', {}).catch(() => null);
-    const frames = collectAxFrameRefs(frameTreeResult);
-    for (const frame of frames) {
-      if (frame.sessionId) {
-        await cdp.call(this, 'Accessibility.enable', axEnableParams(frame)).catch(() => null);
-      }
-      const tree = await cdp.call(this, 'Accessibility.getFullAXTree', axTreeParams(frame)).catch(() => null);
-      if (tree) trees.push({ tree, frame });
-    }
-
-    return trees;
   }
 
   async getCurrentUrl(): Promise<string | null> {
@@ -1229,55 +1443,5 @@ export abstract class BasePage implements IPage {
     if (opts.raw) return raw;
     if (typeof raw === 'string') return formatSnapshot(raw, opts);
     return raw;
-  }
-}
-
-function axTreeParams(frame: BrowserRef['frame'] | undefined): Record<string, unknown> {
-  return frame?.frameId
-    ? {
-        frameId: frame.frameId,
-        ...(frame.sessionId ? { sessionId: frame.sessionId } : {}),
-        ...(frame.targetUrl ? { targetUrl: frame.targetUrl } : {}),
-      }
-    : {};
-}
-
-function axEnableParams(frame: BrowserRef['frame'] | undefined): Record<string, unknown> {
-  return frame?.frameId && frame.sessionId
-    ? { frameId: frame.frameId, sessionId: frame.sessionId, ...(frame.targetUrl ? { targetUrl: frame.targetUrl } : {}) }
-    : {};
-}
-
-function collectAxFrameRefs(frameTreeResult: unknown): Array<NonNullable<BrowserRef['frame']>> {
-  const root = (frameTreeResult as { frameTree?: CdpFrameTreeNode } | null)?.frameTree;
-  const rootUrl = root?.frame?.url || root?.frame?.unreachableUrl || '';
-  const rootOrigin = urlOrigin(rootUrl);
-  if (!root || !rootOrigin) return [];
-
-  const frames: Array<NonNullable<BrowserRef['frame']>> = [];
-  function collect(node: CdpFrameTreeNode | undefined): void {
-    for (const child of node?.childFrames ?? []) {
-      const frame = child.frame;
-      const frameId = frame?.id;
-      const frameUrl = frame?.url || frame?.unreachableUrl || '';
-      const origin = urlOrigin(frameUrl);
-      if (!frameId) continue;
-      if (origin === rootOrigin) {
-        frames.push({ frameId, url: frameUrl });
-        collect(child);
-      } else {
-        frames.push({ frameId, url: frameUrl, targetUrl: frameUrl, sessionId: 'target' });
-      }
-    }
-  }
-  collect(root);
-  return frames;
-}
-
-function urlOrigin(url: string): string | null {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return null;
   }
 }

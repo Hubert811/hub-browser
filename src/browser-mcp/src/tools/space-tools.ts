@@ -10,6 +10,7 @@
 import { z } from 'zod'
 import {
   SpaceGuardError,
+  ownerOf,
   type SpaceIdentity,
   type TaskSpaceManager,
 } from '../../../space/task-space-manager.js'
@@ -35,7 +36,7 @@ async function resolveSpaceId(
   spaceId?: string,
 ): Promise<string> {
   if (spaceId) return spaceId
-  const current = await manager.currentSpace(identity.agentId)
+  const current = await manager.currentSpace(ownerOf(identity))
   if (!current) {
     throw new SpaceGuardError(
       'space-not-found',
@@ -75,7 +76,7 @@ export const space_create = defineTool({
   annotations: { title: 'Create task space', idempotentHint: true },
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
-    const space = await manager.create(identity.agentId, args.name, args.taskId)
+    const space = await manager.create(ownerOf(identity), args.name, args.taskId)
     return textResult(`created space ${space.id} ("${space.name}")`, { space })
   },
 })
@@ -91,9 +92,9 @@ export const space_use = defineTool({
   annotations: { title: 'Use or create task space', idempotentHint: true },
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
-    const before = await manager.listSpaces(identity.agentId)
+    const before = await manager.listSpaces(ownerOf(identity))
     const space = await manager.useOrCreateTaskSpace(
-      identity.agentId,
+      ownerOf(identity),
       args.name,
       args.taskId,
     )
@@ -115,7 +116,7 @@ export const space_list = defineTool({
   annotations: { title: 'List task spaces', readOnlyHint: true },
   handler: async (_args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
-    const spaces = await manager.listSpaces(identity.agentId)
+    const spaces = await manager.listSpaces(ownerOf(identity))
     const text = spaces.length
       ? spaces.map(spaceLine).join('\n')
       : '(no task spaces)'
@@ -131,7 +132,7 @@ export const space_current = defineTool({
   annotations: { title: 'Show current task space', readOnlyHint: true },
   handler: async (_args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
-    const space = await manager.currentSpace(identity.agentId)
+    const space = await manager.currentSpace(ownerOf(identity))
     if (!space) {
       return textResult('no current space', { space: null })
     }
@@ -147,7 +148,7 @@ export const space_switch = defineTool({
   annotations: { title: 'Switch task space' },
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
-    const space = await manager.switch(identity.agentId, args.spaceId)
+    const space = await manager.switch(ownerOf(identity), args.spaceId)
     return textResult(`switched to space ${space.id} ("${space.name}")`, {
       switched: space.id,
       current: space,
@@ -178,7 +179,7 @@ export const space_open_tab = defineTool({
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
     const { pageId, reused } = await manager.openTabWithReuse(
-      identity.agentId,
+      ownerOf(identity),
       spaceId,
       args.url,
       {
@@ -229,7 +230,7 @@ export const space_close_tab = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
-    await manager.closeTab(identity.agentId, spaceId, args.pageId)
+    await manager.closeTab(ownerOf(identity), spaceId, args.pageId)
     return textResult(`closed page ${args.pageId} in space ${spaceId}`, {
       closed: args.pageId,
       spaceId,
@@ -252,7 +253,7 @@ export const space_close = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
-    await manager.closeSpace(identity.agentId, spaceId, { keep: args.keep })
+    await manager.closeSpace(ownerOf(identity), spaceId, { keep: args.keep })
     return textResult(`closed space ${spaceId}`, { closed: spaceId, keep: args.keep })
   },
 })
@@ -274,7 +275,7 @@ export const space_recycle = defineTool({
     )
     const pageGw = ctx.page ? gatewayFromPage(ctx.page) : undefined
     const result = await manager.recycleSpaceTabs(
-      identity.agentId,
+      ownerOf(identity),
       spaceId,
       pageGw,
     )
@@ -302,7 +303,7 @@ export const space_handoff = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
-    const space = await manager.handOff(identity.agentId, spaceId)
+    const space = await manager.handOff(ownerOf(identity), spaceId)
     return textResult(`handed off space ${space.id} to the user`, { space })
   },
 })
@@ -322,7 +323,7 @@ export const space_takeover = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
-    const space = await manager.takeOver(identity.agentId, spaceId, {
+    const space = await manager.takeOver(ownerOf(identity), spaceId, {
       confirmed: args.confirmed,
     })
     return textResult(`agent now controls space ${space.id}`, { space })
@@ -344,7 +345,7 @@ export const space_claim = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
-    const space = await manager.claimTaskSpace(identity.agentId, spaceId, {
+    const space = await manager.claimTaskSpace(ownerOf(identity), spaceId, {
       confirmed: args.confirmed,
     })
     return textResult(`agent now controls space ${space.id}`, { space })

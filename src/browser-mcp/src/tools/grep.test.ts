@@ -11,6 +11,7 @@ function sessionWithSnapshot(text: string): unknown {
   return {
     observe: () => ({
       snapshot: async () => ({ text, refs: { byRef: new Map() } }),
+      lastRefs: { byRef: new Map(), get: () => undefined },
     }),
     pages: {
       list: async () => [

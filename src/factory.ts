@@ -2,6 +2,7 @@ import { generateStealthJs } from './opencli/stealth.js';
 import type { IPage } from './opencli/types.js';
 import { UnifiedPage } from './page.js';
 import { resolveCdpPort } from './cdp-port.js';
+import { getDaemonFactory } from './opencli-engine/runtime-globals.js';
 
 /** Browser factory interface (mirrors OpenCLI's IBrowserFactory) */
 export interface IBrowserFactory {
@@ -12,6 +13,25 @@ export interface IBrowserFactory {
     session?: string;
   }): Promise<IPage>;
   close(): Promise<void>;
+}
+
+/**
+ * #13: should this process kill itself when CDP reconnection is exhausted?
+ *
+ * The vendored CdpBackend defaults to `exitOnReconnectFailure: true` (sane
+ * for its own server processes — restart-on-death). For hub the default is
+ * right for the daemon and the one-shot CLI, but wrong for the MCP server:
+ * exiting turns a connection outage into a session death (every tool of the
+ * agent's MCP session dies with no auto-recovery). In MCP mode we downgrade
+ * to staying alive — subsequent tool calls surface the structured
+ * "CDP not connected" error instead.
+ *
+ * Keep the detection in sync with bin/hub.mjs's MCP branch.
+ */
+export function resolveExitOnReconnectFailure(): boolean {
+  const isMcp =
+    process.env.HUB_MCP === 'true' || process.argv.includes('--mcp');
+  return !isMcp;
 }
 
 export class UnifiedBrowserFactory implements IBrowserFactory {
@@ -38,7 +58,10 @@ export class UnifiedBrowserFactory implements IBrowserFactory {
       const port = cdpEndpoint
         ? parsePortFromEndpoint(cdpEndpoint)
         : resolveCdpPort();
-      const cdp = new CdpBackend({ port });
+      const cdp = new CdpBackend({
+        port,
+        exitOnReconnectFailure: resolveExitOnReconnectFailure(),
+      });
       await cdp.connect();
       this._cdp = cdp;
       this._session = new BrowserSession(cdp);
@@ -61,8 +84,10 @@ export class UnifiedBrowserFactory implements IBrowserFactory {
     pageId?: number;
     session?: string;
   }): Promise<UnifiedPage> {
-    // Daemon mode: reuse singleton connection from globalThis.__HubBrowserFactory
-    const singleton = (globalThis as any).__HubBrowserFactory;
+    // Daemon mode: reuse the daemon's singleton connection (see
+    // opencli-engine/runtime-globals.js — the centralized process-global
+    // contract; P1-4 phase C).
+    const singleton = getDaemonFactory();
     if (singleton && singleton !== this && singleton._cdp && singleton._session) {
       const pages = await singleton._session.pages.list();
       const pageId = opts?.pageId

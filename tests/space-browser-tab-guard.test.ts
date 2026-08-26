@@ -10,11 +10,18 @@
  * Exercised through the real commander program with an injected fake browser
  * bridge (no CDP needed), mirroring tests/space-browser-cli.test.ts.
  */
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, afterAll } from 'bun:test'
 import { createProgram } from '../src/opencli-engine/cli.js'
 import * as path from 'node:path'
 import * as os from 'node:os'
 import * as fs from 'node:fs'
+
+// Env hygiene: HUB_AGENT_ID/HUB_SPACES_FILE leaking past this file breaks
+// sibling spawn-based tests (e.g. space-close-direct-exit) that inherit env.
+afterAll(() => {
+  delete process.env.HUB_AGENT_ID
+  delete process.env.HUB_SPACES_FILE
+})
 
 const BUILTIN_CLIS = path.join(process.cwd(), 'clis')
 const USER_CLIS = path.join(os.homedir(), '.hub', 'clis')
@@ -31,6 +38,10 @@ class FakeBrowser {
   nextPageId = 100
   closed: string[] = []
   selected: string[] = []
+  groups: Array<{ pages: number[]; title?: string }> = []
+  ungrouped: number[][] = []
+  groupUpdates: string[] = []
+  groupCloses: string[] = []
 
   async connect() {
     return new FakePage(this)
@@ -53,6 +64,49 @@ class FakeBrowser {
     }
     return { pageId, targetId }
   }
+
+  tabGroupCreate(pages: number[], title?: string) {
+    const group = { pages: [...pages], ...(title !== undefined ? { title } : {}) }
+    this.groups.push(group)
+    return { groupId: `group-${this.groups.length}`, ...group }
+  }
+
+  tabGroupUngroup(pages: number[]) {
+    this.ungrouped.push([...pages])
+  }
+
+  /** CDP-shaped group view: groupId + tabIds (tabId === pageId in the fake). */
+  tabGroupList() {
+    return this.groups.map((g, i) => ({
+      groupId: `group-${i + 1}`,
+      title: g.title,
+      tabIds: [...g.pages],
+    }))
+  }
+
+  tabGroupUpdate(groupId: string, opts: { title?: string }) {
+    this.groupUpdates.push(groupId)
+    const idx = Number(groupId.replace(/^group-/, '')) - 1
+    const g = this.groups[idx]
+    if (!g) throw new Error(`Unknown tab group ${groupId}`)
+    if (opts.title !== undefined) g.title = opts.title
+    return { groupId, ...g }
+  }
+
+  tabGroupClose(groupId: string) {
+    this.groupCloses.push(groupId)
+    const idx = Number(groupId.replace(/^group-/, '')) - 1
+    const g = this.groups[idx]
+    if (!g) throw new Error(`Unknown tab group ${groupId}`)
+    for (const pageId of g.pages) {
+      const t = this.tabs.find((tab) => tab.pageId === pageId)
+      if (t) {
+        this.closed.push(t.targetId)
+        this.tabs.splice(this.tabs.indexOf(t), 1)
+      }
+    }
+    this.groups.splice(idx, 1)
+  }
 }
 
 /** Fake UnifiedPage surface used by the browser commands under test. */
@@ -63,12 +117,18 @@ class FakePage {
     this.currentPageId = active?.pageId
   }
 
+  /** forkToolArgsFor(page) binds the connected/active page id. */
+  get pageId(): number | undefined {
+    return this.currentPageId
+  }
+
   get session(): string {
     return `page-${this.currentPageId}`
   }
 
   async tabs() {
-    return this.browser.tabs.map((t) => ({ ...t, page: t.targetId }))
+    // tabId mirrors pageId in the fake (real CDP tabs carry both ids).
+    return this.browser.tabs.map((t) => ({ ...t, tabId: t.pageId, page: t.targetId }))
   }
 
   async newTab(url?: string, opts?: { background?: boolean }) {
@@ -122,6 +182,21 @@ class FakePage {
   }
   async snapshot() {
     return 'fake snapshot'
+  }
+  async tabGroupCreate(pages: number[], title?: string) {
+    return this.browser.tabGroupCreate(pages, title)
+  }
+  async tabGroupUngroup(pages: number[]) {
+    this.browser.tabGroupUngroup(pages)
+  }
+  async tabGroupList() {
+    return this.browser.tabGroupList()
+  }
+  async tabGroupUpdate(groupId: string, opts: { title?: string }) {
+    return this.browser.tabGroupUpdate(groupId, opts)
+  }
+  async tabGroupClose(groupId: string) {
+    return this.browser.tabGroupClose(groupId)
   }
   async close() {}
 }
@@ -292,5 +367,203 @@ describe('hub browser tab guard (Phase 3 B — bugs #4/#5 + D3)', () => {
     const closed = await run(['browser', '--session', 'legacy', 'tab', 'close', 'target-101'])
     expect(closed).toContain('no space')
     expect(browser.tabs.map((t) => t.targetId)).toEqual(['target-100', 'target-101'])
+  })
+})
+
+describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
+  it('group create rejects pages owned by another space (P1-1 矩阵补洞)', async () => {
+    const { browser } = makeEnv()
+    const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+    const run = (args: string[]) => runProgram(program, args)
+
+    process.env.HUB_AGENT_ID = 'agent-a'
+    await run(['space', 'create', 'alice', '--json'])
+    await run(['browser', '--session', 'alice-work', 'open', 'https://a.example'])
+
+    process.env.HUB_AGENT_ID = 'agent-b'
+    await run(['space', 'create', 'bob', '--json'])
+    await run(['browser', '--session', 'bob-work', 'open', 'https://b.example'])
+
+    // agent-b must NOT be able to drag agent-a's tab (page 100) into its own
+    // group — D5 treats a drag INTO the group as an ownership transfer.
+    // (The two existing groups are the D5 space projections: each space
+    // create/open auto-groups its tabs under the space name.)
+    const groupsBefore = browser.groups.length
+    const out = await run(['browser', '--session', 'bob-work', 'group', 'create', '--pages', '100'])
+    expect(out).toContain('not in your space')
+    expect(out).toContain('page-not-in-space')
+    expect(browser.groups).toHaveLength(groupsBefore)
+    expect(browser.groups.find((g) => g.pages.includes(100))?.title).toBe('alice')
+
+    // Grouping its OWN page works (a genuinely new group beyond the projections)
+    const own = await run(['browser', '--session', 'bob-work', 'group', 'create', '--pages', '101', '--title', 'bob-extra'])
+    expect(browser.groups).toHaveLength(groupsBefore + 1)
+    expect(browser.groups.at(-1)?.pages).toEqual([101])
+    expect(browser.groups.at(-1)?.title).toBe('bob-extra')
+  })
+
+  it('group create/ungroup without a current space are rejected (D3)', async () => {
+    const { browser } = makeEnv()
+    browser.newTab('https://start.example')
+    const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+    const run = (args: string[]) => runProgram(program, args)
+    delete process.env.HUB_AGENT_ID
+
+    const created = await run(['browser', '--session', 'legacy', 'group', 'create', '--pages', '100'])
+    expect(created).toContain('no space')
+    expect(browser.groups).toEqual([])
+
+    const ungrouped = await run(['browser', '--session', 'legacy', 'group', 'ungroup', '--pages', '100'])
+    expect(ungrouped).toContain('no space')
+    expect(browser.ungrouped).toEqual([])
+  })
+
+  it('group ungroup rejects pages owned by another space', async () => {
+    const { browser } = makeEnv()
+    const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+    const run = (args: string[]) => runProgram(program, args)
+
+    process.env.HUB_AGENT_ID = 'agent-a'
+    await run(['space', 'create', 'alice', '--json'])
+    await run(['browser', '--session', 'alice-work', 'open', 'https://a.example'])
+
+    process.env.HUB_AGENT_ID = 'agent-b'
+    await run(['space', 'create', 'bob', '--json'])
+    await run(['browser', '--session', 'bob-work', 'open', 'https://b.example'])
+
+    const out = await run(['browser', '--session', 'bob-work', 'group', 'ungroup', '--pages', '100'])
+    expect(out).toContain('not in your space')
+    expect(browser.ungrouped).toEqual([])
+  })
+
+  it('group update/close reject a group owned by another space (real-run P1-1 hole, 2026-08-22)', async () => {
+    const { browser } = makeEnv()
+    const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+    const run = (args: string[]) => runProgram(program, args)
+
+    process.env.HUB_AGENT_ID = 'agent-a'
+    await run(['space', 'create', 'alice', '--json'])
+    await run(['browser', '--session', 'alice-work', 'open', 'https://a.example'])
+
+    process.env.HUB_AGENT_ID = 'agent-b'
+    await run(['space', 'create', 'bob', '--json'])
+    await run(['browser', '--session', 'bob-work', 'open', 'https://b.example'])
+
+    // D5 projection groups: alice's tabs grouped under 'alice', bob's under
+    // 'bob'. Grab live group ids from the list (never hardcode fake ids).
+    const groups = JSON.parse(
+      await run(['browser', '--session', 'bob-work', 'group', 'list']),
+    ) as Array<{ groupId: string; title?: string; tabIds: number[] }>
+    const foreign = groups.find((g) => g.title === 'alice')
+    const own = groups.find((g) => g.title === 'bob')
+    expect(foreign).toBeDefined()
+    expect(own).toBeDefined()
+    // The D5 projection sync itself may call tabGroupUpdate; only calls past
+    // this point are the command under test.
+    const updatesBefore = browser.groupUpdates.length
+    const closesBefore = browser.groupCloses.length
+
+    // agent-b must NOT be able to rename agent-a's group — pre-fix this
+    // sailed through (groupId-addressed, pages gate never fired).
+    const upd = await run(['browser', '--session', 'bob-work', 'group', 'update', foreign!.groupId, '--title', 'hack'])
+    expect(upd).toContain('not in your space')
+    expect(upd).toContain('page-not-in-space')
+    expect(browser.groupUpdates.slice(updatesBefore)).toEqual([])
+
+    // Nor close it — that would take agent-a's tabs down with the group.
+    const cls = await run(['browser', '--session', 'bob-work', 'group', 'close', foreign!.groupId])
+    expect(cls).toContain('not in your space')
+    expect(browser.groupCloses.slice(closesBefore)).toEqual([])
+    expect(browser.tabs.map((t) => t.targetId)).toContain('target-100')
+    expect(browser.groups.find((g) => g.pages.includes(100))?.title).toBe('alice')
+
+    // agent-b renaming its OWN group still works.
+    const ok = await run(['browser', '--session', 'bob-work', 'group', 'update', own!.groupId, '--title', 'bob-renamed'])
+    expect(browser.groupUpdates.slice(updatesBefore)).toEqual([own!.groupId])
+    expect(browser.groups.find((g) => g.pages.includes(101))?.title).toBe('bob-renamed')
+  })
+
+  it('group update/close reject the SAME agent\u2019s other space (real-run repro: one agent, two spaces)', async () => {
+    const { browser } = makeEnv()
+    const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+    const run = (args: string[]) => runProgram(program, args)
+
+    // One local agent (no HUB_AGENT_ID switching), two spaces — mirrors the
+    // live repro where an agent-level check (assertPagesControllable) waved
+    // the rename through because BOTH spaces belong to the same owner.
+    process.env.HUB_AGENT_ID = 'solo'
+    await run(['space', 'create', 'work-one', '--json'])
+    await run(['browser', '--session', 's1', 'open', 'https://one.example'])
+    await run(['space', 'create', 'work-two', '--json'])
+    await run(['browser', '--session', 's2', 'open', 'https://two.example'])
+
+    const groups = JSON.parse(
+      await run(['browser', '--session', 's2', 'group', 'list']),
+    ) as Array<{ groupId: string; title?: string; tabIds: number[] }>
+    const foreign = groups.find((g) => g.title === 'work-one')
+    const own = groups.find((g) => g.title === 'work-two')
+    expect(foreign).toBeDefined()
+    expect(own).toBeDefined()
+    const updatesBefore = browser.groupUpdates.length
+    const closesBefore = browser.groupCloses.length
+
+    // Current space is work-two; renaming/closing work-one's projection
+    // group must be rejected at the SPACE level even though both spaces
+    // belong to the same agent.
+    const upd = await run(['browser', '--session', 's2', 'group', 'update', foreign!.groupId, '--title', 'hijacked'])
+    expect(upd).toContain('is not in your space')
+    expect(upd).toContain('page-not-in-space')
+    expect(browser.groupUpdates.slice(updatesBefore)).toEqual([])
+
+    const cls = await run(['browser', '--session', 's2', 'group', 'close', foreign!.groupId])
+    expect(cls).toContain('is not in your space')
+    expect(browser.groupCloses.slice(closesBefore)).toEqual([])
+    // work-one's tab survives the close attempt.
+    expect(browser.tabs.map((t) => t.url)).toContain('https://one.example')
+
+    // The current space's own group is still operable.
+    const ok = await run(['browser', '--session', 's2', 'group', 'update', own!.groupId, '--title', 'work-two-renamed'])
+    expect(browser.groupUpdates.slice(updatesBefore)).toEqual([own!.groupId])
+    expect(browser.groups.find((g) => g.pages.includes(101))?.title).toBe('work-two-renamed')
+  })
+
+  it('fork tool wrappers pass the executeTool gate (P1-4 CLI face)', async () => {
+    const { browser } = makeEnv()
+    const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+    const run = (args: string[]) => runProgram(program, args)
+
+    // agent-a's tab (100) is the active tab; agent-b owns a space with no tabs.
+    process.env.HUB_AGENT_ID = 'agent-a'
+    await run(['space', 'create', 'alice', '--json'])
+    await run(['browser', '--session', 'alice-work', 'open', 'https://a.example'])
+
+    process.env.HUB_AGENT_ID = 'agent-b'
+    await run(['space', 'create', 'bob', '--json'])
+
+    // The connected/active page (100) belongs to agent-a → guardToolAccess
+    // inside executeTool rejects the fork wrapper (open-world before the
+    // identity+spaces injection).
+    const foreign = await run(['browser', '--session', 'bob-work', 'read'])
+    expect(foreign).toContain('not in your space')
+    // P1-4 (phase C): the fork bridge surfaces the REAL platform code from
+    // the structured contract — not the legacy 'tool_error' blanket.
+    const jsonStart = foreign.indexOf('{')
+    const jsonEnd = foreign.lastIndexOf('}')
+    expect(jsonStart).toBeGreaterThanOrEqual(0)
+    const foreignParsed = JSON.parse(foreign.slice(jsonStart, jsonEnd + 1)) as {
+      error: { code: string; message: string }
+    }
+    expect(foreignParsed.error.code).toBe('page-not-in-space')
+    expect(foreignParsed.error.message).toContain('not in your space')
+
+    // Without a space the fork wrappers are rejected (D3 parity with tab select)
+    delete process.env.HUB_AGENT_ID
+    const noSpace = await run(['browser', '--session', 'legacy', 'read'])
+    expect(noSpace).toContain('no space')
+
+    // Own page still reads fine (evaluate returns undefined → '(empty)' body)
+    process.env.HUB_AGENT_ID = 'agent-a'
+    const own = await run(['browser', '--session', 'alice-work', 'read'])
+    expect(own).toContain('UNTRUSTED_PAGE_CONTENT')
   })
 })

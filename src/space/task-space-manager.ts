@@ -30,6 +30,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { withLedgerLock } from './ledger-lock.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -42,7 +43,27 @@ export interface SpaceIdentity {
   agentId: string
   /** Human-readable name (e.g. MCP client name). */
   displayName?: string
+  /**
+   * P1-3 — ownership key: the stable conversation id (convoId). Two
+   * different conversations from the same agent tool (e.g. two Claude Code
+   * processes, both "mcp:claude-code") get distinct convoIds and therefore
+   * distinct space ownership. Falls back to agentId when unset (legacy
+   * callers / existing ledger entries keep their owner keys unchanged).
+   */
+  convoId?: string
 }
+
+/**
+ * P1-3 — the ownership key one identity acts under. All space ledger
+ * operations and guards must extract the owner through this helper (never
+ * `identity.agentId` directly) so the convoId layer stays swappable.
+ */
+export function ownerOf(identity: SpaceIdentity): string {
+  return identity.convoId ?? identity.agentId
+}
+
+/** P1-5 — tri-bucket tab ownership from one agent's point of view. */
+export type TabOwnership = 'mine' | 'user' | 'other-agent'
 
 /** Live browser tab shape (superset of what browser-core pages.list returns). */
 export interface TabLike {
@@ -251,6 +272,16 @@ export type SpaceEventType =
   | 'space.switched'
   | 'space.closed'
   | 'space.tabs_recycled'
+  /**
+   * P1-7 方向 B (D5 v2) — drag signals. Chrome tab groups are a VISUAL
+   * PROJECTION of ledger ownership; dragging a tab in/out of a group NEVER
+   * mutates the ledger anymore. Reconcile detects membership changes and
+   * emits these signals so orchestration layers (or a future cross-process
+   * bus) can react; the only path that moves ownership is the explicit
+   * transferTab() API.
+   */
+  | 'tab.dragged_in'
+  | 'tab.dragged_out'
 
 export interface SpaceEvent {
   type: SpaceEventType
@@ -261,6 +292,14 @@ export interface SpaceEvent {
   ownership?: SpaceOwnership
   /** Number of tabs involved (e.g. space.tabs_recycled carries the recycled count). */
   urls?: number
+  /**
+   * P1-7 方向 B — drag-signal payload (tab.dragged_in / tab.dragged_out):
+   * the page that changed group membership, its best-known url, and the
+   * space whose ledger still owns it (undefined = unclaimed tab).
+   */
+  pageId?: number
+  url?: string
+  ledgerSpaceId?: string
   timestamp: number
 }
 
@@ -353,29 +392,35 @@ export function migrateLegacyLedger(
   targetPath: string,
   legacyPath: string = legacyLedgerPath(),
 ): boolean {
-  try {
-    if (fs.existsSync(targetPath)) return false
-    if (!fs.existsSync(legacyPath)) return false
-    const raw = JSON.parse(fs.readFileSync(legacyPath, 'utf-8')) as Partial<PersistedState>
-    if (!raw || typeof raw !== 'object') return false
-    const deleted = new Set(raw.deletedSpaces ?? [])
-    const spaces = Object.fromEntries(
-      Object.entries(raw.spaces ?? {}).filter(([id]) => !deleted.has(id)),
-    )
-    const merged: PersistedState = {
-      version: SPACE_STORAGE_VERSION,
-      spaces,
-      currentSpaceByOwner: raw.currentSpaceByOwner ?? {},
-      deletedSpaces: raw.deletedSpaces ?? [],
+  // P1-7: the existsSync check and the write are a TOCTOU pair — two
+  // processes can both see "no ledger yet" and the slower rename then
+  // clobbers state the faster one already merged in. Serialize under the
+  // ledger lock and re-check inside the critical section.
+  return withLedgerLock(targetPath, () => {
+    try {
+      if (fs.existsSync(targetPath)) return false
+      if (!fs.existsSync(legacyPath)) return false
+      const raw = JSON.parse(fs.readFileSync(legacyPath, 'utf-8')) as Partial<PersistedState>
+      if (!raw || typeof raw !== 'object') return false
+      const deleted = new Set(raw.deletedSpaces ?? [])
+      const spaces = Object.fromEntries(
+        Object.entries(raw.spaces ?? {}).filter(([id]) => !deleted.has(id)),
+      )
+      const merged: PersistedState = {
+        version: SPACE_STORAGE_VERSION,
+        spaces,
+        currentSpaceByOwner: raw.currentSpaceByOwner ?? {},
+        deletedSpaces: raw.deletedSpaces ?? [],
+      }
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true })
+      const tmp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`
+      fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf-8')
+      fs.renameSync(tmp, targetPath)
+      return true
+    } catch {
+      return false
     }
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true })
-    const tmp = `${targetPath}.tmp`
-    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf-8')
-    fs.renameSync(tmp, targetPath)
-    return true
-  } catch {
-    return false
-  }
+  })
 }
 
 /**
@@ -656,6 +701,14 @@ const EMPTY_STATE = (): PersistedState => ({
 
 export class TaskSpaceManager {
   readonly events: SpaceEventBus | null
+  /**
+   * P1-7 方向 B — last observed group membership per space (pageId sets),
+   * in-memory per process. Membership DIFFS against this baseline are what
+   * emit tab.dragged_in/out; a cold start (no baseline) only records one.
+   * Deliberately not persisted: drag signals are ephemeral, and a restarted
+   * process must not replay the world as "changes".
+   */
+  private readonly lastGroupMembership = new Map<string, Set<number>>()
   private state: PersistedState
   private readonly storagePath: string | undefined
   private readonly gateway: SpaceTabGateway | undefined
@@ -802,9 +855,23 @@ export class TaskSpaceManager {
     if (!this.persist || !this.storagePath) return
     try {
       fs.mkdirSync(path.dirname(this.storagePath), { recursive: true })
-      const tmp = `${this.storagePath}.tmp`
-      fs.writeFileSync(tmp, JSON.stringify(this.mergeWithDisk(), null, 2), 'utf-8')
-      fs.renameSync(tmp, this.storagePath)
+      // P1-7: serialize the read-merge-write critical section across processes,
+      // and use a unique tmp name so two concurrent saves never clobber each
+      // other's tmp file (with a fixed `.tmp` name P2's write can overwrite
+      // P1's before either renames — even though rename itself is atomic).
+      withLedgerLock(this.storagePath, () => {
+        const tmp = `${this.storagePath}.${process.pid}.${randomUUID()}.tmp`
+        try {
+          fs.writeFileSync(tmp, JSON.stringify(this.mergeWithDisk(), null, 2), 'utf-8')
+          fs.renameSync(tmp, this.storagePath)
+        } finally {
+          try {
+            fs.rmSync(tmp, { force: true })
+          } catch {
+            // already renamed away (or never written) — nothing to clean up
+          }
+        }
+      })
     } catch {
       // Ledger persistence is best-effort; in-memory state stays authoritative
       // for this process.
@@ -1286,6 +1353,30 @@ export class TaskSpaceManager {
   }
 
   /**
+   * P2-1 — session-end sweep: close every space this owner holds.
+   *
+   * The MCP server process IS the session (P1-3 per-process convoId), so when
+   * that process goes down its session-scoped spaces are orphans no caller
+   * can ever address again — closing them now, instead of waiting out the D8
+   * spaceTtl, is the mechanical floor under the "task ends → tabs close"
+   * platform gap. Explicit stable identities (HUB_AGENT_ID) span sessions by
+   * design, so hub.mjs wires this only for session-scoped identities.
+   */
+  async closeSpacesOwnedBy(
+    owner: string,
+    opts?: { keep?: boolean },
+    gateway?: SpaceTabGateway,
+  ): Promise<string[]> {
+    const ids = this.spacesOwnedBy(owner).map((space) => space.id)
+    const closed: string[] = []
+    for (const id of ids) {
+      await this.closeSpace(owner, id, opts, gateway)
+      closed.push(id)
+    }
+    return closed
+  }
+
+  /**
    * TabFreshness 修正版 — space 整组回收原语 (边界新鲜化, 2026-08-03).
    *
    * Closes every tab attributed to the space, then reopens each URL in a
@@ -1754,63 +1845,63 @@ export class TaskSpaceManager {
   }
 
   /**
-   * D5 反向同步核心（lazy reconcile）：人类改 tab group → space 账本。
+   * D5 v2 反向同步（P1-7 方向 B，2026-08-24）：人类拖拽 → 事件，不写账本。
    *
+   * 账本唯一权威；Chrome tab group 降级为「可选视觉投影 + 拖拽检测信号」。
    * 只处理「已建过 group」的 space：tabGroupId 存在，或 live group 能按
-   * (title=space.name, color=deterministicColor(space.id)) 匹配到。无 group 的
-   * space 一律跳过，绝不误判。规则：
-   *   a. group 内新增 tab（group.tabIds 反查 tabId→pageId）→ 写账本归属 (added++)
-   *   b. 账本 tab 不在 group 内 且 该 space 已有 tabGroupId（人类拖出）→ 移除
-   *      (removed++)。防误伤：无 tabGroupId 的 space 从不走移除方向；另外
-   *      刚写入账本、尚未入组的 pending 新 tab（restored === false 且浏览器里
-   *      pageId 仍存活）视为"pending 入组"保留不删（任务 2 竞态修复）。
+   * (title=space.name, color=deterministicColor(space.id)) 匹配到。规则：
+   *   a. group 成员相比上一轮基线新增 pageId → emit `tab.dragged_in`
+   *      （带 pageId/url/ledgerSpaceId——账本归属不变；归属变更唯一合法路径
+   *      是显式 transferTab()）。
+   *   b. group 成员相比基线移除 pageId → emit `tab.dragged_out`（账本不动）。
    *   c. 人类改 group 名/色 → 不反写（这里绝不调用 tabGroupUpdate）。
-   *   d. group 被删 → 本次跳过（tab 保留），由下一次 openTabWithReuse / restore
-   *      的 ensureSpaceGroup 自动重建。
-   * 无 gateway / 浏览器不支持 tab group → no-op {0,0}。内部只读 gateway 的
-   * tabGroupList/listTabs 并写账本，绝不调用其它 manager 方法 —— 不会递归触发
-   * sync。owner 可选：触发点传 owner 只处理该 owner 的 space（避免跨 owner 写账本）；
-   * 不传则处理账本中所有已建 group 的 space（显式调用 / 测试）。
+   *   d. group 被删 → 本次跳过（基线保留），由下一次 openTabWithReuse /
+   *      restore 的 ensureSpaceGroup 自动重建。
+   * 基线（lastGroupMembership）是进程内存：冷启动第一轮只记基线不发事件
+   * （重启不得把全世界重放成「变更」）；之后每轮 diff。无 gateway / 浏览器不
+   * 支持 tab group → no-op。内部只读 gateway 的 tabGroupList/listTabs 并 emit
+   * 事件，绝不调用其它 manager 方法 —— 不会递归触发 sync。owner 可选：触发点
+   * 传 owner 只处理该 owner 的 space；不传则处理全部已建 group 的 space。
    */
   private async reconcileTabGroups(
     gw: SpaceTabGateway | undefined,
     owner?: string,
-  ): Promise<{ added: number; removed: number }> {
-    if (!gw?.tabGroupList || !gw.listTabs) return { added: 0, removed: 0 }
+  ): Promise<{ draggedIn: number; draggedOut: number }> {
+    if (!gw?.tabGroupList || !gw.listTabs) return { draggedIn: 0, draggedOut: 0 }
     // Best-effort bound: never let a slow/unreachable browser drag the lazy
     // trigger paths (currentSpace/listSpaces/openTabWithReuse/guard) down.
     // A timed-out pass simply does not reconcile this round; the next call
-    // retries. The inner work may finish in the background (no cancellation
-    // available through CDP) — its ledger write is still a correct reconcile.
+    // retries. (No cancellation available through CDP; a late inner pass may
+    // still emit its drag signals — signals are idempotent observations.)
     try {
       return await Promise.race([
         this.reconcileTabGroupsUnbounded(gw, owner),
-        new Promise<{ added: number; removed: number }>((resolve) => {
-          setTimeout(() => resolve({ added: 0, removed: 0 }), TAB_GROUP_SYNC_TIMEOUT_MS)
+        new Promise<{ draggedIn: number; draggedOut: number }>((resolve) => {
+          setTimeout(() => resolve({ draggedIn: 0, draggedOut: 0 }), TAB_GROUP_SYNC_TIMEOUT_MS)
         }),
       ])
     } catch {
-      return { added: 0, removed: 0 }
+      return { draggedIn: 0, draggedOut: 0 }
     }
   }
 
   private async reconcileTabGroupsUnbounded(
     gw: SpaceTabGateway,
     owner?: string,
-  ): Promise<{ added: number; removed: number }> {
+  ): Promise<{ draggedIn: number; draggedOut: number }> {
     let groups: unknown[] = []
     let live: TabLike[] = []
     try {
       groups = await gw.tabGroupList()
     } catch {
-      return { added: 0, removed: 0 }
+      return { draggedIn: 0, draggedOut: 0 }
     }
     try {
       live = await gw.listTabs()
     } catch {
-      return { added: 0, removed: 0 }
+      return { draggedIn: 0, draggedOut: 0 }
     }
-    if (!Array.isArray(groups)) return { added: 0, removed: 0 }
+    if (!Array.isArray(groups)) return { draggedIn: 0, draggedOut: 0 }
 
     // tabId → pageId 反查表（group.tabIds 是 tabId；pageId 来自 listTabs）。
     const pageIdByTabId = new Map<string | number, number>()
@@ -1821,8 +1912,8 @@ export class TaskSpaceManager {
     }
     const liveById = new Map(live.map((t) => [t.pageId, t]))
 
-    let added = 0
-    let removed = 0
+    let draggedIn = 0
+    let draggedOut = 0
     const candidates = Object.values(this.state.spaces).filter(
       (s) => owner === undefined || s.owner === owner,
     )
@@ -1834,54 +1925,40 @@ export class TaskSpaceManager {
         const pageId = pageIdByTabId.get(tabId)
         if (pageId !== undefined) groupPageIds.add(pageId)
       }
-      const ledgerIds = new Set(space.tabs.map((t) => t.pageId))
-      let mutated = false
 
-      // a. group 内新增 tab → 归属该 space（视觉边界=归属边界）。
-      for (const pageId of groupPageIds) {
-        if (ledgerIds.has(pageId)) continue
-        const info = liveById.get(pageId)
-        space.tabs.push({
-          pageId,
-          url: info?.url ?? 'about:blank',
-          title: info?.title,
-          // The tab is already attached to a live browser tab — mark it
-          // restored so the next restore() never re-opens a duplicate.
-          restored: true,
-        })
-        ledgerIds.add(pageId)
-        added++
-        mutated = true
+      // D5 v2 (P1-7 方向 B)：与上一轮基线 diff 出「成员变化」→ 发事件，账本
+      // 一律不动。冷启动（无基线）只记录本轮为基线，不把全世界重放成变更。
+      const baseline = this.lastGroupMembership.get(space.id)
+      if (baseline !== undefined) {
+        const ledgerSpaceOfPage = new Map<number, string>()
+        for (const other of Object.values(this.state.spaces)) {
+          for (const t of other.tabs) ledgerSpaceOfPage.set(t.pageId, other.id)
+        }
+        for (const pageId of groupPageIds) {
+          if (baseline.has(pageId)) continue
+          // Own wiring is not a drag signal: openTab/restore project ledger
+          // tabs into the group, and that membership change comes from us.
+          if (ledgerSpaceOfPage.get(pageId) === space.id) continue
+          this.emit('tab.dragged_in', space, {
+            pageId,
+            url: liveById.get(pageId)?.url,
+            ledgerSpaceId: ledgerSpaceOfPage.get(pageId),
+          })
+          draggedIn++
+        }
+        for (const pageId of baseline) {
+          if (groupPageIds.has(pageId)) continue
+          this.emit('tab.dragged_out', space, {
+            pageId,
+            url: liveById.get(pageId)?.url,
+            ledgerSpaceId: ledgerSpaceOfPage.get(pageId),
+          })
+          draggedOut++
+        }
       }
-
-      // b. 拖出移除 —— 只在该 space 已有 tabGroupId 时生效（防误伤：刚开还没
-      //    入组的 tab / 无 group 的 space 都不会被误删）。
-      if (space.tabGroupId) {
-        const before = space.tabs.length
-        space.tabs = space.tabs.filter((t) => {
-          if (groupPageIds.has(t.pageId)) return true
-          // 任务 2 竞态保护：openTabWithReuse 先写账本（restored:false，步骤 2）
-          // 再 tabGroupAddTabs 入组（步骤 4），两步之间的窗口里 sync 若触发，
-          // 会把刚开的新 tab 误判为「人类拖出」而从账本移除（视觉还在、账本
-          // 短暂无主）。只要该 tab 仍是 pending（restored === false）且浏览器里
-          // pageId 还存活（liveById 有它），就视为「pending 入组」保留不删；
-          // 只有确认已 restored（restore() 已 reconcile 过）且不在 group 的
-          // tab 才是真拖出、移除。restored === undefined 的旧账本数据保持原
-          // 行为（不在 group 即移除）。
-          if (t.restored === false && liveById.has(t.pageId)) return true
-          return false
-        })
-        const delta = before - space.tabs.length
-        removed += delta
-        if (delta > 0) mutated = true
-      }
-
-      if (mutated) {
-        space.lastActiveAt = this.now()
-        this.save()
-      }
+      this.lastGroupMembership.set(space.id, new Set(groupPageIds))
     }
-    return { added, removed }
+    return { draggedIn, draggedOut }
   }
 
   /**
@@ -1916,9 +1993,13 @@ export class TaskSpaceManager {
    * diff（group 内新增归属 / 拖出移除 / 改名不反写 / 组删重建留待 ensure）。
    * 无 gateway 或浏览器不支持 tab group → no-op 返回 {0,0}。
    */
+  /**
+   * D5 v2 (P1-7 方向 B)：对账 tab group 成员变化 → 返回本轮发出的拖拽信号
+   * 计数（事件经 SpaceEventBus 发给订阅者；账本不动）。
+   */
   async syncWithTabGroups(
     gateway?: SpaceTabGateway,
-  ): Promise<{ added: number; removed: number }> {
+  ): Promise<{ draggedIn: number; draggedOut: number }> {
     return this.reconcileTabGroups(gateway ?? this.gateway)
   }
 
@@ -2095,6 +2176,41 @@ export class TaskSpaceManager {
     })
   }
 
+  /**
+   * P1-5 — tri-bucket ownership classification of live tabs for one agent:
+   *   mine         — a tab in one of the caller's agent-controlled spaces
+   *   user         — a tab in a user-held space (handed off), or a tab that
+   *                  belongs to no space at all (opened by the human)
+   *   other-agent  — a tab in another owner's space
+   *
+   * Visibility without leakage (D3 in mind): non-mine tabs keep only their
+   * identity (pageId + ownership + ownerLabel = the owning space's name) —
+   * url/title are stripped so the caller learns WHO holds a tab, not WHAT
+   * is in it. Mirrors BrowserOS tab_ownership.rs's annotate-style view.
+   */
+  async classifyTabsForAgent(
+    owner: string,
+    tabs: TabLike[],
+  ): Promise<Array<TabLike & { ownership: TabOwnership; ownerLabel?: string }>> {
+    if (!this.isolationActive(owner)) return []
+    return tabs.map((tab) => {
+      const space = this.spaceForPage(tab.pageId)
+      if (!space) {
+        return { pageId: tab.pageId, ownership: 'user' as const }
+      }
+      if (space.owner === owner) {
+        return space.ownership === 'agent'
+          ? { ...tab, ownership: 'mine' as const }
+          : { pageId: tab.pageId, ownership: 'user' as const }
+      }
+      return {
+        pageId: tab.pageId,
+        ownership: 'other-agent' as const,
+        ownerLabel: space.name,
+      }
+    })
+  }
+
   /** Attribute a freshly opened tab to the agent's current space (best-effort). */
   async recordTabForCurrentSpace(
     owner: string,
@@ -2105,12 +2221,96 @@ export class TaskSpaceManager {
     if (!currentId) return false
     const space = this.state.spaces[currentId]
     if (!space || space.owner !== owner) return false
+    // P1-6 invariant: a page belongs to at most one space — refuse to claim
+    // a tab that already belongs to another space (normal callers only
+    // record freshly opened tabs, which are unowned).
+    const holder = this.spaceForPage(pageId)
+    if (holder && holder.id !== space.id) return false
     this.assertAgentCanAct(owner, space)
     if (space.tabs.some((t) => t.pageId === pageId)) return true
     space.tabs.push({ pageId, url: url ?? 'about:blank', restored: false })
     space.lastActiveAt = this.now()
     this.save()
     return true
+  }
+
+  /**
+   * P1-7 方向 B (D5 v2) — explicit tab ownership transfer. Since dragging
+   * only emits tab.dragged_in/out signals (the group is a visual projection,
+   * the ledger is authoritative), this is the ONLY path that moves a page
+   * between spaces' ledgers. The owner must own BOTH spaces involved (a
+   * cross-owner transfer would be tab theft — a dragged_in signal with a
+   * foreign ledgerSpaceId is exactly the case orchestration must escalate,
+   * not automate). Claiming an UNOWNED tab (e.g. a human tab dragged into
+   * the group) is allowed: to-space only. Projects the moved tab into the
+   * destination group (best-effort, like openTab's D5 wiring).
+   */
+  async transferTab(
+    owner: string,
+    opts: { pageId: number; toSpaceId?: string },
+  ): Promise<{
+    fromSpaceId: string | null
+    toSpaceId: string
+    projected: boolean
+  }> {
+    const toId =
+      opts.toSpaceId ?? this.state.currentSpaceByOwner[owner]
+    if (!toId) {
+      throw new SpaceGuardError(
+        'no-space',
+        `agent ${owner} has no space; create one first with space.create (or 'hub space create <name>')`,
+        { hint: 'create a task space first, then transfer tabs into it' },
+      )
+    }
+    const to = this.requireSpace(toId)
+    this.requireOwned(owner, to)
+    this.assertAgentCanAct(owner, to)
+    if (to.tabs.some((t) => t.pageId === opts.pageId)) {
+      // Already there — idempotent no-op (still project below for repair).
+      const projected = await this.projectIntoGroup(to, opts.pageId)
+      return { fromSpaceId: null, toSpaceId: to.id, projected }
+    }
+    const from = this.spaceForPage(opts.pageId)
+    const existing = from?.tabs.find((t) => t.pageId === opts.pageId)
+    if (from) {
+      this.requireOwned(owner, from)
+      this.assertAgentCanAct(owner, from)
+      from.tabs = from.tabs.filter((t) => t.pageId !== opts.pageId)
+      from.lastActiveAt = this.now()
+    }
+    to.tabs.push({
+      pageId: opts.pageId,
+      // Keep the ledger url when known; a brand-new claim falls back to
+      // about:blank until updateTabUrl/restore corrects it.
+      url: existing?.url ?? 'about:blank',
+      title: existing?.title,
+      restored: true, // the browser tab is live by construction (drag/claim)
+    })
+    to.lastActiveAt = this.now()
+    this.save()
+    const projected = await this.projectIntoGroup(to, opts.pageId)
+    return { fromSpaceId: from?.id ?? null, toSpaceId: to.id, projected }
+  }
+
+  /** D5 forward wiring for transferTab — best-effort group projection. */
+  private async projectIntoGroup(
+    space: SpaceRecord,
+    pageId: number,
+  ): Promise<boolean> {
+    const gw = this.gateway
+    if (!gw) return false
+    try {
+      const groupId = await this.ensureSpaceGroup(space, gw)
+      if (groupId && gw.tabGroupAddTabs) {
+        await gw.tabGroupAddTabs(groupId, [pageId])
+        return true
+      }
+    } catch (err) {
+      console.warn(
+        `[hub-spaces] transfer projection skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
+      )
+    }
+    return false
   }
 
   /**

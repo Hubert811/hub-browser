@@ -87,6 +87,7 @@ function createFakeSession(): unknown {
         text: 'hello page',
         refs: { byRef: new Map(), byLabel: new Map() },
       }),
+      lastRefs: { byRef: new Map(), get: () => undefined },
       diff: async () => ({ changed: false, text: 'no changes' }),
     }),
     nav: () => ({ goto: async () => {} }),

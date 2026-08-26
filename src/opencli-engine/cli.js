@@ -16,21 +16,34 @@ import { render as renderOutput } from './output.js';
 import { PKG_VERSION } from './version.js';
 import { printCompletionScript } from './completion.js';
 import { loadExternalClis, executeExternalCli, installExternalCli, registerExternalCli, isBinaryInstalled, formatExternalCliLabel } from './external.js';
+import { isDaemonMode, getDaemonFactory, getBrowserBridgeOverride } from './runtime-globals.js';
 import { listOpenCliSkills, readOpenCliSkill } from './skills.js';
 import { registerAllCommands } from './commanderAdapter.js';
 import { classifyAdapter, formatRootAdapterHelpText, installCommanderNamespaceStructuredHelp, installStructuredHelp, leadingPositionalFromUsage, rootHelpData } from './help.js';
 import { EXIT_CODES, getErrorMessage, BrowserConnectError, CliError } from './errors.js';
 import { TargetError } from './browser/target-errors.js';
 import { resolveTargetJs, getTextResolvedJs, getValueResolvedJs, getAttributesResolvedJs, selectResolvedJs, isAutocompleteResolvedJs } from './browser/target-resolver.js';
-import { buildFindJs, buildSemanticFindJs, isFindError } from './browser/find.js';
-import { inferShape } from './browser/shape.js';
+import { buildSemanticFindJs, isFindError } from './browser/find.js';
 import { assignKeys } from './browser/network-key.js';
-import { DEFAULT_TTL_MS, findEntry, loadNetworkCache, saveNetworkCache } from './browser/network-cache.js';
+import { DEFAULT_TTL_MS } from './browser/network-cache.js';
 import { NETWORK_INTERCEPTOR_JS } from './browser/network-interceptor.js';
-import { parseFilter, shapeMatchesFilter } from './browser/shape-filter.js';
+import { parseFilter } from './browser/shape-filter.js';
 import { buildHtmlTreeJs } from './browser/html-tree.js';
-import { buildExtractHtmlJs, runExtractFromHtml } from './browser/extract.js';
-import { analyzeSite } from './browser/analyze.js';
+// P2-6: extract helpers now live in the shared `extract` tool definition
+// (browser-mcp/src/tools/page-info.ts); the CLI command is a thin wrapper.
+// P2-6 (batch 2): the network/console pipelines live in the shared
+// observation-query module — the CLI commands and the MCP observation tools
+// (browser-mcp/src/tools/observation-tools.ts) run ONE implementation.
+import {
+    captureNetworkItems,
+    filterByTimeWindow,
+    filterNetworkItems,
+    pageSessionOf as getPageSession,
+    parseDurationMs,
+    selectFreshByTimestamp,
+    timestampFromRaw,
+    toIsoTimestamp,
+} from './browser/observation-query.js';
 import { registerAuthCommands } from './commands/auth.js';
 import { log } from './logger.js';
 import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from './browser/config.js';
@@ -42,105 +55,6 @@ class BrowserCommandError extends Error {
 }
 const BROWSER_TAB_OPTION_DESCRIPTION = 'Target tab/page identity returned by "browser open", "browser tab new", or "browser tab list"';
 const FOLLOW_POLL_MS = 1_000;
-function parseDurationMs(raw, flagName) {
-    if (raw === undefined || raw === null || raw === '')
-        return null;
-    const str = String(raw).trim();
-    const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(str);
-    if (!match)
-        return { error: `--${flagName} must be a duration like 500ms, 30s, 2m, got "${str}"` };
-    const value = Number.parseFloat(match[1]);
-    const unit = match[2] ?? 'ms';
-    const multiplier = unit === 'h' ? 3_600_000 : unit === 'm' ? 60_000 : unit === 's' ? 1_000 : 1;
-    return Math.round(value * multiplier);
-}
-function timestampFromRaw(value) {
-    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : Date.now();
-}
-function toIsoTimestamp(timestamp) {
-    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp <= 0)
-        return undefined;
-    return new Date(timestamp).toISOString();
-}
-function filterByTimeWindow(items, opts, now = Date.now()) {
-    const sinceTs = opts.sinceMs != null ? now - opts.sinceMs : undefined;
-    const untilTs = opts.untilMs != null ? now - opts.untilMs : undefined;
-    return items.filter((item) => {
-        const ts = item.timestamp ?? now;
-        if (sinceTs !== undefined && ts < sinceTs)
-            return false;
-        if (untilTs !== undefined && ts > untilTs)
-            return false;
-        return true;
-    });
-}
-export function selectFreshByTimestamp(items, lastSeenTs) {
-    const fresh = items.filter((item) => Number(item.timestamp ?? 0) > lastSeenTs);
-    const nextSeenTs = fresh.length > 0
-        ? Math.max(lastSeenTs, ...fresh.map((item) => Number(item.timestamp ?? 0)).filter(Number.isFinite))
-        : lastSeenTs;
-    return { fresh, lastSeenTs: nextSeenTs };
-}
-/**
- * Normalize raw capture entries (from CDP `readNetworkCapture` or
- * the JS interceptor's `window.__opencli_net`) into a consistent shape.
- * Response preview is parsed as JSON when possible, otherwise kept as string.
- * `bodyFullSize` / `bodyTruncated` surface capture-layer truncation so the
- * agent-facing envelope can warn when the body isn't whole.
- */
-async function captureNetworkItems(page) {
-    if (page.readNetworkCapture) {
-        const raw = await page.readNetworkCapture();
-        if (Array.isArray(raw) && raw.length > 0) {
-            return raw.map((e) => {
-                const preview = e.responsePreview ?? null;
-                let body = null;
-                if (preview) {
-                    try {
-                        body = JSON.parse(preview);
-                    }
-                    catch {
-                        body = preview;
-                    }
-                }
-                const fullSize = typeof e.responseBodyFullSize === 'number'
-                    ? e.responseBodyFullSize
-                    : (preview ? preview.length : 0);
-                const truncated = e.responseBodyTruncated === true;
-                return {
-                    url: e.url || '',
-                    method: e.method || 'GET',
-                    status: e.responseStatus || 0,
-                    size: fullSize,
-                    ct: e.responseContentType || '',
-                    body,
-                    bodyFullSize: fullSize,
-                    bodyTruncated: truncated,
-                    timestamp: timestampFromRaw(e.timestamp),
-                };
-            });
-        }
-    }
-    const raw = await page.evaluate(`(function(){ var out = window.__opencli_net || []; window.__opencli_net = []; return JSON.stringify(out); })()`);
-    try {
-        const parsed = JSON.parse(raw);
-        return parsed.map((item) => ({ ...item, timestamp: timestampFromRaw(item.timestamp) }));
-    }
-    catch {
-        if (process.env.OPENCLI_VERBOSE)
-            log.warn(`[network] Failed to parse interceptor buffer: ${typeof raw === 'string' ? raw.slice(0, 200) : String(raw)}`);
-        return [];
-    }
-}
-/** Drop static-resource / telemetry noise so agents see only API-shaped traffic. */
-function filterNetworkItems(items) {
-    return items.filter((r) => {
-        const ct = r.ct?.toLowerCase() ?? '';
-        return ((ct.includes('json') || ct.includes('xml') || ct.includes('text/plain') || ct.includes('javascript')) &&
-            !/\.(js|css|png|jpg|gif|svg|woff|ico|map)(\?|$)/i.test(r.url) &&
-            !/analytics|tracking|telemetry|beacon|pixel|gtag|fbevents/i.test(r.url));
-    });
-}
 /** Exit codes by network error code — usage errors vs runtime failures. */
 const NETWORK_ERROR_EXIT = {
     invalid_args: EXIT_CODES.USAGE_ERROR,
@@ -433,7 +347,7 @@ async function getBrowserPage(session, targetPage, opts = {}) {
     // Test-only seam: tests inject a fake bridge (a class with connect()) via
     // globalThis.__HubBrowserBridgeOverride so browser commands can be exercised
     // without a live CDP connection.
-    const BridgeCtor = globalThis.__HubBrowserBridgeOverride ?? BrowserBridge;
+    const BridgeCtor = getBrowserBridgeOverride() ?? BrowserBridge;
     const bridge = new BridgeCtor();
     // Internal GC timeout for browser sessions. Not the per-command runtime timeout.
     const envTimeout = process.env.OPENCLI_BROWSER_IDLE_TIMEOUT;
@@ -499,12 +413,6 @@ function getBrowserSession(command) {
     if (typeof raw === 'string' && raw.trim())
         return raw.trim();
     throw new Error('<session> is a required positional argument: hub browser <session> <command>');
-}
-function getPageSession(page) {
-    const session = page.session;
-    if (typeof session === 'string' && session.trim())
-        return session.trim();
-    throw new Error('Browser page is missing a session');
 }
 // The page/CDP session (`page-<pageId>`). Used only for per-page concerns
 // (sitemap-hint dedup, `session:` display). NOT the browser-target-state key —
@@ -917,6 +825,14 @@ Examples:
                     if (err.hint)
                         log.error(`Hint: ${err.hint}`);
                 }
+                else if (err && typeof err === 'object' && err.name === 'SpaceGuardError') {
+                    // P1-4 error contract: guard rejections carry a structured
+                    // code (+ optional hint) — surface both instead of the bare
+                    // message (the no-space hint used to be swallowed here).
+                    log.error(`[${err.code}] ${err.message}`);
+                    if (err.hint)
+                        log.error(`Hint: ${err.hint}`);
+                }
                 else {
                     const msg = getErrorMessage(err);
                     if (isJavaScriptDialogMessage(msg)) {
@@ -933,7 +849,7 @@ Examples:
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
             }
             finally {
-                if (globalThis.__HubDaemonMode) return;
+                if (isDaemonMode()) return;
                 if (page?.close) {
                     try { await page.close(); } catch {}
                 }
@@ -948,24 +864,77 @@ Examples:
      * below are thin wrappers over them.
      */
     async function runForkBrowserTool(toolName, args, page) {
-        const { BROWSER_TOOLS } = await import('../browser-mcp/src/tools/registry.ts');
+        const { BROWSER_TOOLS, PAGE_INFO_TOOLS, OBSERVATION_TOOLS, DISCOVERY_TOOLS } = await import('../browser-mcp/src/tools/registry.ts');
         const { executeTool } = await import('../browser-mcp/src/tools/framework.ts');
-        const def = BROWSER_TOOLS.find((t) => t.name === toolName);
+        // P2-6: the fork surface is every page-operating tool family — the
+        // pinned 17 BROWSER_TOOLS contract plus the families toolified from
+        // CLI direct implementations (batch 1: frames/extract; batch 2:
+        // network/console; batch 3: find/analyze). Space / audit / adapter
+        // families stay out: they are not page-scoped.
+        const def = [...BROWSER_TOOLS, ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS].find((t) => t.name === toolName);
         if (!def)
             throw new Error(`Fork browser tool "${toolName}" is not registered`);
+        // P1-4 (CLI face): fork-wrapped commands pass the SAME executeTool
+        // gate as the MCP surface — inject the local identity + shared ledger
+        // so guardToolAccess enforces D3 and per-page ownership here too.
+        // (These used to run identity-less, i.e. open-world with the guard
+        // off — the last CLI path that bypassed the space gate.)
         return executeTool(def, args, {
             page,
             pageFor: async () => page,
+            identity: LOCAL_SPACE_IDENTITY(),
+            spaces: await loadSpaceManager(),
+            auditSource: 'cli',
         });
     }
     /** Tool args carrying the connected page id (fork tools require a numeric page). */
     function forkToolArgsFor(page) {
         return typeof page.pageId === 'number' ? { page: page.pageId } : {};
     }
+    /**
+     * P2-6 (batch 2): print an observation-tool result (network/console) with
+     * the CLI-native contracts — the envelope object on success, and on error
+     * the pipeline's structured `{ code, message, ... }` rebuilt into the CLI
+     * error shape (agent branching on error.code keeps working), with the same
+     * usage-vs-generic exit-code mapping as emitNetworkError.
+     */
+    function printObservationToolResult(result) {
+        if (result.isError) {
+            const err = result.structuredContent;
+            if (err && typeof err === 'object' && 'code' in err && 'message' in err) {
+                const { code, message, ...extra } = err;
+                console.log(JSON.stringify({ error: { code, message, ...extra } }, null, 2));
+                // P1-4 (phase C): CliError-family results carry their own
+                // semantic exit code; engine query errors keep the
+                // NETWORK_ERROR_EXIT mapping.
+                process.exitCode = typeof extra.exitCode === 'number'
+                    ? extra.exitCode
+                    : (NETWORK_ERROR_EXIT[code] ?? EXIT_CODES.GENERIC_ERROR);
+                return false;
+            }
+            return printForkToolResult(result);
+        }
+        console.log(JSON.stringify(result.structuredContent ?? {}, null, 2));
+        return true;
+    }
     /** Print a fork tool result: formatted text by default, structured envelope with --json. */
     function printForkToolResult(result, opts = {}) {
         const text = result.content?.find?.((c) => c.type === 'text')?.text ?? '';
         if (result.isError) {
+            // P1-4 (phase C): structured error results from the executeTool
+            // gate carry the real platform code (+ hint/candidates/spaceId/
+            // exitCode contract fields) — surface those instead of the legacy
+            // blanket 'tool_error'. Non-contract failures keep the legacy
+            // envelope.
+            const sc = result.structuredContent;
+            if (sc && typeof sc === 'object' && typeof sc.code === 'string' && typeof sc.message === 'string') {
+                const { code, message, ...extra } = sc;
+                console.log(JSON.stringify({ error: { code, message, ...extra } }, null, 2));
+                process.exitCode = typeof extra.exitCode === 'number'
+                    ? extra.exitCode
+                    : EXIT_CODES.GENERIC_ERROR;
+                return false;
+            }
             console.log(JSON.stringify({
                 error: {
                     code: 'tool_error',
@@ -1019,7 +988,7 @@ Examples:
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;
             }
             finally {
-                if (globalThis.__HubDaemonMode) return;
+                if (isDaemonMode()) return;
                 if (bridge?.close) {
                     try { await bridge.close(); } catch {}
                 }
@@ -1179,6 +1148,11 @@ Examples:
         if (!opts.pages) throw new Error('--pages <pageIds> is required (e.g. --pages 1,2)');
         const pages = String(opts.pages).split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
         if (pages.length === 0) throw new Error('No valid page IDs provided');
+        // P1-4 / P1-1 矩阵补洞: same gate as the MCP tab_groups tool — every
+        // page must belong to the current space. D5 treats dragging a tab INTO
+        // a group as an ownership transfer, so an unguarded create could steal
+        // another agent's tabs into this space's group.
+        await assertPagesInCurrentSpace(pages);
         const group = await page.tabGroupCreate(pages, opts.title);
         console.log(JSON.stringify(group, null, 2));
     }));
@@ -1189,6 +1163,7 @@ Examples:
         .option('--color <color>', 'Tab group color (grey, blue, red, yellow, green, pink, purple, cyan, orange)')
         .option('--collapsed', 'Collapse the tab group'))
         .action(browserAction(async (page, groupId, opts) => {
+        await assertGroupInCurrentSpace(page, groupId);
         const updateOpts = {};
         if (opts.title !== undefined) updateOpts.title = opts.title;
         if (opts.color !== undefined) updateOpts.color = opts.color;
@@ -1203,6 +1178,9 @@ Examples:
         if (!opts.pages) throw new Error('--pages <pageIds> is required (e.g. --pages 1,2)');
         const pages = String(opts.pages).split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
         if (pages.length === 0) throw new Error('No valid page IDs provided');
+        // Same gate as group create (MCP tab_groups parity — pages must be
+        // this space's; ungrouping another agent's tabs redirects its group).
+        await assertPagesInCurrentSpace(pages);
         await page.tabGroupUngroup(pages);
         console.log(JSON.stringify({ ungrouped: pages }, null, 2));
     }));
@@ -1210,6 +1188,9 @@ Examples:
         .argument('<groupId>', 'Tab group ID')
         .description('Close a tab group and all its tabs'))
         .action(browserAction(async (page, groupId) => {
+        // Same groupId gate as update — closing a foreign group would take
+        // another space's tabs down with it.
+        await assertGroupInCurrentSpace(page, groupId);
         await page.tabGroupClose(groupId);
         console.log(JSON.stringify({ closed: groupId }, null, 2));
     }));
@@ -1334,8 +1315,17 @@ Examples:
     }));
     addBrowserTabOption(browser.command('frames').description('List cross-origin iframe targets in snapshot order'))
         .action(browserAction(async (page) => {
-        const frames = await page.frames?.() ?? [];
-        console.log(JSON.stringify(frames, null, 2));
+        // P2-6 (batch 1): thin wrapper over the shared `frames` tool definition
+        // (browser-mcp/src/tools/page-info.ts) — the same implementation the
+        // MCP face registers, run through executeTool so the call is guarded
+        // and audited like every other tool dispatch. CLI output contract
+        // (bare JSON array of frames) is preserved by the wrapper.
+        const result = await runForkBrowserTool('frames', forkToolArgsFor(page), page);
+        if (result.isError) {
+            printForkToolResult(result);
+            return;
+        }
+        console.log(JSON.stringify(result.structuredContent?.frames ?? [], null, 2));
     }));
     addBrowserTabOption(browser.command('screenshot').argument('[path]', 'Save to file (base64 if omitted)'))
         .option('--full-page', 'Capture the full scrollable page, not just the viewport', false)
@@ -1380,25 +1370,28 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const normalize = (messages) => messages.map((message) => {
-            if (message && typeof message === 'object') {
-                const record = message;
-                return {
-                    ...record,
-                    timestamp: timestampFromRaw(record.timestamp),
-                };
-            }
-            return { type: 'log', text: String(message), timestamp: Date.now() };
-        });
-        const filter = (messages) => filterByTimeWindow(messages, { sinceMs, untilMs }).filter((message) => {
-            if (opts.level === 'all')
-                return true;
-            const type = String(message.type ?? message.level ?? '').toLowerCase();
-            return opts.level === 'error'
-                ? type === 'error' || type === 'warning'
-                : type === String(opts.level).toLowerCase();
-        });
+        const level = String(opts.level ?? 'all');
         if (opts.follow) {
+            // --follow stays CLI-local: a poll stream does not fit the tool
+            // request/response model (the snapshot path below is the tool face).
+            const normalize = (messages) => messages.map((message) => {
+                if (message && typeof message === 'object') {
+                    const record = message;
+                    return {
+                        ...record,
+                        timestamp: timestampFromRaw(record.timestamp),
+                    };
+                }
+                return { type: 'log', text: String(message), timestamp: Date.now() };
+            });
+            const filter = (messages) => filterByTimeWindow(messages, { sinceMs, untilMs }).filter((message) => {
+                if (level === 'all')
+                    return true;
+                const type = String(message.type ?? message.level ?? '').toLowerCase();
+                return level === 'error'
+                    ? type === 'error' || type === 'warning'
+                    : type === String(level).toLowerCase();
+            });
             let lastSeenTs = 0;
             while (true) {
                 const messages = filter(normalize(await page.consoleMessages('all')));
@@ -1413,16 +1406,16 @@ Examples:
                 await new Promise((resolve) => setTimeout(resolve, FOLLOW_POLL_MS));
             }
         }
-        const messages = filter(normalize(await page.consoleMessages(opts.level)));
-        console.log(JSON.stringify({
-            session: getPageSession(page),
-            captured_at: new Date().toISOString(),
-            count: messages.length,
-            messages: messages.map((message) => ({
-                ...message,
-                timestamp: toIsoTimestamp(message.timestamp),
-            })),
-        }, null, 2));
+        // P2-6 (batch 2): the snapshot path is a thin wrapper over the shared
+        // `console` tool — same pipeline (observation-query.js), now guarded
+        // and audited through executeTool.
+        const result = await runForkBrowserTool('console', {
+            ...forkToolArgsFor(page),
+            level,
+            ...(sinceMs ? { sinceMs } : {}),
+            ...(untilMs ? { untilMs } : {}),
+        }, page);
+        printObservationToolResult(result);
     }));
     // ── Analyze (site recon, agent-native) ──
     //
@@ -1442,55 +1435,22 @@ Examples:
     addBrowserTabOption(browser.command('analyze').argument('<url>'))
         .description('Classify site: anti-bot vendor, real-data API candidates, pattern (A/B/C/D), nearest adapter, next step')
         .action(browserAction(async (page, url) => {
-        const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
-        await page.goto(url);
-        await page.wait(2);
-        if (!hasSessionCapture) {
-            try {
-                await page.evaluate(NETWORK_INTERCEPTOR_JS);
-            }
-            catch { /* non-fatal */ }
+        // P2-6 (batch 3): thin wrapper over the shared `analyze` tool — same
+        // pipeline (observation-query.js runSiteAnalysis: navigate → capture →
+        // probe → analyzeSite classification), guarded and audited through
+        // executeTool. The sitemap hint stays CLI-local (a display nicety
+        // keyed off the report's final_url).
+        const result = await runForkBrowserTool('analyze', {
+            ...forkToolArgsFor(page),
+            url,
+        }, page);
+        if (result.isError) {
+            printObservationToolResult(result);
+            return;
         }
-        await captureNetworkItems(page);
-        // Best-effort: give the page another beat so XHR after DOMContentLoaded lands.
-        await page.wait(1);
-        const rawItems = await captureNetworkItems(page);
-        const networkEntries = rawItems.map((e) => ({
-            url: e.url,
-            status: e.status,
-            contentType: e.ct,
-            bodyPreview: typeof e.body === 'string'
-                ? e.body.slice(0, 2000)
-                : (e.body ? JSON.stringify(e.body).slice(0, 2000) : null),
-        }));
-        const probeJs = `(function(){
-        return {
-          cookieNames: (document.cookie || '').split(';').map(function(c){ return c.trim().split('=')[0]; }).filter(Boolean),
-          initialState: {
-            __INITIAL_STATE__: typeof window.__INITIAL_STATE__ !== 'undefined',
-            __NUXT__: typeof window.__NUXT__ !== 'undefined',
-            __NEXT_DATA__: typeof window.__NEXT_DATA__ !== 'undefined',
-            __APOLLO_STATE__: typeof window.__APOLLO_STATE__ !== 'undefined',
-          },
-          title: document.title || '',
-          finalUrl: location.href,
-        };
-      })()`;
-        const probe = await page.evaluate(probeJs);
-        const browserCookieNames = (await page.getCookies({ url: probe.finalUrl || url }).catch(() => []))
-            .map((c) => c.name)
-            .filter(Boolean);
-        const cookieNames = [...new Set([...probe.cookieNames, ...browserCookieNames])];
-        const signals = {
-            requestedUrl: url,
-            finalUrl: probe.finalUrl,
-            cookieNames,
-            networkEntries,
-            initialState: probe.initialState,
-            title: probe.title,
-        };
-        const report = analyzeSite(signals, getRegistry());
-        const sitemap = resolveSitemapAvailabilityForUrl(probe.finalUrl || url);
+        const report = result.structuredContent ?? {};
+        const finalUrl = typeof report.final_url === 'string' ? report.final_url : url;
+        const sitemap = resolveSitemapAvailabilityForUrl(finalUrl);
         console.log(JSON.stringify({
             ...report,
             ...(sitemap ? { sitemap } : {}),
@@ -1712,22 +1672,19 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const result = await page.evaluate(locator
-            ? buildSemanticFindJs({
-                ...locator,
-                limit: limit ?? undefined,
-                textMax: textMax ?? undefined,
-            })
-            : buildFindJs(opts.css, {
-                limit: limit ?? undefined,
-                textMax: textMax ?? undefined,
-            }));
-        if (isFindError(result)) {
-            console.log(JSON.stringify(result, null, 2));
-            process.exitCode = EXIT_CODES.GENERIC_ERROR;
-            return;
-        }
-        console.log(JSON.stringify(result, null, 2));
+        // P2-6 (batch 3): thin wrapper over the shared `find` tool — same
+        // pipeline (browser/find.js via observation-query.js runFindQuery),
+        // guarded and audited through executeTool. CLI output contract (the
+        // {matches_n, entries[]} object / the find error envelope) is the
+        // tool's structuredContent.
+        const result = await runForkBrowserTool('find', {
+            ...forkToolArgsFor(page),
+            ...(typeof opts.css === 'string' && opts.css.length > 0 ? { css: opts.css } : {}),
+            ...(locator ? locator : {}),
+            ...(limit != null ? { limit } : {}),
+            ...(textMax != null ? { textMax } : {}),
+        }, page);
+        printObservationToolResult(result);
     }));
     // ── Get commands (structured data extraction) ──
     const get = browser.command('get').description('Get page properties');
@@ -2646,6 +2603,9 @@ Examples:
         .option('--start <char>', 'Start offset (use next_start_char from a previous extract)', '0')
         .description('Extract page content as markdown, paragraph-aware chunks for long pages'))
         .action(browserAction(async (page, opts) => {
+        // Local usage validation keeps the CLI error codes (invalid_chunk_size /
+        // invalid_start); page-level failures flow through the tool's unified
+        // error path.
         const rawChunk = String(opts.chunkSize ?? '20000');
         if (!/^\d+$/.test(rawChunk) || Number.parseInt(rawChunk, 10) <= 0) {
             console.log(JSON.stringify({ error: { code: 'invalid_chunk_size', message: `--chunk-size must be a positive integer, got "${opts.chunkSize}"` } }, null, 2));
@@ -2658,35 +2618,22 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const chunkSize = Number.parseInt(rawChunk, 10);
-        const start = Number.parseInt(rawStart, 10);
-        const selector = typeof opts.selector === 'string' && opts.selector.length > 0 ? opts.selector : null;
-        const js = buildExtractHtmlJs(selector);
-        const res = await page.evaluate(js);
-        if (!res) {
-            console.log(JSON.stringify({ error: { code: 'extract_failed', message: 'Page returned no root element.' } }, null, 2));
-            process.exitCode = EXIT_CODES.USAGE_ERROR;
+        // P2-6 (batch 1): thin wrapper over the shared `extract` tool
+        // definition (browser-mcp/src/tools/page-info.ts) — same pipeline the
+        // MCP face runs (buildExtractHtmlJs + runExtractFromHtml), dispatched
+        // through executeTool so the call is guarded and audited. CLI output
+        // contract (the chunk envelope object) is the tool's structuredContent.
+        const result = await runForkBrowserTool('extract', {
+            ...forkToolArgsFor(page),
+            ...(typeof opts.selector === 'string' && opts.selector.length > 0 ? { selector: opts.selector } : {}),
+            chunkSize: Number.parseInt(rawChunk, 10),
+            start: Number.parseInt(rawStart, 10),
+        }, page);
+        if (result.isError) {
+            printForkToolResult(result);
             return;
         }
-        if ('invalidSelector' in res) {
-            console.log(JSON.stringify({ error: { code: 'invalid_selector', message: `Selector "${selector}" is not a valid CSS selector: ${res.reason}` } }, null, 2));
-            process.exitCode = EXIT_CODES.USAGE_ERROR;
-            return;
-        }
-        if ('notFound' in res) {
-            console.log(JSON.stringify({ error: { code: 'selector_not_found', message: selector ? `Selector "${selector}" matched 0 elements.` : 'Page has no body/main/article element.' } }, null, 2));
-            process.exitCode = EXIT_CODES.USAGE_ERROR;
-            return;
-        }
-        const envelope = runExtractFromHtml({
-            html: res.html,
-            url: res.url,
-            title: res.title,
-            selector,
-            start,
-            chunkSize,
-        });
-        console.log(JSON.stringify(envelope, null, 2));
+        console.log(JSON.stringify(result.structuredContent ?? {}, null, 2));
     }));
     // ── Network (API discovery) ──
     //
@@ -2708,7 +2655,6 @@ Examples:
         .description('Capture network requests as shape previews; retrieve full bodies by key')
         .action(browserAction(async (page, opts) => {
         const ttlMs = parsePositiveIntOption(opts.ttl, 'ttl', DEFAULT_TTL_MS);
-        const session = getPageSession(page);
         const hasDetail = typeof opts.detail === 'string' && opts.detail.length > 0;
         const hasFilter = typeof opts.filter === 'string';
         const sinceMs = parseDurationMs(opts.since, 'since');
@@ -2744,62 +2690,22 @@ Examples:
         }
         // --detail short-circuits: read from cache only, no live capture needed.
         if (hasDetail) {
-            const res = loadNetworkCache(session, { ttlMs });
-            if (res.status === 'missing') {
-                emitNetworkError('cache_missing', `No cached capture. Run "browser network" first (in session "${session}").`);
-                return;
-            }
-            if (res.status === 'expired') {
-                emitNetworkError('cache_expired', `Cache is stale (age ${res.ageMs}ms > ttl ${ttlMs}ms). Re-run "browser network" to refresh.`);
-                return;
-            }
-            if (res.status === 'corrupt' || !res.file) {
-                emitNetworkError('cache_corrupt', 'Cache file is malformed; re-run "browser network" to regenerate.');
-                return;
-            }
-            const entry = findEntry(res.file, opts.detail);
-            if (!entry) {
-                emitNetworkError('key_not_found', `Key "${opts.detail}" not in cache.`, {
-                    available_keys: res.file.entries.map((e) => e.key),
-                });
-                return;
-            }
             const rawMaxBody = String(opts.maxBody ?? '0');
             if (!/^\d+$/.test(rawMaxBody)) {
                 emitNetworkError('invalid_max_body', `--max-body must be a non-negative integer, got "${opts.maxBody}"`);
                 return;
             }
             const maxBody = Number.parseInt(rawMaxBody, 10);
-            // Body shape/source:
-            // - If capture already truncated it (entry.body_truncated), the body is a string.
-            // - If the adapter stored a JSON value, it parsed cleanly at capture time; leave it.
-            // - --max-body applies a transport-level cap when the caller wants to keep output small.
-            let outputBody = entry.body;
-            let transportTruncated = false;
-            if (maxBody > 0 && typeof entry.body === 'string' && entry.body.length > maxBody) {
-                outputBody = entry.body.slice(0, maxBody);
-                transportTruncated = true;
-            }
-            const captureTruncated = entry.body_truncated === true;
-            const detailEnvelope = {
-                key: entry.key,
-                url: entry.url,
-                method: entry.method,
-                status: entry.status,
-                ct: entry.ct,
-                size: entry.size,
-                ...(typeof entry.timestamp === 'number' ? { timestamp: toIsoTimestamp(entry.timestamp) } : {}),
-                shape: inferShape(entry.body),
-                body: outputBody,
-            };
-            if (captureTruncated || transportTruncated) {
-                detailEnvelope.body_truncated = true;
-                detailEnvelope.body_full_size = entry.body_full_size ?? entry.size;
-                detailEnvelope.body_truncation_reason = captureTruncated
-                    ? 'capture-limit'
-                    : 'max-body';
-            }
-            console.log(JSON.stringify(detailEnvelope, null, 2));
+            // P2-6 (batch 2): thin wrapper over the shared `network` tool —
+            // same detail pipeline (observation-query.js runNetworkDetail),
+            // guarded and audited through executeTool.
+            const result = await runForkBrowserTool('network', {
+                ...forkToolArgsFor(page),
+                detail: opts.detail,
+                maxBody,
+                ttlMs,
+            }, page);
+            printObservationToolResult(result);
             return;
         }
         if (opts.follow) {
@@ -2834,92 +2740,20 @@ Examples:
                 await new Promise((resolve) => setTimeout(resolve, FOLLOW_POLL_MS));
             }
         }
-        // Fresh capture path.
-        let rawItems;
-        try {
-            rawItems = await captureNetworkItems(page);
-        }
-        catch (err) {
-            emitNetworkError('capture_failed', `Could not read network capture: ${err.message}`);
-            return;
-        }
-        let items = opts.all ? rawItems : filterNetworkItems(rawItems);
-        items = filterByTimeWindow(items, { sinceMs, untilMs });
-        if (opts.failed)
-            items = items.filter((item) => item.status === 0 || item.status >= 400);
-        const filteredOut = rawItems.length - items.length;
-        const keyed = assignKeys(items);
-        const cacheEntries = keyed.map((it) => ({
-            key: it.key,
-            url: it.url,
-            method: it.method,
-            status: it.status,
-            size: it.size,
-            ct: it.ct,
-            body: it.body,
-            ...(typeof it.timestamp === 'number' ? { timestamp: it.timestamp } : {}),
-            ...(it.bodyTruncated ? { body_truncated: true } : {}),
-            ...(it.bodyTruncated && typeof it.bodyFullSize === 'number'
-                ? { body_full_size: it.bodyFullSize }
-                : {}),
-        }));
-        // Soft failure: the caller already has the data, so surface a warning
-        // via the output envelope rather than erroring out the whole command.
-        let cacheWarning = null;
-        try {
-            saveNetworkCache(session, cacheEntries);
-        }
-        catch (err) {
-            cacheWarning = `Could not persist capture cache: ${err.message}. --detail lookups may miss this capture.`;
-        }
-        // Pair each cache entry with its shape up front so --filter can read
-        // segments without recomputing, and the --raw view can keep the full
-        // body. Cache persistence above stored the unfiltered set on purpose:
-        // later `--detail <key>` lookups must still see requests that the
-        // current --filter narrowed out.
-        const shaped = cacheEntries.map((e) => ({ entry: e, shape: inferShape(e.body) }));
-        const visible = filterFields
-            ? shaped.filter((s) => shapeMatchesFilter(s.shape, filterFields))
-            : shaped;
-        const filterDropped = filterFields ? shaped.length - visible.length : 0;
-        const envelope = {
-            session,
-            captured_at: new Date().toISOString(),
-            count: visible.length,
-            filtered_out: filteredOut,
-        };
-        if (filterFields) {
-            envelope.filter = filterFields;
-            envelope.filter_dropped = filterDropped;
-        }
-        if (cacheWarning)
-            envelope.cache_warning = cacheWarning;
-        const truncatedCount = visible.filter((s) => s.entry.body_truncated).length;
-        if (truncatedCount > 0) {
-            envelope.body_truncated_count = truncatedCount;
-            envelope.body_truncated_hint = 'Some bodies exceeded the capture limit; their `shape` reflects only the captured prefix.';
-        }
-        if (opts.raw) {
-            envelope.entries = visible.map((s) => ({
-                ...s.entry,
-                ...(typeof s.entry.timestamp === 'number' ? { timestamp: toIsoTimestamp(s.entry.timestamp) } : {}),
-            }));
-        }
-        else {
-            envelope.entries = visible.map((s) => ({
-                key: s.entry.key,
-                method: s.entry.method,
-                ...(typeof s.entry.timestamp === 'number' ? { timestamp: toIsoTimestamp(s.entry.timestamp) } : {}),
-                status: s.entry.status,
-                url: s.entry.url,
-                ct: s.entry.ct,
-                size: s.entry.size,
-                shape: s.shape,
-                ...(s.entry.body_truncated ? { body_truncated: true } : {}),
-            }));
-            envelope.detail_hint = 'Run "browser network --detail <key>" for full body.';
-        }
-        console.log(JSON.stringify(envelope, null, 2));
+        // P2-6 (batch 2): the fresh capture is a thin wrapper over the shared
+        // `network` tool — same pipeline (observation-query.js runNetworkQuery:
+        // capture → noise filter → time window → keys → cache → shape view),
+        // guarded and audited through executeTool.
+        const result = await runForkBrowserTool('network', {
+            ...forkToolArgsFor(page),
+            ...(opts.all === true ? { all: true } : {}),
+            ...(opts.raw === true ? { raw: true } : {}),
+            ...(filterFields ? { filter: filterFields } : {}),
+            ...(opts.failed === true ? { failed: true } : {}),
+            ...(sinceMs ? { sinceMs } : {}),
+            ...(untilMs ? { untilMs } : {}),
+        }, page);
+        printObservationToolResult(result);
     }));
     // ── Init (adapter scaffolding) ──
     browser.command('init')
@@ -2989,6 +2823,7 @@ cli({
         .option('--write-fixture', 'Write a starter fixture to ~/.hub/config/sites/<site>/verify/<command>.json if none exists')
         .option('--update-fixture', 'Overwrite an existing fixture with one derived from current output')
         .option('--no-fixture', 'Ignore any fixture file for this run (no value-level validation)')
+        .option('--require-fixture', 'Publish gate: fail when no fixture is in effect (user override or co-located clis/<site>/__fixtures__/verify/)', false)
         .option('--strict-memory', 'Fail (not just warn) when ~/.hub/config/sites/<site>/endpoints.json or notes.md is missing')
         .option('--seed-args <value>', 'Seed args when no fixture exists; use JSON array/object for multiple args or flags')
         .option('--trace <mode>', 'Trace capture for the adapter subprocess: off, on, retain-on-failure', 'off')
@@ -3008,7 +2843,7 @@ cli({
                 return;
             }
             const { execFileSync } = await import('node:child_process');
-            const { loadFixture, writeFixture, deriveFixture, validateRows, validateRowShape, fixturePath, expandFixtureArgs, parseSeedArgs } = await import('./browser/verify-fixture.js');
+            const { loadFixture, writeFixture, deriveFixture, validateRows, validateRowShape, fixturePath, builtinFixturePath, resolveFixture, expandFixtureArgs, parseSeedArgs } = await import('./browser/verify-fixture.js');
             const filePath = path.join(hubUserRoot(), 'clis', site, `${command}.js`);
             if (!fs.existsSync(filePath)) {
                 console.error(`Adapter not found: ${filePath}`);
@@ -3019,7 +2854,12 @@ cli({
             console.log(`🔍 Verifying ${name}...\n`);
             console.log(`  Loading: ${filePath}`);
             const useFixture = opts.fixture !== false;
-            let fixture = useFixture ? loadFixture(site, command) : null;
+            // P2-7 — resolution matrix: user override first, then the
+            // co-located clis/<site>/__fixtures__/verify/<command>.json.
+            const fixtureResolved = useFixture ? resolveFixture(site, command) : null;
+            let fixture = fixtureResolved?.fixture ?? null;
+            let fixtureWritePath = null;
+            const effectiveFixturePath = () => fixtureWritePath ?? fixtureResolved?.path ?? fixturePath(site, command);
             // Build adapter args: fixture.args override the legacy --limit 3 heuristic.
             //   - object form   { "limit": 3 }            → `--limit 3`
             //   - array form    ["123", "--limit", "3"]   → verbatim (for positional subjects)
@@ -3087,8 +2927,14 @@ cli({
             // ── Fixture handling ───────────────────────────────────────────
             if (opts.writeFixture || opts.updateFixture) {
                 if (fixture && !opts.updateFixture) {
-                    console.log(`\n  Fixture already exists at ${fixturePath(site, command)}.`);
-                    console.log(`  Use --update-fixture to overwrite.`);
+                    if (fixtureResolved?.source === 'builtin') {
+                        console.log(`\n  Builtin fixture in effect: ${fixtureResolved.path}`);
+                        console.log(`  --write-fixture/--update-fixture seed a user-level override at ${fixturePath(site, command)}.`);
+                    }
+                    else {
+                        console.log(`\n  Fixture already exists at ${fixturePath(site, command)}.`);
+                        console.log(`  Use --update-fixture to overwrite.`);
+                    }
                 }
                 else {
                     const fixtureArgs = explicitArgs !== undefined
@@ -3096,23 +2942,29 @@ cli({
                         : (hasLimitArg ? { limit: 3 } : undefined);
                     const derived = deriveFixture(rows, fixtureArgs);
                     const p = writeFixture(site, command, derived);
+                    fixtureWritePath = p;
                     console.log(`\n  ${fixture ? '↻ Updated' : '✎ Wrote'} fixture: ${p}`);
                     console.log(`  Review and hand-tune the derived expectations (add patterns / notEmpty, tighten rowCount).`);
                     fixture = derived;
                 }
             }
             if (!fixture) {
-                console.log(`\n  ✓ Adapter runs. (No fixture at ${fixturePath(site, command)} — consider --write-fixture to seed one.)`);
+                console.log(`\n  ✓ Adapter runs — but no fixture is in effect (looked at ${fixturePath(site, command)} and ${builtinFixturePath(site, command)}).`);
+                console.log(`  Publish gate: seed one with --write-fixture, hand-tune it, then commit it at clis/${site}/__fixtures__/verify/${command}.json so it ships with the adapter.`);
                 const memoryReport = checkSiteMemory(site);
                 printSiteMemoryReport(memoryReport, opts.strictMemory);
                 if (!memoryReport.ok && opts.strictMemory) {
+                    process.exitCode = EXIT_CODES.GENERIC_ERROR;
+                }
+                if (opts.requireFixture) {
+                    console.log(`\n  ✗ Publish gate (--require-fixture): no fixture in effect.`);
                     process.exitCode = EXIT_CODES.GENERIC_ERROR;
                 }
                 return;
             }
             const failures = validateRows(rows, fixture);
             if (failures.length === 0) {
-                console.log(`\n  ✓ Adapter matches fixture (${fixturePath(site, command)}).`);
+                console.log(`\n  ✓ Adapter matches fixture (${effectiveFixturePath()}${fixtureWritePath === null && fixtureResolved?.source === 'builtin' ? ', builtin' : ''}).`);
                 const memoryReport = checkSiteMemory(site);
                 printSiteMemoryReport(memoryReport, opts.strictMemory);
                 if (!memoryReport.ok && opts.strictMemory) {
@@ -3691,10 +3543,17 @@ cli({
     const spaceCmd = program
         .command('space')
         .description('Task-space management — create, list, switch, close, handoff, takeover (Phase 3)');
-    const LOCAL_SPACE_IDENTITY = () => ({
-        agentId: process.env.HUB_AGENT_ID || 'cli:local',
-        displayName: 'hub local operator',
-    });
+    // P1-3: HUB_AGENT_ID is the stable ownership key (convoId). The agent
+    // label mirrors it for CLI callers; daemon CommandContext wiring will
+    // route owner extraction through ownerOf() (task-space-manager).
+    const LOCAL_SPACE_IDENTITY = () => {
+        const agentId = process.env.HUB_AGENT_ID || 'cli:local';
+        return {
+            agentId,
+            convoId: agentId,
+            displayName: 'hub local operator',
+        };
+    };
     async function loadSpaceManager(opts = {}) {
         const { TaskSpaceManager, defaultStoragePath } = await import('../space/task-space-manager.ts');
         return new TaskSpaceManager({
@@ -3702,6 +3561,109 @@ cli({
             ...(opts.gateway ? { gateway: opts.gateway } : {}),
         });
     }
+    // ── P2-4 observability: audit log query (no browser connection) ──
+    const auditCmd = program
+        .command('audit')
+        .description('Observability — query the audit log (P2-2 dispatch history)');
+    auditCmd.command('list')
+        .description('List recent audit dispatches (newest first; raw JSON rows)')
+        .option('--convo <id>', 'Filter by conversation/owner id')
+        .option('--session <id>', 'Filter by session id')
+        .option('--tool <name>', 'Filter by tool name')
+        .option('--parent <dispatchId>', 'List child rows of one run dispatch')
+        .option('--limit <n>', 'Max rows (default 20)', '20')
+        .option('--cursor <id>', 'Pagination: rows with id < cursor')
+        .action(async (opts) => {
+        const { AuditLog, resolveAuditDbPath } = await import('../audit/audit-log.ts');
+        const dbPath = resolveAuditDbPath();
+        if (!dbPath) {
+            console.log(JSON.stringify({
+                error: {
+                    code: 'audit_off',
+                    message: 'audit log is not active; set HUB_AUDIT_DB (or unset HUB_AUDIT=off / BUN_TEST)',
+                },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const limit = parseInt(opts?.limit ?? '20', 10);
+        const cursor = opts?.cursor !== undefined ? parseInt(opts.cursor, 10) : undefined;
+        const audit = new AuditLog(dbPath);
+        try {
+            const rows = audit.listDispatches({
+                ...(opts?.convo ? { convoId: String(opts.convo) } : {}),
+                ...(opts?.session ? { sessionId: String(opts.session) } : {}),
+                ...(opts?.tool ? { toolName: String(opts.tool) } : {}),
+                ...(opts?.parent ? { parentDispatchId: String(opts.parent) } : {}),
+                ...(Number.isFinite(limit) ? { limit } : {}),
+                ...(Number.isFinite(cursor) ? { cursor } : {}),
+            });
+            console.log(JSON.stringify(rows, null, 2));
+        }
+        finally {
+            audit.close();
+        }
+    });
+    // ── P2-3 recordings: BrowserClaw recording read face (no browser
+    // connection) ──
+    // Streams the browser's claw extension records (rrweb) live in the
+    // BrowserClaw server; these commands read that index over HTTP and export
+    // self-contained replay HTML — same shared implementation the replay.*
+    // MCP tools use (browser-mcp/src/tools/replay-tools.ts). Named `recording`
+    // here because the legacy `replay` command family is the OpenCLI trace
+    // replayer (local trace artifacts, a different data source).
+    const recordingCmd = program
+        .command('recording')
+        .description('Observability — recorded browser replays (BrowserClaw rrweb streams)');
+    function printRecordingError(outcome) {
+        console.log(JSON.stringify({
+            error: { code: outcome.error.code, message: outcome.error.message },
+        }, null, 2));
+        process.exitCode = EXIT_CODES.GENERIC_ERROR;
+    }
+    recordingCmd.command('list')
+        .description('List recorded replay streams (newest first; raw JSON)')
+        .option('--tab <id>', 'Only streams recorded on this Chrome tab id')
+        .option('--from <ms>', 'Only streams whose last event is at/after this epoch-ms timestamp')
+        .option('--to <ms>', 'Only streams whose first event is at/before this epoch-ms timestamp')
+        .option('--limit <n>', 'Max streams (default 50)', '50')
+        .action(async (opts) => {
+        const { listClawStreams } = await import('../browser-mcp/src/tools/replay-tools.ts');
+        const limit = parseInt(opts?.limit ?? '50', 10);
+        const outcome = await listClawStreams({
+            ...(opts?.tab !== undefined && Number.isFinite(parseInt(opts.tab, 10)) ? { tabId: parseInt(opts.tab, 10) } : {}),
+            ...(opts?.from !== undefined && Number.isFinite(parseInt(opts.from, 10)) ? { fromMs: parseInt(opts.from, 10) } : {}),
+            ...(opts?.to !== undefined && Number.isFinite(parseInt(opts.to, 10)) ? { toMs: parseInt(opts.to, 10) } : {}),
+            ...(Number.isFinite(limit) ? { limit } : {}),
+        });
+        if (outcome.ok === false) {
+            printRecordingError(outcome);
+            return;
+        }
+        console.log(JSON.stringify({ streams: outcome.value, count: outcome.value.length }, null, 2));
+    });
+    recordingCmd.command('export')
+        .description('Export one recorded stream as a self-contained HTML replay (open in any browser)')
+        .argument('<documentId>', 'Recording document id (from recording list)')
+        .option('--session <id>', 'Claw session id whose dispatch timeline to embed')
+        .option('--from <ms>', 'Clip events before this epoch-ms timestamp')
+        .option('--to <ms>', 'Clip events after this epoch-ms timestamp')
+        .option('--out <path>', 'Output file path (default ~/.hub/replays/<docId>.html)')
+        .action(async (documentId, opts) => {
+        const { exportClawReplay } = await import('../browser-mcp/src/tools/replay-tools.ts');
+        const outcome = await exportClawReplay({
+            documentId,
+            ...(opts?.session ? { sessionId: String(opts.session) } : {}),
+            ...(opts?.from !== undefined && Number.isFinite(parseInt(opts.from, 10)) ? { fromMs: parseInt(opts.from, 10) } : {}),
+            ...(opts?.to !== undefined && Number.isFinite(parseInt(opts.to, 10)) ? { toMs: parseInt(opts.to, 10) } : {}),
+            ...(opts?.out ? { out: String(opts.out) } : {}),
+        });
+        if (outcome.ok === false) {
+            printRecordingError(outcome);
+            return;
+        }
+        console.log(JSON.stringify(outcome.value, null, 2));
+    });
     // ── Phase 3 B: `browser` commands are space-aware ──
     //
     // The CLI and the daemon share the ledger (HUB_SPACES_FILE or the default
@@ -3778,6 +3740,45 @@ cli({
             throw new Error(`tab ${targetId} is not in your space`);
         }
     }
+    /** P1-4: guard group membership edits (create/ungroup) — every page must
+     *  belong to the current space, mirroring the MCP tab_groups guard
+     *  (manager.assertPagesControllable, which also rejects no-space per D3). */
+    async function assertPagesInCurrentSpace(pageIds) {
+        const { manager } = await currentSpaceForBrowser();
+        await manager.assertPagesControllable(LOCAL_SPACE_IDENTITY().agentId, pageIds);
+    }
+    /** P1-1 real-run hole (2026-08-22): `group update/close` address a group
+     *  by groupId only, so the pages-based gate never fired — any agent could
+     *  rename or close another space's whole group live. Space-level policy
+     *  (same as assertTabInCurrentSpace, NOT assertPagesControllable): a group
+     *  is the current space's visual projection (D5), so every member page
+     *  must belong to the CURRENT space — same local agent's other spaces are
+     *  still off-limits (real-run repro: one agent, two spaces, live rename
+     *  of the other space's group sailed through the agent-level check).
+     *  Unknown/empty groups fall through to the CDP call's native error. */
+    async function assertGroupInCurrentSpace(page, groupId) {
+        const { manager, space } = await currentSpaceForBrowser();
+        if (!space) throw await noSpaceErrorForBrowser();
+        const groups = await page.tabGroupList();
+        const group = (groups || []).find((g) => g && g.groupId === String(groupId));
+        if (!group || !Array.isArray(group.tabIds) || group.tabIds.length === 0) return;
+        const tabs = await page.tabs();
+        const pageIds = group.tabIds
+            .map((tabId) => (tabs || []).find((t) => t && t.tabId === tabId)?.pageId)
+            .filter((id) => typeof id === 'number');
+        if (pageIds.length === 0) return;
+        for (const pageId of pageIds) {
+            const sid = await manager.spaceIdForPage(pageId);
+            if (sid !== space.id) {
+                const { SpaceGuardError } = await import('../space/task-space-manager.ts');
+                throw new SpaceGuardError(
+                    'page-not-in-space',
+                    `group ${groupId} is not in your space (page ${pageId} belongs to ${sid ?? 'no space'})`,
+                    { hint: 'operate on your own space\u0027s group, or hub space switch first' },
+                );
+            }
+        }
+    }
     /** Close a tab through the current space's ledger when it belongs to the space. */
     async function closeTabThroughCurrentSpace(page, targetId) {
         try {
@@ -3814,14 +3815,14 @@ cli({
      */
     async function spaceGatewayFromBrowser() {
         try {
-            const singleton = globalThis.__HubBrowserFactory;
+            const singleton = getDaemonFactory();
             if (singleton && singleton._cdp && singleton._session) {
                 const { gatewayFromPage } = await import('../space/task-space-manager.ts');
                 return { gateway: gatewayFromPage(await singleton.connect()), cleanup: undefined };
             }
             const { BrowserBridge } = await import('./browser/index.js');
             const { gatewayFromPage } = await import('../space/task-space-manager.ts');
-            const BridgeCtor = globalThis.__HubBrowserBridgeOverride ?? BrowserBridge;
+            const BridgeCtor = getBrowserBridgeOverride() ?? BrowserBridge;
             const bridge = new BridgeCtor();
             const cleanup = async () => {
                 if (bridge && typeof bridge.close === 'function') {
@@ -3915,7 +3916,7 @@ cli({
             // bug #9: a direct-connect BrowserBridge keeps the event loop alive;
             // tear it down and exit like `space close`/`space refresh`. Daemon
             // mode must never exit (the daemon process stays resident).
-            if (globalThis.__HubDaemonMode) return;
+            if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
                 process.exit(process.exitCode || 0);
@@ -3944,7 +3945,7 @@ cli({
         }
         catch (err) { printSpaceError(err); }
         finally {
-            if (globalThis.__HubDaemonMode) return;
+            if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
                 process.exit(process.exitCode || 0);
@@ -3975,7 +3976,7 @@ cli({
             // bug #9: a direct-connect BrowserBridge keeps the event loop alive;
             // tear it down and exit like the `browser` commands do. Daemon mode
             // must never exit (the daemon process stays resident).
-            if (globalThis.__HubDaemonMode) return;
+            if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
                 process.exit(process.exitCode || 0);
@@ -4011,7 +4012,7 @@ cli({
         catch (err) { printSpaceError(err); }
         finally {
             // bug #9: same direct-connect bridge teardown + exit as space close.
-            if (globalThis.__HubDaemonMode) return;
+            if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
                 process.exit(process.exitCode || 0);
@@ -4077,7 +4078,7 @@ cli({
         }
         catch (err) { printSpaceError(err); }
         finally {
-            if (globalThis.__HubDaemonMode) return;
+            if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
                 process.exit(process.exitCode || 0);

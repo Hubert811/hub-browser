@@ -79,6 +79,8 @@ describe('spaceEventToNotification', () => {
       'space.switched': 'notifications/space/switched',
       'space.closed': 'notifications/space/closed',
       'space.tabs_recycled': 'notifications/space/tabs_recycled',
+      'tab.dragged_in': 'notifications/space/tab_dragged_in',
+      'tab.dragged_out': 'notifications/space/tab_dragged_out',
     })
   })
 

@@ -33,6 +33,7 @@ export function createFakePage(
     observe: () => ({
       snapshot: async () => ({ text: '', refs: { byRef: new Map() } }),
       diff: async () => ({ changed: false, text: '' }),
+      lastRefs: { byRef: new Map(), get: () => undefined },
     }),
     input: () => ({}),
     cdpJsonForPage: async () => ({}),

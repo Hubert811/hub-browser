@@ -17,7 +17,7 @@ export const download = defineTool({
     ref: z
       .string()
       .describe('Ref of the element that triggers the download, e.g. "e12".'),
-  }),
+  }).strict(),
   annotations: {
     title: 'Download from page',
     destructiveHint: true,

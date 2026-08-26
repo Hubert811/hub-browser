@@ -15,7 +15,7 @@ export const upload = defineTool({
       .array(z.string())
       .optional()
       .describe('Local file paths to upload.'),
-  }),
+  }).strict(),
   annotations: {
     title: 'Upload file to page',
     destructiveHint: true,

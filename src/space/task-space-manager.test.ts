@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import {
   SpaceGuardError,
   SpaceEventBus,
+  SpaceEvent,
   TaskSpaceManager,
   defaultStoragePath,
   deterministicColor,
@@ -1753,7 +1754,7 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     expect(fake.groups).toHaveLength(1)
   })
 
-  it('c1. syncWithTabGroups: group 内新增 tab 归属（added++）', async () => {
+  it('c1. D5 v2: 拖入 group → 发 tab.dragged_in 信号，账本不动', async () => {
     const fake = createFakeGateway()
     const manager = new TaskSpaceManager({
       storagePath: tempLedger(),
@@ -1762,9 +1763,13 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     })
     const space = await manager.create('agent-a', 'sync-space')
     const p1 = await manager.openTab('agent-a', space.id, 'https://a.example')
-    const groupId = fake.groups[0].groupId
+    // Cold start: first sync only records the membership baseline.
+    await manager.syncWithTabGroups()
 
-    // Human opens a new tab and drags it into the space's group.
+    const signals: SpaceEvent[] = []
+    manager.events?.on('tab.dragged_in', (e) => signals.push(e))
+
+    // Human opens a new (unowned) tab and drags it into the space's group.
     const p3 = 300
     fake.tabs.push({
       pageId: p3,
@@ -1776,18 +1781,18 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     fake.groups[0].tabIds.push(1300)
 
     const result = await manager.syncWithTabGroups()
-    expect(result).toEqual({ added: 1, removed: 0 })
+    expect(result).toEqual({ draggedIn: 1, draggedOut: 0 })
+    // The ledger is authoritative and does NOT claim the dragged-in tab —
+    // ownership changes only through the explicit transferTab() API.
     const tabs = await manager.listTabs(space.id)
-    expect(tabs.map((t) => t.pageId)).toEqual(
-      expect.arrayContaining([p1, p3]),
-    )
-    // The attributed tab is marked restored (a future restore never duplicates it).
-    const spaceRaw = (await manager.getSpace(space.id)).tabIds
-    expect(spaceRaw).toEqual(expect.arrayContaining([p1, p3]))
-    void groupId
+    expect(tabs.map((t) => t.pageId)).toEqual([p1])
+    expect(signals).toHaveLength(1)
+    expect(signals[0].pageId).toBe(p3)
+    expect(signals[0].url).toBe('https://c.example')
+    expect(signals[0].ledgerSpaceId).toBeUndefined() // unowned tab
   })
 
-  it('c2. syncWithTabGroups: 账本 tab 被拖出 group → 移除（removed++）', async () => {
+  it('c2. D5 v2: 账本 tab 被拖出 group → 发 tab.dragged_out 信号，账本不动', async () => {
     const fake = createFakeGateway()
     const manager = new TaskSpaceManager({
       storagePath: tempLedger(),
@@ -1797,25 +1802,29 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     const space = await manager.create('agent-a', 'sync-space')
     const p1 = await manager.openTab('agent-a', space.id, 'https://a.example')
     const p2 = await manager.openTab('agent-a', space.id, 'https://b.example')
-    // Reconcile both tabs first (restored:true) — a genuinely dragged-out tab
-    // is one the ledger has confirmed live; fresh pending tabs are protected
-    // from removal by the race fix (see c5).
     await manager.restore()
     expect((await manager.getSpace(space.id)).tabIds).toEqual([p1, p2])
+    // Baseline after the openTab wiring settles.
+    await manager.syncWithTabGroups()
+
+    const signals: SpaceEvent[] = []
+    manager.events?.on('tab.dragged_out', (e) => signals.push(e))
 
     // Human drags p2 out of the group (tab stays open in the browser).
     const g = fake.groups[0]
     g.tabIds = g.tabIds.filter((tabId) => tabId !== tabIdOf(fake, p2))
 
     const result = await manager.syncWithTabGroups()
-    expect(result).toEqual({ added: 0, removed: 1 })
+    expect(result).toEqual({ draggedIn: 0, draggedOut: 1 })
+    // The ledger keeps the attribution — the group is only a projection.
     const tabs = await manager.listTabs(space.id)
-    expect(tabs.map((t) => t.pageId)).toEqual([p1])
-    // The dragged-out tab is still open but no longer attributed to the space.
-    expect(fake.tabs.some((t) => t.pageId === p2)).toBe(true)
+    expect(tabs.map((t) => t.pageId)).toEqual([p1, p2])
+    expect(signals).toHaveLength(1)
+    expect(signals[0].pageId).toBe(p2)
+    expect(signals[0].ledgerSpaceId).toBe(space.id)
   })
 
-  it('c2b. 任务2 竞态：账本 restored:false 新 tab 尚未入组 → sync 不移除（pending 入组保护）', async () => {
+  it('c2b. D5 v2: 自身接线（openTab/restore 投影）不产生假 dragged_in 信号', async () => {
     const fake = createFakeGateway()
     const manager = new TaskSpaceManager({
       storagePath: tempLedger(),
@@ -1824,11 +1833,13 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     })
     const space = await manager.create('agent-a', 'race-space')
     const p1 = await manager.openTab('agent-a', space.id, 'https://a.example')
+    await manager.syncWithTabGroups() // baseline
 
-    // Simulate openTabWithReuse 的步骤 2→4 窗口：新 tab 已写账本
-    // （restored:false）但尚未 tabGroupAddTabs 入组 —— 浏览器里 pageId 存活、
-    // group 里没有它。recordTabForCurrentSpace 只写账本、不做 group 接线，
-    // 正好复现该时序。
+    const signals: SpaceEvent[] = []
+    manager.events?.on('tab.dragged_in', (e) => signals.push(e))
+
+    // 新 tab 已写账本（restored:false）但尚未入组 —— recordTabForCurrentSpace
+    // 只写账本、不做 group 接线，正好复现「步骤 2→4 窗口」；随后投影补组。
     const p2 = 202
     fake.tabs.push({
       pageId: p2,
@@ -1838,20 +1849,17 @@ describe('D5 — space ↔ tab group 双向同步', () => {
       title: undefined,
     })
     await manager.recordTabForCurrentSpace('agent-a', p2, 'https://b.example')
-    // group 里只有 p1；p2 未入组。
-    expect(fake.groups[0].tabIds).not.toContain(tabIdOf(fake, p2))
+    fake.groups[0].tabIds.push(tabIdOf(fake, p2)) // own wiring lands it
 
-    // sync 触发（正是竞态窗口）→ p2 不得被误判为「拖出」而从账本移除。
+    // p2 属于本 space 账本 → 成员变化来自我们自己的投影，不是人类拖入。
     const result = await manager.syncWithTabGroups()
-    expect(result).toEqual({ added: 0, removed: 0 })
+    expect(result).toEqual({ draggedIn: 0, draggedOut: 0 })
+    expect(signals).toHaveLength(0)
     const tabs = await manager.listTabs(space.id)
     expect(tabs.map((t) => t.pageId)).toEqual(expect.arrayContaining([p1, p2]))
-    // p2 仍标记 pending（restored:false），后续 restore 会按 URL 精确恢复一次。
-    const raw = (await manager.getSpace(space.id)).tabIds
-    expect(raw).toEqual(expect.arrayContaining([p1, p2]))
   })
 
-  it('c2c. 任务2 竞态：pending 新 tab 若浏览器里已死 → 仍被移除（不残留死账）', async () => {
+  it('c2c. D5 v2: 冷启动只记基线（重启不重放全世界为变更）', async () => {
     const fake = createFakeGateway()
     const manager = new TaskSpaceManager({
       storagePath: tempLedger(),
@@ -1859,19 +1867,17 @@ describe('D5 — space ↔ tab group 双向同步', () => {
       persist: false,
     })
     const space = await manager.create('agent-a', 'race-space-2')
-    const p1 = await manager.openTab('agent-a', space.id, 'https://a.example')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
 
-    // Pending 新 tab 写账本后、入组前，浏览器里该 tab 已被关闭（pageId 不
-    // 在 live 列表）→ 不是「pending 入组」，应从账本移除（与 listTabs prune
-    // 语义一致，不残留死账）。
-    const p2 = 203
-    await manager.recordTabForCurrentSpace('agent-a', p2, 'https://dead.example')
-    expect(fake.tabs.some((t) => t.pageId === p2)).toBe(false)
+    const signals: SpaceEvent[] = []
+    manager.events?.on('tab.dragged_in', (e) => signals.push(e))
+    manager.events?.on('tab.dragged_out', (e) => signals.push(e))
 
+    // Cold start: the very first reconcile only records the baseline — a
+    // restarted process must not replay the world as "changes".
     const result = await manager.syncWithTabGroups()
-    expect(result).toEqual({ added: 0, removed: 1 })
-    const tabs = await manager.listTabs(space.id)
-    expect(tabs.map((t) => t.pageId)).toEqual([p1])
+    expect(result).toEqual({ draggedIn: 0, draggedOut: 0 })
+    expect(signals).toHaveLength(0)
   })
 
   it('c3. syncWithTabGroups: 人类改 group 名/色 → 不反写（tabGroupUpdate 不被 sync 调用）', async () => {
@@ -1893,7 +1899,7 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     const result = await manager.syncWithTabGroups()
     // sync must not call tabGroupUpdate (update count unchanged during sync).
     expect(fake.updated.length).toBe(updatesBefore)
-    expect(result).toEqual({ added: 0, removed: 0 })
+    expect(result).toEqual({ draggedIn: 0, draggedOut: 0 })
     // The human's presentation edit is preserved in the browser…
     expect(fake.groups[0].title).toBe('human-renamed')
     expect(fake.groups[0].color).toBe('pink')
@@ -1916,7 +1922,7 @@ describe('D5 — space ↔ tab group 双向同步', () => {
 
     // A tab sits in space B's group; space A has no group anywhere.
     const result = await manager.syncWithTabGroups()
-    expect(result).toEqual({ added: 0, removed: 0 })
+    expect(result).toEqual({ draggedIn: 0, draggedOut: 0 })
     expect((await manager.getSpace(noGroup.id)).tabIds).toEqual([])
     expect((await manager.getSpace(withGroup.id)).tabIds).toHaveLength(1)
   })
@@ -1952,7 +1958,7 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     expect(fake.createdGroups).toHaveLength(2)
   })
 
-  it('e. lazy 触发：currentSpace/openTabWithReuse 前自动 reconcile（拖入的 tab 立即可见）', async () => {
+  it('e. lazy 触发：currentSpace/openTabWithReuse 前自动 reconcile（拖入只产生信号）', async () => {
     const fake = createFakeGateway()
     const manager = new TaskSpaceManager({
       storagePath: tempLedger(),
@@ -1961,8 +1967,12 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     })
     const space = await manager.create('agent-a', 'lazy-space')
     const p1 = await manager.openTab('agent-a', space.id, 'https://a.example')
+    await manager.currentSpace('agent-a') // lazy reconcile records the baseline
 
-    // Human drags a new tab into the group; ledger has not seen it yet.
+    const signals: SpaceEvent[] = []
+    manager.events?.on('tab.dragged_in', (e) => signals.push(e))
+
+    // Human drags a new tab into the group; the ledger has not seen it.
     const p3 = 301
     fake.tabs.push({
       pageId: p3,
@@ -1972,14 +1982,14 @@ describe('D5 — space ↔ tab group 双向同步', () => {
       title: undefined,
     })
     fake.groups[0].tabIds.push(1301)
-    expect((await manager.listTabs(space.id)).map((t) => t.pageId)).toEqual([p1])
 
-    // A lazy trigger (currentSpace) reconciles before answering.
+    // A lazy trigger (currentSpace) reconciles before answering — D5 v2: the
+    // signal fires but the dragged-in tab does NOT enter the ledger.
     const current = await manager.currentSpace('agent-a')
     expect(current?.id).toBe(space.id)
-    expect((await manager.listTabs(space.id)).map((t) => t.pageId)).toEqual(
-      expect.arrayContaining([p1, p3]),
-    )
+    expect(signals).toHaveLength(1)
+    expect(signals[0].pageId).toBe(p3)
+    expect((await manager.listTabs(space.id)).map((t) => t.pageId)).toEqual([p1])
   })
 
   it('f. 降级：gateway 无 tabGroup 能力时 openTab/closeSpace/restore/sync 全部静默 no-op', async () => {
@@ -2002,10 +2012,214 @@ describe('D5 — space ↔ tab group 双向同步', () => {
     const space = await manager.create('agent-a', 'plain')
     const pageId = await manager.openTab('agent-a', space.id, 'https://plain.example')
     expect(pageId).toBe(700) // tab attribution unchanged
-    expect(await manager.syncWithTabGroups()).toEqual({ added: 0, removed: 0 })
+    expect(await manager.syncWithTabGroups()).toEqual({ draggedIn: 0, draggedOut: 0 })
     // closeSpace without a group id never calls a tabGroup method.
     await expect(
       manager.closeSpace('agent-a', space.id),
     ).resolves.toBeUndefined()
+  })
+})
+
+// ─── P1-6: space invariants (固化) ─────────────────────────────────
+// A page belongs to at most one space; a space never lists a page twice;
+// closed spaces never revive. These hold across every ownership-changing
+// path: open/close/handoff/takeover/restore/reconcile/recordTab.
+
+interface InvariantSpace {
+  id: string
+  tabs: Array<{ pageId: number }>
+}
+
+function assertOwnershipInvariants(manager: TaskSpaceManager): void {
+  const spaces = Object.values(
+    (manager as unknown as { state: { spaces: Record<string, InvariantSpace> } }).state.spaces,
+  )
+  const ownerOfPage = new Map<number, string>()
+  for (const space of spaces) {
+    const seenInSpace = new Set<number>()
+    for (const tab of space.tabs) {
+      expect(
+        seenInSpace.has(tab.pageId),
+        `space ${space.id} lists page ${tab.pageId} twice`,
+      ).toBe(false)
+      seenInSpace.add(tab.pageId)
+      expect(
+        ownerOfPage.has(tab.pageId),
+        `page ${tab.pageId} belongs to both space ${ownerOfPage.get(tab.pageId)} and ${space.id}`,
+      ).toBe(false)
+      ownerOfPage.set(tab.pageId, space.id)
+    }
+  }
+}
+
+describe('P1-6 space invariants', () => {
+  it('unique page ownership holds across the standard lifecycle', async () => {
+    const fake = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const aSpace = await manager.create('agent-a', 'a-work')
+    const bSpace = await manager.create('agent-b', 'b-work')
+    await manager.openTab('agent-a', aSpace.id, 'https://a.example')
+    await manager.openTab('agent-b', bSpace.id, 'https://b.example')
+    await manager.openTab('agent-a', aSpace.id, 'https://a2.example')
+    await manager.closeTab('agent-a', aSpace.id, (await manager.listTabs(aSpace.id))[0].pageId)
+    await manager.handOff('agent-a', aSpace.id)
+    await manager.takeOver('agent-a', aSpace.id, { confirmed: true })
+    await manager.restore()
+    assertOwnershipInvariants(manager)
+  })
+
+  it('D5 v2: dragging another space\'s tab into my group does NOT transfer — only transferTab does', async () => {
+    const fake = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const aSpace = await manager.create('agent-a', 'a-work')
+    const bSpace = await manager.create('agent-b', 'b-work')
+    const aTab = await manager.openTab('agent-a', aSpace.id, 'https://a.example')
+    const bTab = await manager.openTab('agent-b', bSpace.id, 'https://b.example')
+    await manager.currentSpace('agent-a') // baseline
+
+    const signals: SpaceEvent[] = []
+    manager.events?.on('tab.dragged_in', (e) => signals.push(e))
+
+    // Human drags agent-b's tab into agent-a's group.
+    const bInfo = fake.tabs.find((t) => t.pageId === bTab)!
+    fake.groups[0].tabIds.push(bInfo.tabId!)
+
+    // Lazy reconcile fires the signal but transfers nothing — dual ownership
+    // is impossible by construction (reconcile never writes the ledger).
+    await manager.currentSpace('agent-a')
+    assertOwnershipInvariants(manager)
+    expect(signals).toHaveLength(1)
+    expect(signals[0].pageId).toBe(bTab)
+    expect(signals[0].ledgerSpaceId).toBe(bSpace.id) // foreign-ownership hint
+    expect((await manager.listTabs(aSpace.id)).map((t) => t.pageId)).not.toContain(bTab)
+    expect((await manager.listTabs(bSpace.id)).map((t) => t.pageId)).toContain(bTab)
+
+    // Cross-owner transferTab is tab theft — refused (escalate instead).
+    await expect(
+      manager.transferTab('agent-a', { pageId: bTab, toSpaceId: aSpace.id }),
+    ).rejects.toThrow(SpaceGuardError)
+
+    // Same-owner transfer (agent-b moves its own tab between its spaces) works.
+    const bSpace2 = await manager.create('agent-b', 'b-work-2')
+    const res = await manager.transferTab('agent-b', {
+      pageId: bTab,
+      toSpaceId: bSpace2.id,
+    })
+    expect(res.fromSpaceId).toBe(bSpace.id)
+    expect(res.toSpaceId).toBe(bSpace2.id)
+    assertOwnershipInvariants(manager)
+    expect((await manager.listTabs(bSpace.id)).map((t) => t.pageId)).not.toContain(bTab)
+    expect((await manager.listTabs(bSpace2.id)).map((t) => t.pageId)).toContain(bTab)
+    expect((await manager.listTabs(aSpace.id)).map((t) => t.pageId)).toContain(aTab)
+  })
+
+  it('recordTabForCurrentSpace refuses a tab that already belongs to another space', async () => {
+    const fake = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const aSpace = await manager.create('agent-a', 'a-work')
+    const bSpace = await manager.create('agent-b', 'b-work')
+    const bTab = await manager.openTab('agent-b', bSpace.id, 'https://b.example')
+    void aSpace
+
+    // agent-a tries to attribute agent-b's tab to its own current space.
+    const ok = await manager.recordTabForCurrentSpace('agent-a', bTab, 'https://b.example')
+    expect(ok).toBe(false)
+    assertOwnershipInvariants(manager)
+    expect((await manager.listTabs(bSpace.id)).map((t) => t.pageId)).toContain(bTab)
+
+    // Recording an unowned tab still works.
+    const fresh = 901
+    fake.tabs.push({ pageId: fresh, targetId: 'target-901', url: 'https://fresh.example' })
+    const ok2 = await manager.recordTabForCurrentSpace('agent-a', fresh, 'https://fresh.example')
+    expect(ok2).toBe(true)
+    assertOwnershipInvariants(manager)
+  })
+
+  it('closed spaces never revive (useOrCreate opens a fresh space)', async () => {
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      persist: false,
+    })
+    const first = await manager.create('agent-a', 'recurring-work')
+    // keep:true closes the ledger only (no gateway needed in this test).
+    await manager.closeSpace('agent-a', first.id, { keep: true })
+    const second = await manager.useOrCreateTaskSpace('agent-a', 'recurring-work')
+    expect(second.id).not.toBe(first.id)
+    const ids = Object.keys(
+      (manager as unknown as { state: { spaces: Record<string, unknown> } }).state.spaces,
+    )
+    expect(ids).not.toContain(first.id)
+    expect(ids).toContain(second.id)
+  })
+})
+
+
+// D5 v2 (P1-7 方向 B): transferTab — the ONLY ledger ownership-transfer path.
+describe('D5 v2 — transferTab (explicit ownership transfer)', () => {
+  it('claims an unowned tab into the current space and projects it into the group', async () => {
+    const fake = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'claim-work')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
+
+    // A human tab (unowned) exists in the browser.
+    const human = 400
+    fake.tabs.push({
+      pageId: human,
+      targetId: 'target-400',
+      tabId: 1400,
+      url: 'https://human.example',
+      title: undefined,
+    })
+
+    const res = await manager.transferTab('agent-a', { pageId: human })
+    expect(res.fromSpaceId).toBeNull()
+    expect(res.toSpaceId).toBe(space.id)
+    expect((await manager.listTabs(space.id)).map((t) => t.pageId)).toContain(human)
+    // D5 forward wiring: the claimed tab is projected into the group.
+    expect(fake.groups[0].tabIds).toContain(1400)
+  })
+
+  it('no current space → no-space guard rejection (create first)', async () => {
+    const fake = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    await expect(
+      manager.transferTab('agent-a', { pageId: 1 }),
+    ).rejects.toThrow(SpaceGuardError)
+  })
+
+  it('idempotent: transferring a tab already in the target space is a no-op', async () => {
+    const fake = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'idem-work')
+    const p1 = await manager.openTab('agent-a', space.id, 'https://a.example')
+    const res = await manager.transferTab('agent-a', { pageId: p1, toSpaceId: space.id })
+    expect(res.fromSpaceId).toBeNull()
+    expect(res.toSpaceId).toBe(space.id)
+    expect((await manager.listTabs(space.id)).map((t) => t.pageId)).toEqual([p1])
   })
 })

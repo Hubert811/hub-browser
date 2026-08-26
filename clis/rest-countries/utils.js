@@ -52,7 +52,10 @@ export function requireRegion(value) {
 export async function restCountriesFetch(url, label) {
     let resp;
     try {
-        resp = await fetch(url, { headers: { 'user-agent': UA, accept: 'application/json' } });
+        resp = await fetch(url, {
+            headers: { 'user-agent': UA, accept: 'application/json' },
+            signal: AbortSignal.timeout(15000),
+        });
     }
     catch (err) {
         throw new CommandExecutionError(
@@ -75,6 +78,16 @@ export async function restCountriesFetch(url, label) {
     }
     catch (err) {
         throw new CommandExecutionError(`${label} returned malformed JSON: ${err?.message ?? err}`);
+    }
+    // Upstream drift guard (2026-08): v3.1 was deprecated server-side — the
+    // old endpoints now 301 to a legacy file that answers
+    // {success:false, errors:[..."deprecated"...]}. Surface that as an
+    // explicit upstream error instead of letting callers misreport it as
+    // "no countries matched" (EMPTY_RESULT).
+    if (body && body.success === false && Array.isArray(body.errors)) {
+        const hint = 'REST Countries v3.1 is deprecated upstream; this adapter needs a v5 port (https://restcountries.com/docs/countries/legacy-api-deprecation).';
+        const detail = body.errors.map((e) => e?.message ?? String(e)).join('; ');
+        throw new CommandExecutionError(`${label}: upstream deprecated (${detail.slice(0, 200)})`, hint);
     }
     return body;
 }

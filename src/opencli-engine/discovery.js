@@ -69,7 +69,17 @@ export async function ensureUserCliCompatShims(baseDir = USER_OPENCLI_DIR) {
         await fs.promises.writeFile(pkgJsonPath, pkgJsonContent, 'utf-8');
     }
     // Create node_modules/@jackwener/opencli symlink pointing to the installed package root.
-    const opencliRoot = PACKAGE_ROOT;
+    //
+    // Pin to dist/opencli-engine whenever it exists (published trees ship
+    // dist only; dev trees have it after `bun run build`). Both runtimes
+    // load the compiled JS fine, so bun and node daemons never fight over
+    // the single symlink: without this pin, a later-started daemon of the
+    // other runtime re-points the shim at its own tree (src for bun), and a
+    // cached node daemon then loads TS sources through it — node's ESM
+    // resolution (no extension probing) dies on the first extensionless
+    // relative import. A source tree without dist/ falls back to PACKAGE_ROOT.
+    const distEngineRoot = path.join(PACKAGE_ROOT, '..', '..', 'dist', 'opencli-engine');
+    const opencliRoot = fs.existsSync(distEngineRoot) ? distEngineRoot : PACKAGE_ROOT;
     const symlinkDir = path.join(baseDir, 'node_modules', '@jackwener');
     const symlinkPath = path.join(symlinkDir, 'opencli');
     try {
@@ -93,6 +103,20 @@ export async function ensureUserCliCompatShims(baseDir = USER_OPENCLI_DIR) {
     catch (err) {
         log.warn(`Could not create symlink at ${symlinkPath}: ${getErrorMessage(err)}`);
     }
+    // Self-heal the in-repo node_modules link too (postinstall creates it,
+    // but installs made before the dist-first fix keep pointing at src —
+    // which is unrunnable under node). Same dist-first rule, idempotent.
+    try {
+        const repoRoot = path.join(PACKAGE_ROOT, '..', '..');
+        const repoLink = path.join(repoRoot, 'node_modules', '@jackwener', 'opencli');
+        const existing = await fs.promises.readlink(repoLink).catch(() => undefined);
+        if (existing !== undefined && existing !== distEngineRoot && fs.existsSync(distEngineRoot)) {
+            await fs.promises.rm(repoLink, { recursive: true, force: true });
+            const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+            await fs.promises.symlink(distEngineRoot, repoLink, symlinkType);
+        }
+    }
+    catch { /* best-effort self-heal; postinstall remains the primary fix */ }
 }
 /**
  * Best-effort one-time migration of user adapters from the legacy
@@ -142,6 +166,52 @@ export async function migrateLegacyUserClis(legacyDir = LEGACY_USER_CLIS_DIR, de
  */
 export async function ensureUserAdapters() {
     await fs.promises.mkdir(USER_CLIS_DIR, { recursive: true });
+}
+/**
+ * Change signature of a clis tree: every .js file's mtimeMs, sorted by path.
+ * Used by the daemon (#11) to detect adapters written after its startup —
+ * the registry is cached in memory, so without this check a daemon started
+ * before an adapter file existed never learns about it.
+ *
+ * Deliberately cheap: user trees are small (tens of files), and this runs
+ * before every forwarded /command. Deletions and edits both shift the
+ * signature; a re-discovery re-registers cleanly (registerCommand is
+ * Map.set-overwrite semantics, aliases included).
+ */
+export async function clisTreeSignature(clisDir) {
+    try {
+        const entries = [];
+        const walk = async (dir) => {
+            let names;
+            try {
+                names = await fs.promises.readdir(dir);
+            }
+            catch {
+                return;
+            }
+            for (const name of names) {
+                const full = path.join(dir, name);
+                let st;
+                try {
+                    st = await fs.promises.stat(full);
+                }
+                catch {
+                    continue;
+                }
+                if (st.isDirectory()) {
+                    await walk(full);
+                }
+                else if (name.endsWith('.js')) {
+                    entries.push(`${full}:${st.mtimeMs}`);
+                }
+            }
+        };
+        await walk(clisDir);
+        return entries.sort().join('|');
+    }
+    catch {
+        return '';
+    }
 }
 /**
  * Discover and register CLI commands.

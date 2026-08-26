@@ -35,7 +35,15 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-const __filename = fileURLToPath(import.meta.url);
+let __filename = fileURLToPath(import.meta.url);
+// bun --compile rewrites import.meta.url to a virtual bunfs path
+// (/$bunfs/root/hub) — every fs anchor derived from it (PROJECT_ROOT,
+// RUNTIME, spawn cwd) would point into a nonexistent filesystem. The real
+// executable lives at process.execPath; anchor to it when compiled.
+const COMPILED = __filename.startsWith('/$bunfs');
+if (COMPILED && process.execPath && !process.execPath.startsWith('/$bunfs')) {
+  __filename = process.execPath;
+}
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = dirname(__dirname);
 
@@ -49,10 +57,62 @@ const PROJECT_ROOT = dirname(__dirname);
 const HAS_SRC = fs.existsSync(join(PROJECT_ROOT, 'src', 'opencli-engine', 'main.js'));
 const HAS_DIST = fs.existsSync(join(PROJECT_ROOT, 'dist', 'opencli-engine', 'main.js'));
 const RUNTIME_BASE = !HAS_SRC || (HAS_DIST && typeof Bun === 'undefined') ? 'dist' : 'src';
-const RUNTIME = `../${RUNTIME_BASE}`;
+// Absolute form: under --compile the module's own URL lives on the virtual
+// bunfs disk, so a relative specifier would resolve there instead of next
+// to the real executable. Absolute paths resolve identically in dev.
+const RUNTIME = join(PROJECT_ROOT, RUNTIME_BASE);
 
 const DAEMON_PORT = parseInt(process.env.HUB_DAEMON_PORT ?? '9300', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.HUB_DAEMON_IDLE_TIMEOUT ?? '300000', 10); // 5 min
+
+// ─── P2-9: agent self-description (hub --llm-txt) ────────────────
+// Prints the agent guide straight from the installed build: the bundled
+// hub-browser SKILL.md (single source — the very file the skills system
+// ships, no second copy to maintain) plus a tool surface enumerated LIVE
+// from this build's modules, so the listing can never drift from what
+// `hub --mcp` actually registers. Never fails on a missing resource: a
+// package without the skill file still gets the dynamic surface.
+if (process.argv.includes('--llm-txt')) {
+  const {
+    BROWSER_TOOLS, SPACE_TOOLS,
+    PAGE_INFO_TOOLS, OBSERVATION_TOOLS, DISCOVERY_TOOLS, PROBE_TOOLS,
+  } = await import(`${RUNTIME}/browser-mcp/src/tools/registry.js`);
+  const { AUDIT_TOOLS } = await import(`${RUNTIME}/browser-mcp/src/tools/audit-tools.js`);
+  const { ADAPTER_TOOLS } = await import(`${RUNTIME}/browser-mcp/src/tools/adapter-tools.js`);
+  const { REPLAY_TOOLS } = await import(`${RUNTIME}/browser-mcp/src/tools/replay-tools.js`);
+  const pkg = JSON.parse(fs.readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf-8'));
+  const skillPath = [
+    join(PROJECT_ROOT, 'skills', 'hub-browser', 'SKILL.md'),
+    join(PROJECT_ROOT, 'dist', 'skills', 'hub-browser', 'SKILL.md'),
+  ].find((p) => fs.existsSync(p));
+  const firstLine = (s) => (s ?? '').split('\n')[0].trim();
+  // Every family register.ts mounts must appear here — P2-6's three new
+  // families (page-info/observation/discovery) initially missed this list and
+  // the "never drifts" promise broke (41 registered, 35 advertised). Caught
+  // by the 0.2.0 release pipeline's node-dist smoke.
+  const tools = [
+    ...BROWSER_TOOLS, ...SPACE_TOOLS, ...AUDIT_TOOLS, ...REPLAY_TOOLS, ...ADAPTER_TOOLS,
+    ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS, ...PROBE_TOOLS,
+  ];
+  const toolLines = tools.map((t) => `- ${t.name}: ${firstLine(t.description)}`).join('\n');
+  const parts = [
+    '# hub-browser agent guide (hub --llm-txt)',
+    '',
+    `hub-browser ${pkg.version} — printed from this installed build. The tool list below is enumerated live from the build's own modules and always matches what \`hub --mcp\` registers.`,
+    '',
+    `## MCP tool surface (${tools.length} tools)`,
+    '',
+    toolLines,
+    '',
+    'CLI face: `hub --help` lists commands; `hub <site> <cmd>` runs site adapters (same list as `adapter.run`). Env knobs: HUB_AGENT_ID (stable identity), HUB_SESSION_END_SPACES (close|keep|off at session end), HUB_AUDIT (off) / HUB_AUDIT_DB, HUB_SPACES_FILE.',
+    '',
+  ];
+  if (skillPath) {
+    parts.push(fs.readFileSync(skillPath, 'utf-8').trimEnd(), '');
+  }
+  process.stdout.write(parts.join('\n') + '\n');
+  process.exit(0);
+}
 
 // ─── MCP mode (hub --mcp | HUB_MCP=true) ───────────────────────────
 // Stdio MCP server bound to the @hub/browser-mcp fork. All browser tools
@@ -89,6 +149,10 @@ if (process.env.HUB_MCP === 'true' || process.argv.includes('--mcp')) {
     }, reapIntervalMs);
     reapTimer.unref?.();
   }
+  // P2-1 — this process's session ownership key, set by onSessionIdentity
+  // on the first tool call (declared before the server so the callback can
+  // never race the declaration).
+  let sessionOwner = null;
   const server = createBrowserMcpServer({
     name: 'hub-browser',
     title: 'hub-browser MCP (UnifiedPage)',
@@ -102,10 +166,26 @@ if (process.env.HUB_MCP === 'true' || process.argv.includes('--mcp')) {
     spaceEvents: spaces.events ?? undefined,
     // Per-conversation identity: set HUB_AGENT_ID uniquely per conversation
     // when several agents share one client; otherwise the registration layer
-    // falls back to the MCP client name (clientInfo).
+    // derives a session-scoped identity from MCP client info (P1-3: with a
+    // unique convoId per server session).
     identity: process.env.HUB_AGENT_ID
-      ? { agentId: process.env.HUB_AGENT_ID, displayName: 'hub-browser mcp agent' }
+      ? {
+          agentId: process.env.HUB_AGENT_ID,
+          convoId: process.env.HUB_AGENT_ID,
+          displayName: 'hub-browser mcp agent',
+        }
       : undefined,
+    // P2-1 — session-scoped spaces die with the session: remember this
+    // process's ownership key (per-process convoId, P1-3) so the exit hooks
+    // below can sweep its spaces. Stable HUB_AGENT_ID identities span
+    // sessions by design — no tracking, no auto-close for them.
+    ...(process.env.HUB_AGENT_ID
+      ? {}
+      : process.env.HUB_SESSION_END_SPACES !== 'off' && {
+          onSessionIdentity: (identity) => {
+            sessionOwner = identity.convoId ?? identity.agentId;
+          },
+        }),
   });
 
   const transport = new StdioServerTransport();
@@ -124,11 +204,53 @@ if (process.env.HUB_MCP === 'true' || process.argv.includes('--mcp')) {
     });
   // Keep the process alive while the stdio transport is connected.
   process.stdin.resume();
+
+  // ── P2-1: session-end space sweep ─────────────────────────────
+  // The MCP process IS the session: when it goes down (client disconnect =
+  // stdin end, or a signal), its session-scoped spaces are orphans nobody
+  // can address again (per-process convoId). Close them now instead of
+  // waiting out the D8 7d TTL. HUB_SESSION_END_SPACES:
+  //   close (default) — close tabs + tab groups + ledger eviction
+  //   keep            — ledger eviction only (tabs stay for review)
+  //   off             — leave everything (D8 TTL still applies eventually)
+  let sessionClosing = false;
+  async function closeSessionSpacesAndExit(code) {
+    if (sessionClosing) return;
+    sessionClosing = true;
+    try {
+      if (sessionOwner) {
+        // P2-3: end the claw-server harness session too — closes its tab
+        // ownership windows so replay attribution settles at session end.
+        try {
+          const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
+          await clawHarnessReporter.endSession(sessionOwner);
+        } catch { /* best-effort; claw orphan cleanup is the backstop */ }
+        const keep = process.env.HUB_SESSION_END_SPACES === 'keep';
+        // A hung CDP close must never keep the exit pending — bounded wait,
+        // ledger eviction inside closeSpace has already persisted by then or
+        // the D8 TTL remains the backstop.
+        await Promise.race([
+          spaces.closeSpacesOwnedBy(sessionOwner, keep ? { keep } : undefined),
+          new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+      }
+    } catch (err) {
+      process.stderr.write('[hub-mcp] session space close failed: ' + (err?.message ?? String(err)) + '\n');
+    } finally {
+      process.exit(code);
+    }
+  }
+  process.stdin.on('end', () => closeSessionSpacesAndExit(0));
+  process.on('SIGINT', () => closeSessionSpacesAndExit(130));
+  process.on('SIGTERM', () => closeSessionSpacesAndExit(143));
 } else
 
 // ─── Daemon mode ──────────────────────────────────────────────────
 if (process.env.HUB_DAEMON === 'true') {
-  globalThis.__HubDaemonMode = true;
+  // P1-4 phase C: process globals go through the centralized contract module
+  // (imported before use — setDaemonMode must be initialized first).
+  const { setDaemonMode, setDaemonFactory } = await import(`${RUNTIME}/opencli-engine/runtime-globals.js`);
+  setDaemonMode();
 
   // Catch uncaught errors so the daemon doesn't silently crash.
   process.on('uncaughtException', (err) => {
@@ -142,8 +264,9 @@ if (process.env.HUB_DAEMON === 'true') {
   const { UnifiedBrowserFactory } = await import(`${RUNTIME}/factory.js`);
   const { createProgram } = await import(`${RUNTIME}/opencli-engine/cli.js`);
   const { rewriteBrowserArgv, escapeLeadingDashPositional } = await import(`${RUNTIME}/opencli-engine/cli-argv-preprocess.js`);
-  const { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdapters, hubUserRoot } = await import(`${RUNTIME}/opencli-engine/discovery.js`);
+  const { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdapters, hubUserRoot, clisTreeSignature } = await import(`${RUNTIME}/opencli-engine/discovery.js`);
   const { emitHook } = await import(`${RUNTIME}/opencli-engine/hooks.js`);
+  const { createCommandContext, runWithCommandContext } = await import(`${RUNTIME}/command-context.js`);
 
   const BUILTIN_CLIS = join(PROJECT_ROOT, 'clis');
   const USER_CLIS = join(hubUserRoot(), 'clis');
@@ -159,7 +282,7 @@ if (process.env.HUB_DAEMON === 'true') {
       // Only cache a successfully connected factory — a failed startup restore
       // must not poison the lazy browser-command path.
       factory = candidate;
-      globalThis.__HubBrowserFactory = factory;
+      setDaemonFactory(factory);
     }
     return factory;
   }
@@ -194,6 +317,7 @@ if (process.env.HUB_DAEMON === 'true') {
   }
 
   // Run adapter discovery once (mirrors main.js startup sequence)
+  let userClisSig = '';
   async function ensureDiscovery() {
     if (discoveryDone) return;
     discoveryDone = true;
@@ -205,8 +329,29 @@ if (process.env.HUB_DAEMON === 'true') {
       ]);
       await discoverClis(USER_CLIS);
       await discoverPlugins();
+      userClisSig = await clisTreeSignature(USER_CLIS);
     } catch (err) {
       process.stderr.write('[hub-daemon] discovery error: ' + (err?.message ?? String(err)) + '\n');
+    }
+  }
+
+  // #11: the registry is cached in daemon memory, so an adapter written AFTER
+  // daemon startup was invisible until a restart. Cheap mtime-signature check
+  // before every forwarded /command: when the user clis tree changed, re-run
+  // its discovery (registerCommand is overwrite semantics, so re-registration
+  // is idempotent). Builtin clis stay startup-scoped — they only change with
+  // the package itself.
+  async function refreshUserAdaptersIfChanged() {
+    if (!discoveryDone) return;
+    try {
+      const sig = await clisTreeSignature(USER_CLIS);
+      if (sig !== userClisSig) {
+        await discoverClis(USER_CLIS);
+        userClisSig = sig;
+        process.stderr.write('[hub-daemon] user adapters changed, re-discovered\n');
+      }
+    } catch (err) {
+      process.stderr.write('[hub-daemon] adapter refresh check failed: ' + (err?.message ?? String(err)) + '\n');
     }
   }
 
@@ -220,27 +365,13 @@ if (process.env.HUB_DAEMON === 'true') {
   }
 
   // ── /command executor ────────────────────────────────────────────
-  // The daemon is a shared process: every request applies per-command identity
-  // env (HUB_AGENT_ID / HUB_SPACES_FILE) to process.env (bug #3 — identity
-  // collapse), and the console-capture buffers are process-global, so /command
-  // runs are serialized: only one command executes at a time.
+  // The daemon is a shared process: every request executes inside an explicit
+  // CommandContext (P1-3 part 2) — identity + output capture are scoped by
+  // runWithCommandContext (which also bridges the per-command env for
+  // cli.js's env-based LOCAL_SPACE_IDENTITY, bug #3). /command runs stay
+  // serialized: console capture is process-global, only one context at a
+  // time (true concurrency needs P3-4 process unification).
   let commandQueue = Promise.resolve();
-
-  /** Apply per-command space env; returns a restore() for the daemon's values. */
-  function applyCommandEnv(env) {
-    const saved = {
-      HUB_AGENT_ID: process.env.HUB_AGENT_ID,
-      HUB_SPACES_FILE: process.env.HUB_SPACES_FILE,
-    };
-    if (env?.HUB_AGENT_ID !== undefined) process.env.HUB_AGENT_ID = env.HUB_AGENT_ID;
-    if (env?.HUB_SPACES_FILE !== undefined) process.env.HUB_SPACES_FILE = env.HUB_SPACES_FILE;
-    return () => {
-      if (saved.HUB_AGENT_ID === undefined) delete process.env.HUB_AGENT_ID;
-      else process.env.HUB_AGENT_ID = saved.HUB_AGENT_ID;
-      if (saved.HUB_SPACES_FILE === undefined) delete process.env.HUB_SPACES_FILE;
-      else process.env.HUB_SPACES_FILE = saved.HUB_SPACES_FILE;
-    };
-  }
 
   async function handleDaemonCommand(req, res) {
     let body = '';
@@ -256,94 +387,106 @@ if (process.env.HUB_DAEMON === 'true') {
       return;
     }
 
-    // Capture stdout/stderr so we can return output to the CLI caller.
-    const stdoutChunks = [];
-    const stderrChunks = [];
-    const origLog = console.log;
-    const origError = console.error;
-    const origWarn = console.warn;
-    const origInfo = console.info;
-    console.log = (...a) => { stdoutChunks.push(Buffer.from(a.join(' ') + '\n')); };
-    console.error = (...a) => { stderrChunks.push(Buffer.from(a.join(' ') + '\n')); };
-    console.warn = (...a) => { stderrChunks.push(Buffer.from(a.join(' ') + '\n')); };
-    console.info = (...a) => { stdoutChunks.push(Buffer.from(a.join(' ') + '\n')); };
-    const origWrite = process.stdout.write.bind(process.stdout);
-    const origErrWrite = process.stderr.write.bind(process.stderr);
-    process.stdout.write = (chunk) => { stdoutChunks.push(Buffer.from(chunk)); return true; };
-    process.stderr.write = (chunk) => { stderrChunks.push(Buffer.from(chunk)); return true; };
-
-    // Apply the caller's space-related env for this command only (bug #3):
-    // identity must follow the per-command HUB_AGENT_ID, not the daemon's.
-    const restoreEnv = applyCommandEnv(commandEnv);
+    // P1-3 part 2: explicit per-command context (identity + output capture +
+    // env bridge), replacing the inline env mutation + console monkey-patch.
+    const ctx = createCommandContext(commandEnv);
+    const stdoutChunks = ctx.output.stdout;
+    const stderrChunks = ctx.output.stderr;
     let exitCode = 0;
-    try {
-      // Run adapter discovery before parsing (mirrors main.js)
-      await ensureDiscovery();
-      await emitHook('onStartup', { command: '__startup__', args: {} });
 
-      // Rewrite argv: browser <session> <cmd> -> browser --session <name> <cmd>
-      let rewritten = rewriteBrowserArgv(args);
+    await runWithCommandContext(ctx, async () => {
       try {
-        const manifestPath = join(BUILTIN_CLIS, 'manifest.json');
-        if (fs.existsSync(manifestPath)) {
-          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
-          if (Array.isArray(manifest))
-            rewritten = escapeLeadingDashPositional(rewritten, manifest);
+        // Run adapter discovery before parsing (mirrors main.js)
+        await ensureDiscovery();
+        // #11: pick up adapters written after daemon startup.
+        await refreshUserAdaptersIfChanged();
+        await emitHook('onStartup', { command: '__startup__', args: {} });
+
+        // Rewrite argv: browser <session> <cmd> -> browser --session <name> <cmd>
+        let rewritten = rewriteBrowserArgv(args);
+        try {
+          const manifestPath = join(BUILTIN_CLIS, 'manifest.json');
+          if (fs.existsSync(manifestPath)) {
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+            if (Array.isArray(manifest))
+              rewritten = escapeLeadingDashPositional(rewritten, manifest);
+          }
+        } catch { /* manifest unavailable; skip */ }
+
+        // Create factory lazily (only needed for browser commands, not for list/init/etc)
+        // We check if this is a browser command to avoid unnecessary CDP connection
+        const isBrowserCmd = rewritten[0] === 'browser';
+        if (isBrowserCmd) {
+          await getFactory();
+          // Phase 3 A: first successful browser connection is also a restore
+          // trigger (boot attempt may have been skipped while CDP was down).
+          void ensureSpacesRestored();
         }
-      } catch { /* manifest unavailable; skip */ }
 
-      // Create factory lazily (only needed for browser commands, not for list/init/etc)
-      // We check if this is a browser command to avoid unnecessary CDP connection
-      const isBrowserCmd = rewritten[0] === 'browser';
-      if (isBrowserCmd) {
-        await getFactory();
-        // Phase 3 A: first successful browser connection is also a restore
-        // trigger (boot attempt may have been skipped while CDP was down).
-        void ensureSpacesRestored();
+        const program = createProgram(BUILTIN_CLIS, USER_CLIS);
+        // exitOverride: re-throw CommanderError so catch block can extract exitCode.
+        // Apply to program AND all subcommands recursively (subcommands inherit settings
+        // at creation time, before exitOverride is set, so they still have null _exitCallback).
+        const exitHandler = (err) => { throw err; };
+        program.exitOverride(exitHandler);
+        const applyExitOverride = (cmd) => {
+          cmd._exitCallback = exitHandler;
+          cmd.commands?.forEach(applyExitOverride);
+        };
+        program.commands.forEach(applyExitOverride);
+        // configureOutput: redirect commander help/error text into capture buffers.
+        program.configureOutput({
+          writeOut: (str) => stdoutChunks.push(Buffer.from(str)),
+          writeErr: (str) => stderrChunks.push(Buffer.from(str)),
+        });
+        await program.parseAsync(['node', 'hub', ...rewritten]);
+        // Propagate process.exitCode set by commands (replay/space error paths)
+        // into the HTTP response; reset it so a later command in this daemon
+        // process starts from a clean slate.
+        exitCode = process.exitCode ?? 0;
+      } catch (err) {
+        // CommanderError from --help has exitCode 0; real errors have exitCode 1+
+        exitCode = err.exitCode ?? (err.code ?? 1);
+        // Don't add commander help output to stderr (it was already captured via output.write)
+        if (err.message && !err.code?.startsWith?.('commander.')) {
+          stderrChunks.push(Buffer.from(err.message + '\n'));
+        }
+      } finally {
+        process.exitCode = 0;
       }
+    });
 
-      const program = createProgram(BUILTIN_CLIS, USER_CLIS);
-      // exitOverride: re-throw CommanderError so catch block can extract exitCode.
-      // Apply to program AND all subcommands recursively (subcommands inherit settings
-      // at creation time, before exitOverride is set, so they still have null _exitCallback).
-      const exitHandler = (err) => { throw err; };
-      program.exitOverride(exitHandler);
-      const applyExitOverride = (cmd) => {
-        cmd._exitCallback = exitHandler;
-        cmd.commands?.forEach(applyExitOverride);
-      };
-      program.commands.forEach(applyExitOverride);
-      // configureOutput: redirect commander help/error text into capture buffers.
-      program.configureOutput({
-        writeOut: (str) => stdoutChunks.push(Buffer.from(str)),
-        writeErr: (str) => stderrChunks.push(Buffer.from(str)),
-      });
-      await program.parseAsync(['node', 'hub', ...rewritten]);
-      // Propagate process.exitCode set by commands (replay/space error paths)
-      // into the HTTP response; reset it so a later command in this daemon
-      // process starts from a clean slate.
-      exitCode = process.exitCode ?? 0;
-    } catch (err) {
-      // CommanderError from --help has exitCode 0; real errors have exitCode 1+
-      exitCode = err.exitCode ?? (err.code ?? 1);
-      // Don't add commander help output to stderr (it was already captured via output.write)
-      if (err.message && !err.code?.startsWith?.('commander.')) {
-        stderrChunks.push(Buffer.from(err.message + '\n'));
-      }
-    } finally {
-      restoreEnv();
-      process.exitCode = 0;
-      console.log = origLog;
-      console.error = origError;
-      console.warn = origWarn;
-      console.info = origInfo;
-      process.stdout.write = origWrite;
-      process.stderr.write = origErrWrite;
-    }
+    // P2-2: the daemon command lands an audit row (source='daemon'). Output
+    // CONTENT stays out (byte counts only — stdout can carry whole pages);
+    // on failure the stderr head lands as the error. recordDispatch never
+    // throws and self-degrades, so the HTTP response path is untouched.
+    const { getAuditSink } = await import(`${RUNTIME}/audit/audit-log.js`);
+    const stderrText = Buffer.concat(stderrChunks).toString('utf-8');
+    getAuditSink().recordDispatch({
+      convoId: ctx.identity.convoId,
+      agentLabel: ctx.identity.displayName,
+      source: 'daemon',
+      toolName: `hub ${args
+        .filter((a) => !String(a).startsWith('-'))
+        .slice(0, 3)
+        .join(' ')}`,
+      args: { argv: args },
+      resultMeta: {
+        exitCode,
+        stdoutBytes: Buffer.concat(stdoutChunks).length,
+        stderrBytes: stderrText.length,
+      },
+      durationMs: Date.now() - ctx.startedAt,
+      ok: exitCode === 0,
+      ...(exitCode !== 0 && {
+        error: stderrText.slice(0, 200).trim() || `exit code ${exitCode}`,
+      }),
+      createdAt: ctx.startedAt,
+    });
 
     res.end(JSON.stringify({
       stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
-      stderr: Buffer.concat(stderrChunks).toString('utf-8'),
+      stderr: stderrText,
       exitCode,
     }));
   }

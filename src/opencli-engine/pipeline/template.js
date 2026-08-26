@@ -50,6 +50,31 @@ export function evalExpr(expr, ctx) {
     const resolved = resolvePath(expr, { args, item, data, root, index });
     if (resolved !== null && resolved !== undefined)
         return resolved;
+    // Fast path: pure function wrapping a dotted path — Number(item.x),
+    // String(args.y), parseInt(item.z, 10), ... These shapes are ubiquitous
+    // in adapters (numeric coercion for sort keys etc.) and executing them
+    // through the VM sandbox costs ~230µs per field (sanitizeContext JSON
+    // round-trip + vm context hop), which turns a 3.7k-row × N-field map
+    // into tens of seconds (real case: binance ticker). The fast path is
+    // side-effect free and skips both the sandbox and sanitization.
+    const fnWrap = expr.match(/^(Number|String|Boolean|parseInt|parseFloat|encodeURIComponent|decodeURIComponent)\(\s*([A-Za-z_][\w.]*)\s*(?:,\s*(\d+)\s*)?\)$/);
+    if (fnWrap) {
+        const inner = resolvePath(fnWrap[2], { args, item, data, root, index });
+        if (inner !== null && inner !== undefined) {
+            try {
+                switch (fnWrap[1]) {
+                    case 'Number': return Number(inner);
+                    case 'String': return String(inner);
+                    case 'Boolean': return Boolean(inner);
+                    case 'parseInt': return parseInt(String(inner), fnWrap[3] ? Number(fnWrap[3]) : 10);
+                    case 'parseFloat': return parseFloat(String(inner));
+                    case 'encodeURIComponent': return encodeURIComponent(String(inner));
+                    case 'decodeURIComponent': return decodeURIComponent(String(inner));
+                }
+            }
+            catch { /* fall through to the VM path */ }
+        }
+    }
     // Fallback: evaluate as JS in a sandboxed VM.
     // Handles ||, ??, arithmetic, ternary, method calls, etc. natively.
     return evalJsExpr(expr, { args, item, data, root, index });

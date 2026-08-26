@@ -90,8 +90,9 @@ CLI 等价：`hub browser <session> tab list` / `hub browser <session> tab close
 |---|---|---|
 | `tabs` | list / active / new / close；list 只显示本 space 的页面 | 找 pageId、看当前页、新开或关闭页面 |
 | `navigate` | 加载 url / 后退 / 前进 / 刷新，返回新 snapshot | 跳转；导航后 refs 失效，需重新 snapshot |
-| `snapshot` | 页面可访问性树，带稳定 `[ref=eN]` | 每个交互前；主循环的起点 |
-| `act` | click / type / fill / press / hover / focus / check / uncheck / select / scroll / drag（用 ref） | 操作页面元素 |
+| `snapshot` | 页面可访问性树，带稳定 `[ref=eN]`；P3-5 起每个 ref 行尾内嵌 DOM 定位单元 `→ tag#id [sel="..."]`（最短唯一稳定 selector，写适配器/定位元素直接用） | 每个交互前；主循环的起点 |
+| `act` | click / type / fill / press / hover / focus / check / uncheck / select / scroll / drag（用 ref）；完成后自动回读 diff，含 DOM 维度 `DOM changes (+N/-M)`（spinner 等无 role 节点的出现/消失也可见） | 操作页面元素 |
+| `inspect` | 按 ref 深挖单元素：完整 class/属性、祖先路径、候选 selector（标注策略且已验证唯一）、outerHTML 头 | 写适配器要精确细节时；快照内嵌单元不够用 |
 | `read` | 提取页面内容：markdown / 纯文本 / 链接列表 | 读内容、抓数据；只读不操作 |
 | `grep` | 在 ax 行或可见文本里搜索，不 dump 全页 | 只想知道页面上有没有某内容 |
 | `diff` | 显示距上次 snapshot/diff 的变化 | 低成本确认动作生效，不用重 dump |
@@ -161,6 +162,14 @@ hub browser work open "https://github.com/..."   # 2. 开 tab
 hub browser work state                           # 3. 看页面
 hub space close <id>                        # 6. 完成默认全关
 ```
+
+## 平台工具与自动行为
+
+- `adapter.run { site, command, args }`：跑站点适配器厚命令（= CLI `hub <site> <cmd>`），与 CLI 走同一道 space 门和审计；站点/命令清单用 `hub list` 或错误提示里的建议发现。写完适配器先用 `adapter.validate` / `adapter.convention_audit` 静态检查，再上真站。
+- `audit.query { convoId?, toolName?, ... }`：查审计日志——谁在何时从哪个入口（mcp/cli/run/daemon）调了什么、耗时多久；guard 拒绝也留痕（带错误码），多 agent 会话后复盘用它。
+- `replay.list { tabId?, fromMs?, toMs?, limit? }` / `replay.export { documentId, sessionId?, out? }`：录制回放——浏览器扩展被动录制所有 tab（含 hub 的），list 列录制流（拿 documentId），export 导出自包含 HTML（含本会话操作时间线，点 dispatch 行可跳转回放对应时刻）；CLI 等价 `hub recording list` / `hub recording export <docId>`。hub 的每次工具调用同时上报 BrowserClaw 审计（cockpit 可见）。
+- 会话结束自动清扫：MCP 会话断开时，本会话的 space 默认自动关闭（tab + tab group + 账本）；`HUB_SESSION_END_SPACES=keep` 只清账本留 tab（供复核），`=off` 关闭该行为。稳定身份（HUB_AGENT_ID）跨会话连续，不受清扫影响。
+- 闲置兜底（D8 TTL）：空 space 24h、agent space 7d 未活动自动回收。
 
 ## Don't
 

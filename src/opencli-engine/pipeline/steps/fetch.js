@@ -5,8 +5,16 @@ import { CliError, getErrorMessage } from '../../errors.js';
 import { log } from '../../logger.js';
 import { render } from '../template.js';
 import { isRecord, mapConcurrent } from '../../utils.js';
+/**
+ * Default wall-clock budget for one non-browser pipeline fetch. Without it a
+ * slow/hung upstream stalls the whole command forever (real case: binance
+ * ticker — curl 200 in 8s but the full 24hr payload kept the command hanging
+ * past 90s). Adapters override per step via `timeoutMs`.
+ */
+const DEFAULT_FETCH_TIMEOUT_MS = 15000;
+
 /** Single URL fetch helper */
-async function fetchSingle(page, url, method, queryParams, headers, args, data) {
+async function fetchSingle(page, url, method, queryParams, headers, args, data, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
     const renderedParams = {};
     for (const [k, v] of Object.entries(queryParams))
         renderedParams[k] = String(render(v, { args, data }));
@@ -19,7 +27,11 @@ async function fetchSingle(page, url, method, queryParams, headers, args, data) 
         finalUrl = `${finalUrl}${finalUrl.includes('?') ? '&' : '?'}${qs}`;
     }
     if (page === null) {
-        const resp = await fetch(finalUrl, { method: method.toUpperCase(), headers: renderedHeaders });
+        const resp = await fetch(finalUrl, {
+            method: method.toUpperCase(),
+            headers: renderedHeaders,
+            signal: AbortSignal.timeout(timeoutMs),
+        });
         if (!resp.ok) {
             throw new CliError('FETCH_ERROR', `HTTP ${resp.status} ${resp.statusText} from ${finalUrl}`);
         }
@@ -74,6 +86,9 @@ export async function stepFetch(page, params, data, args) {
     const method = typeof paramObject.method === 'string' ? paramObject.method : 'GET';
     const queryParams = isRecord(paramObject.params) ? paramObject.params : {};
     const headers = isRecord(paramObject.headers) ? paramObject.headers : {};
+    const timeoutMs = typeof paramObject.timeoutMs === 'number' && paramObject.timeoutMs > 0
+        ? paramObject.timeoutMs
+        : DEFAULT_FETCH_TIMEOUT_MS;
     const urlTemplate = String(urlOrObj);
     // Per-item fetch when data is array and URL references item
     if (Array.isArray(data) && urlTemplate.includes('item')) {
@@ -108,7 +123,7 @@ export async function stepFetch(page, params, data, args) {
         return mapConcurrent(data, concurrency, async (item, index) => {
             const itemUrl = String(render(urlTemplate, { args, data, item, index }));
             try {
-                return await fetchSingle(null, itemUrl, method, queryParams, headers, args, data);
+                return await fetchSingle(null, itemUrl, method, queryParams, headers, args, data, timeoutMs);
             }
             catch (error) {
                 const message = getErrorMessage(error);
@@ -118,5 +133,5 @@ export async function stepFetch(page, params, data, args) {
         });
     }
     const url = render(urlOrObj, { args, data });
-    return fetchSingle(page, String(url), method, queryParams, headers, args, data);
+    return fetchSingle(page, String(url), method, queryParams, headers, args, data, timeoutMs);
 }

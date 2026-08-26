@@ -1,4 +1,5 @@
-import { BasePage } from './opencli/base-page.js';
+import { BasePage, type AxActionChannel } from './opencli/base-page.js';
+import { callOnElement, getElementCenter, scrollIntoView } from '@browseros/browser-core/core/input/geometry';
 import { generateStealthJs } from './opencli/stealth.js';
 import { applyUserAgentOverride } from './opencli/ua-override.js';
 import type { BrowserSession } from '@browseros/browser-core';
@@ -6,6 +7,7 @@ import type { ProtocolApi } from '@browseros/cdp-protocol/protocol-api';
 import type { CdpBackend } from '@browseros/browser-core';
 import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, SnapshotOptions } from './opencli/types.js';
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
+import { resolveCdpPort } from './cdp-port.js';
 
 /**
  * Serialize registry-mutating browser operations on one BrowserSession.
@@ -444,7 +446,61 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     return this._browserSession.cdpJsonForPage(this.pageId, method, JSON.stringify(params ?? {}));
   }
 
-  // ── native input → BrowserOS neo Input ──
+  // ── AX action channel (P2-8 primitive sinking) ──
+  // Adapter over browser-core's Input/Observer/geometry — the single trusted
+  // action surface that BasePage's AX-ref fast paths ride on. Element-scoped
+  // actions resolve the ref through the page's Observer (stale refs are
+  // re-identified by role/name/nth) and dispatch on the element's own frame
+  // session, which is what fixes OOPIF input dispatch. Cached per page.
+  private _axChannel: AxActionChannel | null | undefined;
+
+  protected override axChannel(): AxActionChannel | null {
+    if (this._axChannel !== undefined) return this._axChannel;
+    const session = this._browserSession;
+    const observer = session.observe(this.pageId);
+    const input = () => session.input(this.pageId);
+    this._axChannel = {
+      hasRef: (ref) => observer.lastRefs.get(ref) !== undefined,
+      click: (ref, opts) => input().click(ref, opts),
+      hover: (ref) => input().hover(ref),
+      focus: (ref) => input().focus(ref),
+      fill: (ref, value, opts) => input().fill(ref, value, opts),
+      check: (ref) => input().check(ref),
+      uncheck: (ref) => input().uncheck(ref),
+      uploadFile: (ref, files) => input().uploadFile(ref, files),
+      dragRefs: async (source, target) => {
+        await input().drag(source, target);
+      },
+      scrollIntoViewRef: async (ref) => {
+        const { session: frameSession, backendNodeId } = await observer.resolveRef(ref);
+        await scrollIntoView(frameSession, backendNodeId);
+      },
+      readState: async (ref, expr) => {
+        const { session: frameSession, backendNodeId } = await observer.resolveRef(ref);
+        return callOnElement(frameSession, backendNodeId, expr);
+      },
+      clickAt: (x, y, opts) => input().clickAt(x, y, opts),
+      hoverAt: (x, y) => input().hoverAt(x, y),
+      dragAt: (from, to) => input().dragAt(from, to),
+      typeText: (text) => input().type(text),
+      press: (key, modifiers) => {
+        const combo = modifiers?.length ? `${modifiers.join('+')}+${key}` : key;
+        return input().press(combo);
+      },
+      centerRef: async (ref) => {
+        const { session: frameSession, backendNodeId } = await observer.resolveRef(ref);
+        try {
+          return await getElementCenter(frameSession, backendNodeId);
+        } catch {
+          return null;
+        }
+      },
+    };
+    return this._axChannel;
+  }
+
+  // ── native input → BrowserOS neo Input (IPage surface; BasePage routes
+  //    through axChannel() internally) ──
   async nativeClick(x: number, y: number): Promise<void> {
     await this._browserSession.input(this.pageId).clickAt(x, y);
   }
@@ -521,7 +577,9 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
   // data-opencli-ref marker path.
   async selectOption(ref: string, value: string): Promise<unknown> {
     if (/^e?\d+$/.test(ref)) {
-      const entry = this._axRefs.get(ref);
+      // P2-8: the Observer's refs are the authority (they persist on the
+      // browser session across per-command page rebuilds).
+      const entry = this._browserSession.observe(this.pageId).lastRefs.get(ref);
       if (entry?.backendNodeId != null) {
         try {
           const { session } = await this._browserSession.pages.getSession(this.pageId);
@@ -586,7 +644,6 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
     }
   }
   const result = await this._browserSession.observe(this.pageId).snapshot();
-   this.populateAxRefs(result.refs);
    // 2b.1: compound 后处理
    const compound = await this.collectCompoundInfo();
    return this.mergeCompoundIntoSnapshot(result.text, compound);
@@ -594,6 +651,12 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
 
   async diff(): Promise<unknown> {
     return this._browserSession.observe(this.pageId).diff();
+  }
+
+  // P3-5 — deep-probe one snapshot ref's backing element (full classes/
+  // attributes, ancestor path, verified candidate selectors, outerHTML head).
+  async inspectRef(ref: string): Promise<unknown> {
+    return this._browserSession.observe(this.pageId).inspectRef(ref);
   }
 
   // ── consoleMessages (event-bridge) ──
@@ -686,7 +749,6 @@ const wrapper = `(function() {
  // 2b.2: UnifiedPage 覆写 annotatedScreenshot — visual ref overlay by coordinates
  override async annotatedScreenshot(options: ScreenshotOptions = {}): Promise<string> {
    const snapResult = await this._browserSession.observe(this.pageId).snapshot();
-   this.populateAxRefs(snapResult.refs);
    const { session } = await this._browserSession.pages.getSession(this.pageId);
    const refCoords = await this.getRefCoordinates(session, snapResult.refs);
    await this.evaluate(this.installCoordOverlayJs(refCoords));
@@ -767,7 +829,8 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
   const map = new Map();
   const fnDecl = 'function() {\n' + COMPOUND_INFO_JS + '\nreturn compoundInfoOf(this);\n}';
   // Check each AX ref: resolve backendNodeId → objectId → callFunctionOn
-  const entries = [...this._axRefs.entries()];
+  // (P2-8: iterate the Observer's refs — the single ref authority.)
+  const entries = [...this._browserSession.observe(this.pageId).lastRefs.byRef.entries()];
   const results = await Promise.all(entries.map(async ([ref, entry]: [string, any]) => {
     try {
       const resolved = await session.DOM.resolveNode({ backendNodeId: entry.backendNodeId });
@@ -810,7 +873,7 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
  
  // 2b.4.1: executionContext tracking for cross-origin OOPIF eval
  private async screenshotViaRawWebSocket(options: ScreenshotOptions = {}): Promise<{ data: string }> {
-    const port = Number(process.env.BROWSEROS_CDP_PORT ?? 9110);
+    const port = resolveCdpPort();
     const pages = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as any[];
     const pageInfo = this._browserSession.pages.getInfo(this.pageId);
     const target = pages.find((p: any) => p.targetId === pageInfo?.targetId)
@@ -871,21 +934,4 @@ private clearExecutionContexts(): void {
   this._ctxEventSub2?.();
   this._ctxEventSub2 = null;
 }
-
-private populateAxRefs(refs: any): void {
-   this._axRefs.clear();
-   for (const [ref, entry] of refs.byRef) {
-      this._axRefs.set(ref, {
-        ref,
-        backendNodeId: entry.backendNodeId,
-        role: entry.role,
-        name: entry.name,
-        nth: entry.nth,
-        frame: entry.frameId
-          ? { frameId: entry.frameId, url: entry.frameUrl ?? undefined }
-          : undefined,
-      });
-    }
-  }
-
 }

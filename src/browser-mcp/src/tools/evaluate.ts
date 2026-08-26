@@ -24,7 +24,7 @@ export const evaluate = defineTool({
       .number()
       .optional()
       .describe('Max evaluation time in ms (default 30000).'),
-  }),
+  }).strict(),
   annotations: {
     title: 'Run JavaScript in page',
     destructiveHint: true,

@@ -60,6 +60,12 @@ export interface BrowserMcpServerOptions extends BrowserToolDefaults {
    * provided. Never throws into the event bus.
    */
   onSpaceEvent?: (event: SpaceEvent) => void
+  /**
+   * P2-1 — fires once with the first resolved tool identity so the host
+   * process can run a session-end space sweep (hub.mjs closes session-scoped
+   * spaces when the MCP process goes down). Best-effort observer.
+   */
+  onSessionIdentity?: (identity: SpaceIdentity) => void
 }
 
 /** Creates a hub-browser MCP server with only the shared browser tool surface. */
@@ -109,6 +115,8 @@ export function createBrowserMcpServer(
       spaceTools: options.registration?.spaceTools,
       spaceEvents: options.spaceEvents ?? options.registration?.spaceEvents,
       onSpaceEvent: options.onSpaceEvent ?? options.registration?.onSpaceEvent,
+      onSessionIdentity:
+        options.onSessionIdentity ?? options.registration?.onSessionIdentity,
     },
   )
 

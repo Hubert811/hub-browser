@@ -10,7 +10,7 @@ export const navigate = defineTool({
     page: z.number().int().describe('Page id from `tabs`.'),
     action: z.enum(['url', 'back', 'forward', 'reload']).default('url'),
     url: z.string().optional().describe('Required when action is "url".'),
-  }),
+  }).strict(),
   annotations: {
     title: 'Navigate page',
     destructiveHint: true,

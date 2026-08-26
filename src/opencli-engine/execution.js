@@ -425,12 +425,19 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                 // Other failures keep the best-effort original-page fallback.
                 // Must happen before any navigation / command execution.
                 // The binding result is kept for the bug #7 URL sync below.
+                // P2-7 (adapter.run MCP face): opts.agentId lets a
+                // long-lived caller (the MCP server process) pass the
+                // per-caller ownership key explicitly. The env fallback keeps
+                // the CLI/daemon behavior byte-identical (HUB_AGENT_ID is
+                // per-process there, so env is correct for them but would
+                // collapse identities in a shared MCP process).
+                const agentId = opts.agentId ?? (process.env.HUB_AGENT_ID || 'cli:local');
                 const binding = await bindAdapterPageToSpace({
                     page,
                     browser,
                     cdpEndpoint,
                     cmd,
-                    agentId: process.env.HUB_AGENT_ID || 'cli:local',
+                    agentId,
                 });
                 page = binding.page;
                 const observation = traceMode === 'off'

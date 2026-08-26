@@ -2,6 +2,13 @@ import { describe, expect, it } from 'bun:test'
 import { BROWSER_MCP_INSTRUCTIONS } from './mcp-prompt'
 import { createBrowserMcpServer } from './mcp-server'
 import { BROWSER_TOOLS, SPACE_TOOLS } from './tools/registry'
+import { AUDIT_TOOLS } from './tools/audit-tools'
+import { ADAPTER_TOOLS } from './tools/adapter-tools'
+import { REPLAY_TOOLS } from './tools/replay-tools'
+import { PAGE_INFO_TOOLS } from './tools/page-info'
+import { OBSERVATION_TOOLS } from './tools/observation-tools'
+import { DISCOVERY_TOOLS } from './tools/discovery-tools'
+import { PROBE_TOOLS } from './tools/inspect'
 import { createFakePage, textOf } from './tools/test-helpers'
 import type { UnifiedPageProvider } from './tools/framework'
 
@@ -50,7 +57,7 @@ describe('createBrowserMcpServer', () => {
     )
 
     expect(Object.keys(server._registeredTools)).toEqual(
-      [...BROWSER_TOOLS, ...SPACE_TOOLS].map((tool) => tool.name),
+      [...BROWSER_TOOLS, ...SPACE_TOOLS, ...AUDIT_TOOLS, ...REPLAY_TOOLS, ...ADAPTER_TOOLS, ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS, ...PROBE_TOOLS].map((tool) => tool.name),
     )
     expect(server.server._capabilities).toEqual({
       logging: {},
@@ -174,9 +181,9 @@ describe('createBrowserMcpServer legacy browserSession binding', () => {
       }),
     )
 
-    // full fork surface: 17 browser + 13 space tools
+    // full fork surface: 17 browser + 13 space + audit + replay tools
     expect(Object.keys(server._registeredTools)).toEqual(
-      [...BROWSER_TOOLS, ...SPACE_TOOLS].map((tool) => tool.name),
+      [...BROWSER_TOOLS, ...SPACE_TOOLS, ...AUDIT_TOOLS, ...REPLAY_TOOLS, ...ADAPTER_TOOLS, ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS, ...PROBE_TOOLS].map((tool) => tool.name),
     )
 
     const tabsHandler = server._registeredTools['tabs'].handler

@@ -17,7 +17,10 @@ import {
   type BrowserOutputFileAccess,
   withBrowserOutputFileAccess,
 } from './output-file'
-import { BROWSER_TOOLS, SPACE_TOOLS } from './registry'
+import { BROWSER_TOOLS, DISCOVERY_TOOLS, OBSERVATION_TOOLS, PAGE_INFO_TOOLS, PROBE_TOOLS, SPACE_TOOLS } from './registry'
+import { AUDIT_TOOLS } from './audit-tools'
+import { ADAPTER_TOOLS } from './adapter-tools'
+import { REPLAY_TOOLS } from './replay-tools'
 
 type RegisterFn = (
   name: string,
@@ -73,6 +76,26 @@ export interface BrowserToolRegistrationOptions {
   spaces?: TaskSpaceManager
   /** Register the space.* tools (default true). */
   spaceTools?: boolean
+  /** Register the audit.* observability tools (default true). */
+  auditTools?: boolean
+  /** Register the replay.* recording tools — list/export (default true, P2-3). */
+  replayTools?: boolean
+  /** Register the adapter.* execution/maintenance tools (default true, P2-7). */
+  adapterTools?: boolean
+  /** Register the page-info tools — frames/extract (default true, P2-6 batch 1). */
+  pageInfoTools?: boolean
+  /** Register the observation tools — network/console (default true, P2-6 batch 2). */
+  observationTools?: boolean
+  /** Register the discovery tools — find/analyze (default true, P2-6 batch 3). */
+  discoveryTools?: boolean
+  /** Register the probe tools — inspect (default true, P3-5). */
+  probeTools?: boolean
+  /**
+   * P2-1 — fires once with the first resolved tool identity (the session's
+   * ownership key holder) so the host can run a session-end space sweep.
+   * Best-effort: throws are swallowed and never affect tool calls.
+   */
+  onSessionIdentity?: (identity: SpaceIdentity) => void
   /**
    * Phase 7 — OPT-IN space event source for MCP notifications. When provided,
    * every event emitted on this SpaceEventBus (created/agent_active/
@@ -188,6 +211,47 @@ function resolveToolIdentity(
   return fallbackIdentity(server)
 }
 
+/**
+ * P1-3 — builds the session-scoped identity for an MCP server.
+ *
+ * Layers (first match wins):
+ *   1. $HUB_AGENT_ID — explicit stable identity: it is both the agent label
+ *      and the ownership key (convoId), so a caller that needs continuity
+ *      across restarts pins it explicitly.
+ *   2. clientInfo.name — conversation-scoped identity: the agentId keeps the
+ *      historical `mcp:<name>` label, while the ownership key gets a
+ *      per-process unique suffix (convoId = `mcp:<name>:<suffix>`). Two MCP
+ *      server processes with the same client name (two Claude Code windows)
+ *      therefore own disjoint space sets — the bug-#3 identity-collapse class
+ *      of issues. The suffix is generated exactly once per server session
+ *      and cached; per MCP process stdio is one client, so process == session.
+ */
+export function makeMcpSessionIdentityResolver(
+  server: McpServer,
+): () => SpaceIdentity | undefined {
+  let cached: SpaceIdentity | undefined
+  return () => {
+    const env = process.env.HUB_AGENT_ID
+    if (env) {
+      return { agentId: env, convoId: env, displayName: env }
+    }
+    if (cached) return cached
+    const clientInfo = server?.server?.getClientVersion?.()
+    if (clientInfo?.name) {
+      cached = {
+        agentId: `mcp:${clientInfo.name}`,
+        convoId: `mcp:${clientInfo.name}:${randomSessionSuffix()}`,
+        displayName: clientInfo.name,
+      }
+    }
+    return cached
+  }
+}
+
+function randomSessionSuffix(): string {
+  return Math.random().toString(36).slice(2, 10)
+}
+
 function fallbackIdentity(
   server: McpServer,
 ): SpaceIdentity | undefined {
@@ -207,6 +271,8 @@ export function registerBrowserTools(
   options: BrowserToolRegistrationOptions = {},
 ): void {
   const register = server.registerTool.bind(server) as unknown as RegisterFn
+  const sessionIdentityResolver = makeMcpSessionIdentityResolver(server)
+  let sessionIdentityNotified = false
 
   const pageCache = new Map<number, Promise<UnifiedPage>>()
   const pageForCached = (pageId: number): Promise<UnifiedPage> => {
@@ -221,6 +287,13 @@ export function registerBrowserTools(
   const allTools = [
     ...BROWSER_TOOLS,
     ...(options.spaceTools === false ? [] : SPACE_TOOLS),
+    ...(options.auditTools === false ? [] : AUDIT_TOOLS),
+    ...(options.replayTools === false ? [] : REPLAY_TOOLS),
+    ...(options.adapterTools === false ? [] : ADAPTER_TOOLS),
+    ...(options.pageInfoTools === false ? [] : PAGE_INFO_TOOLS),
+    ...(options.observationTools === false ? [] : OBSERVATION_TOOLS),
+    ...(options.discoveryTools === false ? [] : DISCOVERY_TOOLS),
+    ...(options.probeTools === false ? [] : PROBE_TOOLS),
   ]
 
   for (const tool of allTools) {
@@ -255,31 +328,62 @@ export function registerBrowserTools(
         options.onToolExecutionStart?.(lifecycleEvent)
         try {
           const pageArg = typeof args.page === 'number' ? args.page : undefined
-          // space.* tools are ledger-only: they must work without a browser
-          // connection (identity + TaskSpaceManager only). Eagerly connecting
-          // here made space.list fail whenever CDP was down.
-          const isSpaceTool = tool.name.startsWith('space.')
+          // space.*/audit.* tools are ledger/platform-metadata tools: they
+          // must work without a browser connection (identity +
+          // TaskSpaceManager / audit DB only). Eagerly connecting here made
+          // space.list fail whenever CDP was down.
+          //
+          // adapter.* tools manage their own sessions: adapter.run builds its
+          // browser session inside executeCommand (the engine chain), so the
+          // MCP provider connection would be wasted — and would wrongly fail
+          // adapter.run/validate when this server's CDP face is down.
+          //
+          // replay.* tools read the BrowserClaw server over HTTP (P2-3): no
+          // CDP connection either — recording capture lives in the browser
+          // extension, hub only queries the index and exports files.
+          const isBrowserlessTool =
+            tool.name.startsWith('space.') ||
+            tool.name.startsWith('audit.') ||
+            tool.name.startsWith('adapter.') ||
+            tool.name.startsWith('replay.')
           const page =
-            isSpaceTool
+            isBrowserlessTool
               ? (undefined as unknown as UnifiedPage)
               : pageArg === undefined
                 ? await provider.connect()
                 : await pageForCached(pageArg)
           const pageFor = pageForCached
-          const resolvedIdentity = resolveToolIdentity(
-            options.identity,
-            server,
-          )
+          // P1-3: without an explicit identity option, tool calls share one
+          // session-scoped identity (env override or clientInfo + unique
+          // convoId, generated once per server session). Called synchronously
+          // — the fallback must not add microtask ticks to the tool pipeline
+          // (some callers rely on the old fallbackIdentity timing).
+          const resolvedIdentity = options.identity
+            ? resolveToolIdentity(options.identity, server)
+            : sessionIdentityResolver()
+          const identity =
+            resolvedIdentity instanceof Promise
+              ? await resolvedIdentity
+              : resolvedIdentity
+          // P2-1 — notify once with the first resolved tool identity so the
+          // host process (hub.mjs) knows this session's ownership key for its
+          // session-end space sweep. Observer failures never touch the tool
+          // pipeline.
+          if (identity && !sessionIdentityNotified) {
+            sessionIdentityNotified = true
+            try {
+              options.onSessionIdentity?.(identity)
+            } catch {
+              // best-effort observer
+            }
+          }
           const ctx: ToolContext = {
             page,
             pageFor,
             defaultWindowId: defaults.defaultWindowId,
             defaultTabGroupId: defaults.defaultTabGroupId,
             signal: extra?.signal,
-            identity:
-              resolvedIdentity instanceof Promise
-                ? await resolvedIdentity
-                : resolvedIdentity,
+            identity,
             spaces: options.spaces,
           }
           const result = await withBrowserOutputFileAccess(

@@ -10,7 +10,7 @@ const screenshotFormat = z.enum(['jpeg', 'png', 'webp'])
 const screenshotSize = z.object({
   width: z.number().int().positive().max(4096).default(1024),
   height: z.number().int().positive().max(4096).default(768),
-})
+}).strict()
 
 type ScreenshotFormat = z.infer<typeof screenshotFormat>
 type ScreenshotSize = z.infer<typeof screenshotSize>
@@ -161,7 +161,7 @@ export const screenshot = defineTool({
       .describe(
         'What to do when the canary detects a wedged capture pipeline: hint (default) returns the actionable tab-wedged error; auto-recycle (opt-in) closes this page\u2019s task space and reopens every URL in a fresh tab, then retries the screenshot once on the fresh tab.',
       ),
-  }),
+  }).strict(),
   annotations: { title: 'Take screenshot', readOnlyHint: true },
   handler: async (args, ctx) => {
     // defineTool types args via zod's input type (defaults optional); executeTool

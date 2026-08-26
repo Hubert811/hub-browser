@@ -21,7 +21,7 @@ export const pdf = defineTool({
       .boolean()
       .default(false)
       .describe('Use CSS page size when the page defines one.'),
-  }),
+  }).strict(),
   annotations: { title: 'Save page as PDF', readOnlyHint: true },
   handler: async (args, ctx) => {
     const page = await ctx.pageFor(args.page)

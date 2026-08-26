@@ -206,7 +206,7 @@ describe('opencli space refresh — TabFreshness 整组回收原语 (CLI)', () =
 // manager with a browser gateway so raw tab-group edits (拖入/拖出) reconcile
 // into the ledger before answering. Without a gateway the reads degrade
 // gracefully (no sync, same output as before).
-describe('bug 1 — CLI read paths sync tab-group drag-ins via the gateway', () => {
+describe('bug 1 — CLI read paths carry the browser gateway (D5 v2: drag-ins signal, not claim)', () => {
   /** Fake BrowserOS neo page with D5 tab-group support (shared registry). */
   class TabGroupPage {
     constructor(private browser: TabGroupBrowser) {}
@@ -309,25 +309,27 @@ describe('bug 1 — CLI read paths sync tab-group drag-ins via the gateway', () 
       connect: async () => browser.connect(),
     }
 
-    // bug 1: `space current` reconciles the drag-in before answering.
+    // D5 v2 (P1-7 方向 B): `space current` still reconciles through the
+    // gateway (bug 1 fix intact — the read path carries the browser gateway),
+    // but a drag-in is now a SIGNAL, not a claim: the ledger keeps one tab.
     const current = await run(['space', 'current', '--json'])
     const cur = JSON.parse(current) as {
       space: { id: string; tabIds: number[]; tabGroupId?: string }
     }
     expect(cur.space.id).toBe(space.id)
-    expect(cur.space.tabIds).toHaveLength(2)
-    expect(cur.space.tabIds).toEqual(expect.arrayContaining([dragged.pageId]))
+    expect(cur.space.tabIds).toHaveLength(1)
+    expect(cur.space.tabIds).not.toContain(dragged.pageId)
     // bug 3: tabGroupId 透出 (SpaceInfo serialization).
     expect(cur.space.tabGroupId).toBe(groupId)
 
-    // `space list` reconciles too.
+    // `space list` reconciles too — same one-tab ledger.
     const list = await run(['space', 'list', '--json'])
     const parsed = JSON.parse(list) as {
       spaces: Array<{ id: string; tabIds: number[] }>
       count: number
     }
     const listed = parsed.spaces.find((s) => s.id === space.id)!
-    expect(listed.tabIds).toHaveLength(2)
+    expect(listed.tabIds).toHaveLength(1)
 
     // `space switch` still works with a gateway present.
     const switched = await run(['space', 'switch', space.id, '--json'])
@@ -366,10 +368,10 @@ describe('bug 1 — CLI read paths sync tab-group drag-ins via the gateway', () 
 
     const listed = await run(['browser', '--session', 'smoke', 'tab', 'list'])
     const tabs = JSON.parse(listed) as Array<{ pageId: number; url: string }>
-    expect(tabs.map((t) => t.pageId)).toEqual(
-      expect.arrayContaining([dragged.pageId]),
-    )
-    expect(tabs).toHaveLength(2)
+    // D5 v2: the dragged-in tab is NOT claimed, so the agent-scoped list
+    // (filterTabsForAgent) keeps showing only the ledger tab.
+    expect(tabs.map((t) => t.pageId)).not.toContain(dragged.pageId)
+    expect(tabs).toHaveLength(1)
 
     delete (globalThis as any).__HubBrowserBridgeOverride
   })

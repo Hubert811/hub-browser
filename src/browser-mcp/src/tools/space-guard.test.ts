@@ -165,6 +165,142 @@ describe('agent-level tab isolation (3.3) — through executeTool', () => {
     expect(own.isError).toBeFalsy()
   })
 
+  it('tab_groups update/close on a foreign group are rejected (real-run P1-1 hole, 2026-08-22)', async () => {
+    const gateway = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: join(mkdtempSync(join(tmpdir(), 'guard-')), 's.json'),
+      gateway: gateway.gateway,
+      persist: false,
+    })
+    const alice: SpaceIdentity = { agentId: 'alice' }
+    const bob: SpaceIdentity = { agentId: 'bob' }
+    const aSpace = await manager.create('alice', 'a-work')
+    const bSpace = await manager.create('bob', 'b-work')
+    const aTab = await manager.openTab('alice', aSpace.id, 'https://a.example')
+    const bTab = await manager.openTab('bob', bSpace.id, 'https://b.example')
+
+    // The guard maps groupId → tabIds → pageIds, so the fake tabs carry a
+    // tabId (real CDP tabs do) and tabGroupList returns the CDP shape.
+    const groupFor = (id: string, tabId: number) => ({ groupId: id, tabIds: [tabId] })
+    const updated: string[] = []
+    const closed: string[] = []
+    const page = createFakePage({
+      tabs: (async () =>
+        gateway.tabs.map((t) => ({ ...t, tabId: t.pageId }))) as never,
+      tabGroupList: (async () => [
+        { ...groupFor('g-a', aTab), title: 'a' },
+        { ...groupFor('g-b', bTab), title: 'b' },
+      ]) as never,
+      tabGroupUpdate: (async (groupId: string, opts: unknown) => {
+        if (groupId !== 'g-a' && groupId !== 'g-b') {
+          throw new Error(`Unknown tab group ${groupId}`)
+        }
+        updated.push(groupId)
+        const tabIds = groupId === 'g-a' ? [aTab] : [bTab]
+        return { groupId, tabIds, ...(opts as object) }
+      }) as never,
+      tabGroupClose: (async (groupId: string) => {
+        closed.push(groupId)
+      }) as never,
+    })
+    const ctx: ToolContext = {
+      ...makeContext(page),
+      identity: alice,
+      spaces: manager,
+    }
+
+    // Pre-fix these calls addressed the group by groupId only and sailed
+    // through guardToolAccess (its tab_groups branch keyed on args.pages).
+    const upd = await executeTool(
+      tool('tab_groups'),
+      { action: 'update', groupId: 'g-b', title: 'hack' },
+      ctx,
+    )
+    expect(upd.isError).toBe(true)
+    expect(textOf(upd)).toContain('is not in your space')
+
+    const cls = await executeTool(
+      tool('tab_groups'),
+      { action: 'close', groupId: 'g-b' },
+      ctx,
+    )
+    expect(cls.isError).toBe(true)
+    expect(textOf(cls)).toContain('is not in your space')
+
+    // The guard fired before dispatch — the handler never touched the group.
+    expect(updated).toEqual([])
+    expect(closed).toEqual([])
+
+    // Own group still updates fine.
+    const own = await executeTool(
+      tool('tab_groups'),
+      { action: 'update', groupId: 'g-a', title: 'renamed' },
+      ctx,
+    )
+    expect(own.isError).toBeFalsy()
+    expect(updated).toEqual(['g-a'])
+
+    // Unknown group ids fall through to the handler's native error (the
+    // guard only rejects what it can prove is foreign).
+    const unknown = await executeTool(
+      tool('tab_groups'),
+      { action: 'update', groupId: 'g-nope', title: 'x' },
+      ctx,
+    )
+    expect(unknown.isError).toBe(true)
+    expect(textOf(unknown)).not.toContain('is not in your space')
+  })
+
+  it('tab_groups update on the SAME agent\u2019s other space is rejected (space-level finalization, 2026-08-24)', async () => {
+    // The real-run repro shape: one agent, two spaces. The original
+    // groupId-branch fix used the agent-level assertPagesControllable, which
+    // waved this through (both spaces belong to the same owner). The
+    // finalized guard is space-level: a group is the CURRENT space's D5
+    // projection, so members of another space — even the same agent's — are
+    // off-limits.
+    const gateway = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: join(mkdtempSync(join(tmpdir(), 'guard-')), 's.json'),
+      gateway: gateway.gateway,
+      persist: false,
+    })
+    const solo: SpaceIdentity = { agentId: 'solo' }
+    const first = await manager.create('solo', 'first-work')
+    const firstTab = await manager.openTab('solo', first.id, 'https://first.example')
+    const second = await manager.create('solo', 'second-work') // becomes current
+    await manager.openTab('solo', second.id, 'https://second.example')
+
+    const updated: string[] = []
+    const page = createFakePage({
+      tabs: (async () =>
+        gateway.tabs.map((t) => ({ ...t, tabId: t.pageId }))) as never,
+      tabGroupList: (async () => [
+        { groupId: 'g-first', tabIds: [firstTab], title: 'first' },
+      ]) as never,
+      tabGroupUpdate: (async (groupId: string, opts: unknown) => {
+        updated.push(groupId)
+        return { groupId, ...(opts as object) }
+      }) as never,
+    })
+    const ctx: ToolContext = {
+      ...makeContext(page),
+      identity: solo,
+      spaces: manager,
+    }
+
+    // Agent-level check (pre-finalization) allowed this: both spaces are
+    // solo's. Space-level rejects: firstTab belongs to `first`, not the
+    // current space `second`.
+    const upd = await executeTool(
+      tool('tab_groups'),
+      { action: 'update', groupId: 'g-first', title: 'hack' },
+      ctx,
+    )
+    expect(upd.isError).toBe(true)
+    expect(textOf(upd)).toContain('is not in your space')
+    expect(updated).toEqual([])
+  })
+
   it('handoff → agent operations fail with "user is controlling"; confirmed takeover restores them', async () => {
     const gateway = createFakeGateway()
     const manager = new TaskSpaceManager({

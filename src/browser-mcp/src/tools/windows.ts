@@ -24,7 +24,7 @@ export const windows = defineTool({
       .int()
       .optional()
       .describe('Window id for close and activate.'),
-  }),
+  }).strict(),
   annotations: {
     title: 'Manage windows',
     destructiveHint: true,

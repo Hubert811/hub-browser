@@ -51,6 +51,14 @@ export class FakeBrowser {
   downloadSession = new FakeDownloadSession()
   lastUpload?: { ref: string; files: string[] }
   lastClickRef?: string
+  /** P2-6: fake cross-origin frames returned by FakePage.frames(). */
+  framesResult: unknown[] = []
+  /** P2-6 batch 2: fake console messages (page.consoleMessages(level)). */
+  consoleMessagesResult: unknown[] = []
+  /** P2-6 batch 2: fake CDP network capture (page.readNetworkCapture());
+   * empty array → captureNetworkItems falls back to the JS interceptor
+   * (evaluate) path, mirroring a backend without session capture. */
+  networkCaptureResult: unknown[] = []
 
   newTab(url?: string, opts?: { background?: boolean }): { pageId: number; targetId: string } {
     const pageId = this.nextPageId++
@@ -99,6 +107,21 @@ export class FakePage {
     return this.browser.evaluateResult
   }
 
+  /** P2-6: cross-origin iframe targets (feeds the shared frames tool). */
+  async frames() {
+    return this.browser.framesResult
+  }
+
+  /** P2-6 batch 2: console messages (feeds the shared console tool). */
+  async consoleMessages(_level?: string) {
+    return this.browser.consoleMessagesResult
+  }
+
+  /** P2-6 batch 2: CDP session capture (feeds the shared network tool). */
+  async readNetworkCapture() {
+    return this.browser.networkCaptureResult
+  }
+
   async snapshot() {
     return this.browser.snapshotText
   }
@@ -137,6 +160,25 @@ export class FakePage {
 
   async getCurrentUrl() {
     return this.browser.tabs[0]?.url ?? 'https://example.com'
+  }
+
+  /** P2-6 batch 3: site-analysis surface (goto/wait/cookies/capture start). */
+  gotoCalls: string[] = []
+  async goto(url: string) {
+    this.gotoCalls.push(url)
+    return undefined
+  }
+
+  async wait(_seconds?: number) {
+    return undefined
+  }
+
+  async getCookies(_opts: { url: string }) {
+    return [] as Array<{ name: string }>
+  }
+
+  async startNetworkCapture() {
+    return true // session capture available → no JS interceptor injection
   }
 }
 

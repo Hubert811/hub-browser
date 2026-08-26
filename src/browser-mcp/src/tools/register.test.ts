@@ -2,6 +2,13 @@ import { describe, expect, it } from 'bun:test'
 import { registerBrowserTools } from '../register'
 import type { UnifiedPageProvider } from './framework'
 import { BROWSER_TOOLS, SPACE_TOOLS } from './registry'
+import { AUDIT_TOOLS } from './audit-tools'
+import { REPLAY_TOOLS } from './replay-tools'
+import { ADAPTER_TOOLS } from './adapter-tools'
+import { PAGE_INFO_TOOLS } from './page-info'
+import { OBSERVATION_TOOLS } from './observation-tools'
+import { DISCOVERY_TOOLS } from './discovery-tools'
+import { PROBE_TOOLS } from './inspect'
 import { createFakePage, textOf } from './test-helpers'
 
 type RegisteredHandler = (
@@ -75,14 +82,14 @@ describe('registerBrowserTools', () => {
     registerBrowserTools(fake.server as never, providerFor(page as never))
 
     expect([...fake.handlers.keys()]).toEqual(
-      [...BROWSER_TOOLS, ...SPACE_TOOLS].map((tool) => tool.name),
+      [...BROWSER_TOOLS, ...SPACE_TOOLS, ...AUDIT_TOOLS, ...REPLAY_TOOLS, ...ADAPTER_TOOLS, ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS, ...PROBE_TOOLS].map((tool) => tool.name),
     )
     expect(fake.configs.get('tabs')?.inputSchema).toBeDefined()
     expect(
       Object.keys(
         fake.configs.get('tabs')?.inputSchema as Record<string, unknown>,
       ).sort(),
-    ).toEqual(['action', 'background', 'page', 'url'])
+    ).toEqual(['action', 'background', 'page', 'url', 'view'])
     expect(
       Object.keys(
         fake.configs.get('windows')?.inputSchema as Record<string, unknown>,
@@ -196,7 +203,7 @@ describe('registerBrowserTools', () => {
       {
         message: 'Registered browser MCP tools',
         meta: expect.objectContaining({
-          count: BROWSER_TOOLS.length + SPACE_TOOLS.length,
+          count: BROWSER_TOOLS.length + SPACE_TOOLS.length + AUDIT_TOOLS.length + REPLAY_TOOLS.length + ADAPTER_TOOLS.length + PAGE_INFO_TOOLS.length + OBSERVATION_TOOLS.length + DISCOVERY_TOOLS.length + PROBE_TOOLS.length,
           source: 'unit-test',
         }),
       },
@@ -268,7 +275,13 @@ describe('registerBrowserTools', () => {
       action: 'new',
       url: 'https://example.com',
     })
-    await Promise.resolve()
+    // p18 made the pre-newTab pipeline async (identity resolve + audit +
+    // guard await), so one microtask no longer reaches page.newTab — drain
+    // microtasks until the pending newTab executor has captured its resolver,
+    // otherwise resolveNewTab?.() is a no-op and `await run` hangs forever.
+    for (let i = 0; i < 200 && resolveNewTab === undefined; i++) {
+      await Promise.resolve()
+    }
 
     expect(starts).toEqual([{ tool_name: 'tabs', source: 'unit-test' }])
     expect(ends).toEqual([])

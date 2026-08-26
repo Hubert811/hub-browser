@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { ownerOf } from '../../../space/task-space-manager.js'
 import { defineTool, errorResult, textResult } from './framework'
 
 const TAB_GROUP_COLORS = [
@@ -59,7 +60,7 @@ export const tab_groups = defineTool({
       .boolean()
       .optional()
       .describe('Collapse/expand the group for "update".'),
-  }),
+  }).strict(),
   annotations: {
     title: 'Manage tab groups',
     destructiveHint: true,
@@ -142,7 +143,7 @@ export const tab_groups = defineTool({
           // Phase 3 3.4: a new group created while the agent has a current
           // space defaults to the space name + a deterministic color.
           const meta = await ctx.spaces.currentSpaceGroupMeta(
-            ctx.identity.agentId,
+            ownerOf(ctx.identity),
           )
           if (title === undefined) title = meta.title
           if (color === undefined) color = meta.color

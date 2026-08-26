@@ -183,6 +183,7 @@ DONE
         [ ] 首轮通过后立刻 `--write-fixture` 生成 `~/.hub/config/sites/<site>/verify/<cmd>.json` 种子
         [ ] 手改种子：加 `patterns`（URL / 日期 / ID 格式）+ `notEmpty`（核心字段）+ 收紧 `rowCount`
         [ ] 再跑一次 `hub browser <s> verify <site>/<name>`，确认 ✓ matches fixture
+        [ ] **发布门槛（硬性）**：把改好的 fixture 提交到 `clis/<site>/__fixtures__/verify/<cmd>.json`（随 adapter 源码沉淀，verify 会自动读它——用户目录版本仅作本地覆盖）；`hub browser <s> verify <site>/<name> --require-fixture` 是最终门——fixture 不在效就非零退出，没有 fixture 的 adapter 不算写完
 [ ] 11. 字段值 vs 网页肉眼比对（别只看 "Adapter works!"）
 [ ] 12. 回写站点记忆（**verify 通过 + 肉眼比对对得上之后**，schema 见 `references/site-memory.md`）：
         [ ] `endpoints.json`：以 endpoint 的短名为 key，value = `{url, method, params.{required,optional}, response, verified_at: YYYY-MM-DD, notes}`

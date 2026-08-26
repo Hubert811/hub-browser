@@ -1,6 +1,11 @@
 /**
  * Phase 4.7 — `opencli browser pdf`, `browser download`, `browser upload`
  * (thin wrappers over the fork pdf/download/upload tools). Fake bridge, no CDP.
+ *
+ * P1-4: the fork wrappers now run behind the executeTool space gate, so makeEnv
+ * presets a space owning the fake page (100) — these tests exercise the
+ * wrapper output formats, not the guard (guard coverage lives in
+ * space-browser-tab-guard.test.ts).
  */
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
 import { createProgram } from '../src/opencli-engine/cli.js'
@@ -11,8 +16,9 @@ import { FakeBrowser, installFakeBridge, uninstallFakeBridge } from './helpers/f
 
 const BUILTIN_CLIS = path.join(process.cwd(), 'clis')
 const USER_CLIS = path.join(os.homedir(), '.hub', 'clis')
+const GATE_OWNER = 'phase4-cli'
 
-function makeEnv() {
+async function makeEnv() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pdf-dl-ul-'))
   const cacheDir = path.join(tmp, 'cache')
   const browserosDir = path.join(tmp, 'browseros')
@@ -20,6 +26,14 @@ function makeEnv() {
   browser.tabs.push({ pageId: 100, targetId: 'target-100', url: 'https://example.com', isActive: true })
   installFakeBridge(browser)
   const program = createProgram(BUILTIN_CLIS, USER_CLIS)
+  // Space-gate preset: one space owned by GATE_OWNER with the fake page in it.
+  const ledger = path.join(tmp, 'hub-spaces.json')
+  process.env.HUB_SPACES_FILE = ledger
+  process.env.HUB_AGENT_ID = GATE_OWNER
+  const { TaskSpaceManager } = await import('../src/space/task-space-manager.ts')
+  const manager = new TaskSpaceManager({ storagePath: ledger })
+  await manager.create(GATE_OWNER, 'phase4')
+  await manager.recordTabForCurrentSpace(GATE_OWNER, 100, 'https://example.com')
   return {
     tmp,
     cacheDir,
@@ -50,11 +64,13 @@ describe('opencli browser pdf (Phase 4.7)', () => {
     uninstallFakeBridge()
     delete process.env.OPENCLI_CACHE_DIR
     delete process.env.BROWSEROS_DIR
+    delete process.env.HUB_SPACES_FILE
+    delete process.env.HUB_AGENT_ID
     process.exitCode = 0
   })
 
   it('prints the tool output path when no --path is given', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const out = await env.run(['browser', '--session', 'work', 'pdf'])
     expect(out).toContain('Saved page 100 as PDF')
     expect(out).toMatch(/\.pdf$/)
@@ -63,7 +79,7 @@ describe('opencli browser pdf (Phase 4.7)', () => {
   })
 
   it('--path copies the generated PDF and reports the requested path', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const target = path.join(env.tmp, 'out', 'page.pdf')
     const out = await env.run(['browser', '--session', 'work', 'pdf', '--path', target])
     expect(out).toContain(target)
@@ -72,7 +88,7 @@ describe('opencli browser pdf (Phase 4.7)', () => {
   })
 
   it('--json prints the structured envelope with the path', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const target = path.join(env.tmp, 'page2.pdf')
     const out = await env.run(['browser', '--session', 'work', 'pdf', '--path', target, '--json'])
     const parsed = JSON.parse(out) as { path: string; bytes: number }
@@ -87,11 +103,13 @@ describe('opencli browser download (Phase 4.7)', () => {
     uninstallFakeBridge()
     delete process.env.OPENCLI_CACHE_DIR
     delete process.env.BROWSEROS_DIR
+    delete process.env.HUB_SPACES_FILE
+    delete process.env.HUB_AGENT_ID
     process.exitCode = 0
   })
 
   it('clicks the ref and reports the saved download path', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const out = await env.run(['browser', '--session', 'work', 'download', '5'])
     expect(env.browser.lastClickRef).toBe('5')
     expect(out).toContain('Downloaded "report.csv" to:')
@@ -99,13 +117,13 @@ describe('opencli browser download (Phase 4.7)', () => {
   })
 
   it('strips a leading @ from the ref', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     await env.run(['browser', '--session', 'work', 'download', '@5'])
     expect(env.browser.lastClickRef).toBe('5')
   })
 
   it('--json prints the structured download envelope', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const out = await env.run(['browser', '--session', 'work', 'download', '5', '--json'])
     const parsed = JSON.parse(out) as { ref: string; filename: string }
     expect(parsed.ref).toBe('5')
@@ -119,11 +137,13 @@ describe('opencli browser upload (Phase 4.7)', () => {
     uninstallFakeBridge()
     delete process.env.OPENCLI_CACHE_DIR
     delete process.env.BROWSEROS_DIR
+    delete process.env.HUB_SPACES_FILE
+    delete process.env.HUB_AGENT_ID
     process.exitCode = 0
   })
 
   it('--file uploads a single file through the fork upload tool', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const filePath = path.join(env.tmp, 'a.pdf')
     fs.writeFileSync(filePath, 'pdf')
     const out = await env.run(['browser', '--session', 'work', 'upload', '@5', '--file', filePath])
@@ -132,7 +152,7 @@ describe('opencli browser upload (Phase 4.7)', () => {
   })
 
   it('--files accepts a comma-separated list plus positional files', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const a = path.join(env.tmp, 'a.pdf')
     const b = path.join(env.tmp, 'b.pdf')
     fs.writeFileSync(a, 'a')
@@ -143,7 +163,7 @@ describe('opencli browser upload (Phase 4.7)', () => {
   })
 
   it('--json prints the fork tool structured envelope', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const filePath = path.join(env.tmp, 'c.pdf')
     fs.writeFileSync(filePath, 'c')
     const out = await env.run(['browser', '--session', 'work', 'upload', '5', '--file', filePath, '--json'])
@@ -153,7 +173,7 @@ describe('opencli browser upload (Phase 4.7)', () => {
   })
 
   it('missing files produce a friendly error', async () => {
-    const env = makeEnv()
+    const env = await makeEnv()
     const out = await env.run(['browser', '--session', 'work', 'upload', '5', '--file', '/nope/does-not-exist.pdf'])
     expect(JSON.parse(out) as { error: { code: string } }).toMatchObject({ error: { code: 'file_not_found' } })
   })

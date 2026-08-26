@@ -29,7 +29,9 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { hubUserRoot } from '../discovery.js';
+import { findPackageRoot } from '../package-paths.js';
 const DEFAULT_MAX_TOP_LEVEL_KEYS = 12;
 const DEFAULT_MAX_NESTED_DEPTH = 1;
 const ID_SHAPED_KEY_PATTERNS = [
@@ -53,18 +55,46 @@ const ID_SHAPED_KEY_PATTERNS = [
 export function fixturePath(site, command) {
     return path.join(hubUserRoot(), 'config', 'sites', site, 'verify', `${command}.json`);
 }
-export function loadFixture(site, command) {
-    const p = fixturePath(site, command);
-    if (!fs.existsSync(p))
-        return null;
-    try {
-        const raw = fs.readFileSync(p, 'utf-8');
-        const parsed = JSON.parse(raw);
-        return parsed;
+/**
+ * P2-7 — builtin co-located fixture path:
+ * `clis/<site>/__fixtures__/verify/<command>.json`.
+ *
+ * The historical fixture location (~/.hub/config/sites/...) is user-local
+ * and never committed, so builtin adapters could not ship their shape
+ * contracts. The co-located path travels with the adapter source (and the
+ * published package); the user path stays the override (resolveFixture
+ * checks it first). clisRoot is a test seam — production always resolves
+ * the installed builtin clis tree.
+ */
+export function builtinFixturePath(site, command, clisRoot) {
+    const root = clisRoot ?? path.join(findPackageRoot(fileURLToPath(import.meta.url)), 'clis');
+    return path.join(root, site, '__fixtures__', 'verify', `${command}.json`);
+}
+/**
+ * P2-7 — resolution matrix: user fixture (override) first, then the builtin
+ * co-located fixture. Returns null when neither exists; throws on an
+ * unparseable candidate (the old loadFixture contract).
+ */
+export function resolveFixture(site, command, opts) {
+    const candidates = [
+        { path: fixturePath(site, command), source: 'user' },
+        { path: builtinFixturePath(site, command, opts?.clisRoot), source: 'builtin' },
+    ];
+    for (const candidate of candidates) {
+        if (!fs.existsSync(candidate.path))
+            continue;
+        try {
+            const parsed = JSON.parse(fs.readFileSync(candidate.path, 'utf-8'));
+            return { fixture: parsed, path: candidate.path, source: candidate.source };
+        }
+        catch (err) {
+            throw new Error(`Failed to parse fixture ${candidate.path}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
-    catch (err) {
-        throw new Error(`Failed to parse fixture ${p}: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    return null;
+}
+export function loadFixture(site, command, opts) {
+    return resolveFixture(site, command, opts)?.fixture ?? null;
 }
 export function writeFixture(site, command, fixture) {
     const p = fixturePath(site, command);
