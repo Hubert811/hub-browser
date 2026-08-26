@@ -112,6 +112,11 @@ export async function captureNetworkItems(page) {
                     size: fullSize,
                     ct: e.responseContentType || '',
                     body,
+                    // C1: request body captured by the collector — the other
+                    // half of an API's contract (response bodies alone are
+                    // not enough to replay a POST).
+                    ...(typeof e.requestBody === 'string' ? { requestBody: e.requestBody } : {}),
+                    ...(e.requestBodyTruncated === true ? { requestBodyTruncated: true } : {}),
                     bodyFullSize: fullSize,
                     bodyTruncated: truncated,
                     timestamp: timestampFromRaw(e.timestamp),
@@ -135,6 +140,10 @@ export async function captureNetworkItems(page) {
 export function filterNetworkItems(items) {
     return items.filter((r) => {
         const ct = r.ct?.toLowerCase() ?? '';
+        // C4: data:/blob: URIs (inline svg icons and friends) are page
+        // furniture, not network traffic — keep them out of the default view.
+        if (/^(data|blob):/i.test(r.url))
+            return false;
         return ((ct.includes('json') || ct.includes('xml') || ct.includes('text/plain') || ct.includes('javascript')) &&
             !/\.(js|css|png|jpg|gif|svg|woff|ico|map)(\?|$)/i.test(r.url) &&
             !/analytics|tracking|telemetry|beacon|pixel|gtag|fbevents/i.test(r.url));
@@ -151,6 +160,18 @@ export function filterNetworkItems(items) {
  */
 export async function runNetworkQuery(page, opts = {}) {
     const session = pageSessionOf(page);
+    // A2 fix: a bare network query used to read a never-started collector and
+    // report "Captured 0 requests" while the page had fired dozens — the
+    // caller had to know analyze (of all tools) was the secret to switch
+    // capture on. Ensure the collector is running; when THIS call started it,
+    // history begins now and the envelope says so.
+    let captureStartedNow = false;
+    try {
+        if (typeof page.ensureNetworkCapture === 'function') {
+            captureStartedNow = await page.ensureNetworkCapture();
+        }
+    }
+    catch { /* fall through to the read below */ }
     let rawItems;
     try {
         rawItems = await captureNetworkItems(page);
@@ -172,6 +193,8 @@ export async function runNetworkQuery(page, opts = {}) {
         size: it.size,
         ct: it.ct,
         body: it.body,
+        ...(typeof it.requestBody === 'string' ? { requestBody: it.requestBody } : {}),
+        ...(it.requestBodyTruncated === true ? { requestBodyTruncated: true } : {}),
         ...(typeof it.timestamp === 'number' ? { timestamp: it.timestamp } : {}),
         ...(it.bodyTruncated ? { body_truncated: true } : {}),
         ...(it.bodyTruncated && typeof it.bodyFullSize === 'number'
@@ -209,6 +232,10 @@ export async function runNetworkQuery(page, opts = {}) {
     }
     if (cacheWarning)
         envelope.cache_warning = cacheWarning;
+    if (captureStartedNow) {
+        envelope.capture_started_now = true;
+        envelope.capture_hint = 'Capture started with this query — only requests from this moment on are visible. Re-trigger the page action (click, navigate) and query again.';
+    }
     const truncatedCount = visible.filter((s) => s.entry.body_truncated).length;
     if (truncatedCount > 0) {
         envelope.body_truncated_count = truncatedCount;
@@ -270,6 +297,15 @@ export function runNetworkDetail(session, key, opts = {}) {
         transportTruncated = true;
     }
     const captureTruncated = entry.body_truncated === true;
+    // C1: request body (POST payload) — parse as JSON when possible so the
+    // adapter author can lift filter objects straight from it.
+    let requestBody = entry.requestBody ?? null;
+    if (typeof requestBody === 'string') {
+        try {
+            requestBody = JSON.parse(requestBody);
+        }
+        catch { /* keep the raw string */ }
+    }
     const detailEnvelope = {
         key: entry.key,
         url: entry.url,
@@ -280,6 +316,8 @@ export function runNetworkDetail(session, key, opts = {}) {
         ...(typeof entry.timestamp === 'number' ? { timestamp: toIsoTimestamp(entry.timestamp) } : {}),
         shape: inferShape(entry.body),
         body: outputBody,
+        ...(requestBody !== null ? { requestBody } : {}),
+        ...(entry.requestBodyTruncated === true ? { requestBodyTruncated: true } : {}),
     };
     if (captureTruncated || transportTruncated) {
         detailEnvelope.body_truncated = true;
@@ -320,19 +358,24 @@ export async function runConsoleQuery(page, opts = {}) {
             ? type === 'error' || type === 'warning'
             : type === String(level).toLowerCase();
     });
+    // A2 (console twin): the collector starts on first contact — messages
+    // logged before this process's first console query are not visible. The
+    // envelope says so when the buffer is empty rather than letting "0
+    // messages" read as "the page logged nothing".
     const messages = filter(normalize(await page.consoleMessages(level)));
-    return {
-        ok: true,
-        envelope: {
-            session,
-            captured_at: new Date().toISOString(),
-            count: messages.length,
-            messages: messages.map((message) => ({
-                ...message,
-                timestamp: toIsoTimestamp(message.timestamp),
-            })),
-        },
+    const envelope = {
+        session,
+        captured_at: new Date().toISOString(),
+        count: messages.length,
+        messages: messages.map((message) => ({
+            ...message,
+            timestamp: toIsoTimestamp(message.timestamp),
+        })),
     };
+    if (messages.length === 0) {
+        envelope.capture_hint = 'Console capture starts on first query per process — earlier messages are not retained. Re-trigger the action and query again.';
+    }
+    return { ok: true, envelope };
 }
 
 // ── find (structured CSS / semantic-locator query) ──────────────────────────

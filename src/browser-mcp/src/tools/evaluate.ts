@@ -20,6 +20,13 @@ export const evaluate = defineTool({
       .describe(
         'Async-capable JS body evaluated inside the page. Use `return` to read a value.',
       ),
+    frame: z
+      .number()
+      .int()
+      .optional()
+      .describe(
+        'Frame index from the `frames` tool (0 = main frame). Omit to evaluate in the main frame. Same-origin and cross-origin (OOPIF) frames are both supported.',
+      ),
     timeout: z
       .number()
       .optional()
@@ -40,8 +47,13 @@ export const evaluate = defineTool({
 
     let value: unknown
     try {
+      // A1: the `frames` tool promises "pass the index to evaluate's frame
+      // option" — this is that option. Frames 1+ route to the frame's own
+      // session (isolated world), so JS lands inside the iframe, not the shell.
       value = await withTimeout(
-        page.evaluate(`(async () => {\n${args.code}\n})()`),
+        args.frame !== undefined && typeof page.evaluateInFrame === 'function'
+          ? page.evaluateInFrame(`(async () => {\n${args.code}\n})()`, args.frame)
+          : page.evaluate(`(async () => {\n${args.code}\n})()`),
         timeout,
       )
     } catch (err) {

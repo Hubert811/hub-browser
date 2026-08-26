@@ -83,12 +83,29 @@ export const find = defineTool({
     if (outcome.ok === false) return queryError(outcome)
     const result = (outcome.result ?? {}) as {
       matches_n?: number
-      entries?: Array<{ ref?: string; text?: string }>
+      entries?: Array<{
+        ref?: string | number
+        tag?: string
+        text?: string
+        attrs?: Record<string, string>
+      }>
     }
     const n = result.matches_n ?? 0
     const lines = [`find: ${n} match(es).`, '']
     for (const e of (result.entries ?? []).slice(0, 20)) {
-      lines.push(`- [${e.ref ?? '?'}] ${String(e.text ?? '').slice(0, 80)}`)
+      // A4: inputs/buttons have no textContent — the tag + whitelisted attrs
+      // (placeholder/name/value…) are what identify them. attrs lives in the
+      // structured envelope; surface the high-signal ones in the text too.
+      const tag = e.tag ? `<${e.tag}>` : ''
+      const attrs = e.attrs ?? {}
+      const attrBits = ['placeholder', 'name', 'value', 'type', 'aria-label', 'id', 'data-testid']
+        .filter((k) => typeof attrs[k] === 'string' && attrs[k] !== '')
+        .slice(0, 3)
+        .map((k) => `${k}=${JSON.stringify(attrs[k])}`)
+        .join(' ')
+      const text = String(e.text ?? '').slice(0, 60)
+      const bits = [tag, attrBits, text].filter((b) => b !== '').join(' ')
+      lines.push(`- [${e.ref ?? '?'}] ${bits || '(no identifying info — see structuredContent)'}`)
     }
     if (n > 20) lines.push(`... and ${n - 20} more`)
     return {
@@ -121,7 +138,12 @@ export const analyze = defineTool({
     const outcome = (await runSiteAnalysis(page, args.url)) as QueryOutcome
     if (outcome.ok === false) return queryError(outcome)
     const report = (outcome.report ?? {}) as Record<string, unknown>
-    const pattern = String(report.pattern ?? '?')
+    // A3: report.pattern is the classifyPattern() RESULT ({pattern, reason,
+    // …}) — printing the object itself renders "[object Object]".
+    const patternInfo = report.pattern as { pattern?: string; reason?: string } | string | undefined
+    const pattern = typeof patternInfo === 'object' && patternInfo !== null
+      ? `${patternInfo.pattern ?? '?'} (${String(patternInfo.reason ?? '').slice(0, 80)})`
+      : String(patternInfo ?? '?')
     const antiBot = String(
       (report.antiBot as { vendor?: string } | undefined)?.vendor ?? 'none',
     )

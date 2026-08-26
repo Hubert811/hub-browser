@@ -24,23 +24,25 @@ const DEFAULT_CHUNK_SIZE = 20000
 export const frames = defineTool({
   name: 'frames',
   description:
-    'List cross-origin iframe targets on the page in snapshot order. Each entry carries a target id and URL; pass the 0-based index to evaluate\'s frame option to run JS inside that frame.',
+    'List the page\'s frames in frame-tree order: [0] is the main frame, then every iframe (same-origin or cross-origin) with its kind. Pass the index to evaluate\'s frame option to run JS inside that frame.',
   input: z
     .object({
       page: z.number().int(),
     })
     .strict(),
-  annotations: { title: 'List cross-origin frames', readOnlyHint: true },
+  annotations: { title: 'List frames', readOnlyHint: true },
   handler: async (args, ctx) => {
     const page = await ctx.pageFor(args.page)
     const frames = (await page.frames?.()) ?? []
-    if (frames.length === 0) {
-      return textResult('(no cross-origin frames)', { frames: [], count: 0 })
+    if (frames.length <= 1 && (frames[0] as { kind?: string } | undefined)?.kind !== 'same-origin') {
+      // A single main frame only — the page has no iframes worth reporting.
+      return textResult('(no iframes — main frame only)', { frames, count: frames.length })
     }
-    const lines = [`Cross-origin frames (${frames.length}):`, '']
+    const lines = [`Frames (${frames.length}; pass the index to evaluate's frame option):`, '']
     frames.forEach((frame: unknown, i: number) => {
-      const f = frame as { url?: string; targetId?: string }
-      lines.push(`- [${i}] ${f.url ?? '(unknown url)'} (target ${f.targetId ?? '?'})`)
+      const f = frame as { url?: string; kind?: string; name?: string }
+      const label = i === 0 ? 'main' : (f.kind ?? 'iframe')
+      lines.push(`- [${i}] (${label}) ${f.url ?? '(unknown url)'}`)
     })
     return textResult(lines.join('\n'), { frames, count: frames.length })
   },

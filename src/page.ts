@@ -7,6 +7,17 @@ import type { ProtocolApi } from '@browseros/cdp-protocol/protocol-api';
 import type { CdpBackend } from '@browseros/browser-core';
 import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, SnapshotOptions } from './opencli/types.js';
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
+
+/**
+ * B1 fix — observation collectors must outlive UnifiedPage instances.
+ * The CLI rebuilds a page object per command and each MCP process caches its
+ * own; collectors held on the instance (the old `_console`/`_network` fields)
+ * died with it, silently zeroing captured history — the same class of bug
+ * P2-8 fixed for AX refs (Observer.lastRefs on the BrowserSession singleton).
+ * Keyed WeakMap on BrowserSession: alive as long as the process's connection.
+ */
+const consoleCollectors = new WeakMap<BrowserSession, Map<number, ConsoleCollector>>();
+const networkCollectors = new WeakMap<BrowserSession, Map<number, NetworkCollector>>();
 import { resolveCdpPort } from './cdp-port.js';
 
 /**
@@ -42,8 +53,7 @@ export class UnifiedPage extends BasePage {
   private _uaOverrideSessionId: string | null = null;
   /** Set when this tab's capture pipeline was detected wedged (screenshot hang). */
   private _screenshotWedged = false;
- private _console: ConsoleCollector | null = null;
- private _network: NetworkCollector | null = null;
+
  private _executionContexts = new Map<string, number>();
 private _ctxEventSub: (() => void) | null = null;
 private _ctxEventSub2: (() => void) | null = null;
@@ -247,14 +257,12 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     if (!page) {
       throw new Error(`Tab not found: ${target}`);
     }
+    const previousPageId = this.pageId;
     this.pageId = (page as any).pageId;
     this.resetPageState();
     this._stealthInjected = false;
     this._screenshotWedged = false;
-    this._console?.stop();
-    this._console = null;
-    await this._network?.stop();
-    this._network = null;
+    await this.dropObservationCollectors(previousPageId);
     this.clearExecutionContexts();
     // Re-register stealth for the new tab's CDP session
     const { session } = await this._browserSession.pages.getSession(this.pageId);
@@ -275,15 +283,13 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     url?: string,
     opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
   ): Promise<string | undefined> {
+    const previousPageId = this.pageId;
     const newPageId = await this._browserSession.pages.newPage(url ?? 'about:blank', opts);
     this.pageId = newPageId;
     this.resetPageState();
     this._stealthInjected = false;
     this._screenshotWedged = false;
-    this._console?.stop();
-    this._console = null;
-    await this._network?.stop();
-    this._network = null;
+    await this.dropObservationCollectors(previousPageId);
     this.clearExecutionContexts();
     // Register stealth for the new tab's CDP session
     const { session } = await this._browserSession.pages.getSession(this.pageId);
@@ -315,6 +321,7 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     if (pageId === this.pageId) {
       const remaining = await this._browserSession.pages.list();
       if (remaining.length > 0) {
+        const closedPageId = this.pageId;
         this.pageId = (remaining[0] as any).pageId;
         this.resetPageState();
         this._stealthInjected = false;
@@ -322,10 +329,7 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
         // P2: rebound to a remaining tab whose CDP session may not carry the
         // full-Chrome UA override yet (idempotent per sessionId).
         await this.ensureUserAgentOverride();
-        this._console?.stop();
-        this._console = null;
-        await this._network?.stop();
-        this._network = null;
+        await this.dropObservationCollectors(closedPageId);
         this.clearExecutionContexts();
       }
     }
@@ -416,6 +420,7 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     const pages = await this._browserSession.pages.list();
     const match = pages.find((p: any) => p.targetId === targetId);
     if (!match) throw new Error(`Tab not found: ${targetId}`);
+    const previousPageId = this.pageId;
     this.pageId = (match as any).pageId;
     this.resetPageState();
     this._stealthInjected = false;
@@ -423,20 +428,14 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     // P2: the newly-bound tab has its own CDP session — apply the full-Chrome
     // UA override (idempotent per sessionId).
     await this.ensureUserAgentOverride();
-    this._console?.stop();
-    this._console = null;
-    await this._network?.stop();
-    this._network = null;
+    await this.dropObservationCollectors(previousPageId);
     this.clearExecutionContexts();
   }
 
   /** Close CDP connection and release all resources. */
   async close(): Promise<void> {
     this.clearExecutionContexts();
-    this._console?.stop();
-    this._console = null;
-    await this._network?.stop();
-    this._network = null;
+    await this.dropObservationCollectors(this.pageId);
     await this._browserSession?.dispose?.();
     await this.cdpBackend?.disconnect?.();
   }
@@ -659,56 +658,164 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
     return this._browserSession.observe(this.pageId).inspectRef(ref);
   }
 
-  // ── consoleMessages (event-bridge) ──
+  // ── console messages (event-bridge, B1: session-scoped collector) ──
   override async consoleMessages(level: string = 'all'): Promise<unknown[]> {
-    if (!this._console) {
-      const { sessionId } = await this._browserSession.pages.getSession(this.pageId);
-      this._console = new ConsoleCollector(this.cdpBackend, sessionId);
-      await this._console.start();
-    }
-    return this._console.get(level);
+    const collector = await this.ensureConsoleCollector();
+    return collector.get(level);
   }
 
-  // ── network capture (event-bridge) ──
-  async startNetworkCapture(pattern: string = ''): Promise<boolean> {
-    if (!this._network) {
-      const { sessionId } = await this._browserSession.pages.getSession(this.pageId);
-      this._network = new NetworkCollector(this.cdpBackend, sessionId);
+  private async ensureConsoleCollector(): Promise<ConsoleCollector> {
+    let byPage = consoleCollectors.get(this._browserSession);
+    if (!byPage) {
+      byPage = new Map();
+      consoleCollectors.set(this._browserSession, byPage);
     }
-    await this._network.start(pattern);
+    let collector = byPage.get(this.pageId);
+    if (!collector) {
+      const { sessionId } = await this._browserSession.pages.getSession(this.pageId);
+      collector = new ConsoleCollector(this.cdpBackend, sessionId);
+      byPage.set(this.pageId, collector);
+    }
+    await collector.start(); // idempotent
+    return collector;
+  }
+
+  // ── network capture (event-bridge, B1: session-scoped collector) ──
+  async startNetworkCapture(pattern: string = ''): Promise<boolean> {
+    const collector = await this.ensureNetworkCollector();
+    await collector.start(pattern);
     return true;
   }
 
+  /**
+   * A2 fix — start capture if it is idle, so a bare `network` query never
+   * reports "Captured 0 requests" just because nobody started the collector.
+   * Returns true when capture was started by THIS call (the caller surfaces
+   * a hint that only requests from now on are visible).
+   */
+  async ensureNetworkCapture(): Promise<boolean> {
+    const collector = await this.ensureNetworkCollector();
+    const wasIdle = !collector.capturing;
+    await collector.start('');
+    return wasIdle;
+  }
+
+  private async ensureNetworkCollector(): Promise<NetworkCollector> {
+    let byPage = networkCollectors.get(this._browserSession);
+    if (!byPage) {
+      byPage = new Map();
+      networkCollectors.set(this._browserSession, byPage);
+    }
+    let collector = byPage.get(this.pageId);
+    if (!collector) {
+      const { sessionId } = await this._browserSession.pages.getSession(this.pageId);
+      collector = new NetworkCollector(this.cdpBackend, sessionId);
+      byPage.set(this.pageId, collector);
+    }
+    return collector;
+  }
+
   async readNetworkCapture(): Promise<unknown[]> {
-    return this._network?.read() ?? [];
+    // Only an already-running collector has history; starting one here would
+    // be a silent side effect on a read path (and still see zero requests).
+    const collector = networkCollectors.get(this._browserSession)?.get(this.pageId);
+    return collector?.read() ?? [];
+  }
+
+  /** Stop and forget the observation collectors of a page (tab switched away/closed). */
+  private async dropObservationCollectors(pageId: number): Promise<void> {
+    const cm = consoleCollectors.get(this._browserSession);
+    const consoleCollector = cm?.get(pageId);
+    if (consoleCollector) {
+      consoleCollector.stop();
+      cm!.delete(pageId);
+    }
+    const nm = networkCollectors.get(this._browserSession);
+    const networkCollector = nm?.get(pageId);
+    if (networkCollector) {
+      await networkCollector.stop();
+      nm!.delete(pageId);
+    }
   }
 
   // ── frames (wujie iframe support) ──
-  async frames(): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
+  async frames(): Promise<
+    Array<{ index: number; frameId: string; url: string; name: string; kind: 'main' | 'same-origin' | 'cross-origin' }>
+  > {
     const { session } = await this._browserSession.pages.getSession(this.pageId);
     const result = await session.Page.getFrameTree();
     const tree = (result as any).frameTree;
-    const list: Array<{ index: number; frameId: string; url: string; name: string }> = [];
+    const list: Array<
+      { index: number; frameId: string; url: string; name: string; kind: 'main' | 'same-origin' | 'cross-origin' }
+    > = [];
     let index = 0;
-    function walk(node: any) {
+    const originOf = (url: string): string => {
+      try {
+        return new URL(url).origin;
+      } catch {
+        return url;
+      }
+    };
+    const walk = (node: any) => {
       if (!node?.frame) return;
+      const url = node.frame.url || '';
+      let kind: 'main' | 'same-origin' | 'cross-origin' = 'main';
+      if (index > 0) {
+        const mainUrl = tree?.frame?.url || '';
+        kind = originOf(url) === originOf(mainUrl) ? 'same-origin' : 'cross-origin';
+      }
       list.push({
         index: index++,
         frameId: node.frame.id || '',
-        url: node.frame.url || '',
+        url,
         name: node.frame.name || '',
+        kind,
       });
       for (const child of node.childFrames || []) walk(child);
-    }
+    };
     walk(tree);
     return list;
   }
 
- // ── evaluateInFrame (wujie iframe support) ──
+ // ── evaluateInFrame (wujie iframe support; A1: frames -> evaluate contract) ──
  async evaluateInFrame(js: string, frameIndex: number): Promise<unknown> {
    const frames = await this.frames();
    const frame = frames[frameIndex];
    if (!frame) throw new Error(`Frame ${frameIndex} not found`);
+   // A1: deterministic path — resolve the frame's own CDP session (page
+   // session for same-origin frames, a dedicated session for OOPIF) and
+   // evaluate inside a fresh isolated world. Works for both origins; the
+   // legacy fallbacks below only cover same-origin frames.
+   try {
+     const target = this._browserSession.frameTarget(this.pageId, frame.frameId);
+     const world = await target.session.Page.createIsolatedWorld({
+       frameId: frame.frameId,
+       worldName: 'hub-evaluate',
+       grantUniveralAccess: false,
+     });
+     if (world.executionContextId !== undefined) {
+       const { buildEvaluateExpression } = await import('./opencli/utils.js');
+       const expression = buildEvaluateExpression(js, []);
+       const result = await target.session.Runtime.evaluate({
+         expression,
+         contextId: world.executionContextId,
+         returnByValue: true,
+         awaitPromise: true,
+       });
+       if (result.exceptionDetails) {
+         throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
+       }
+       return result.result?.value;
+     }
+   } catch (err) {
+     if (frame.kind === 'cross-origin') {
+       throw new Error(
+         `Frame ${frameIndex} is cross-origin and its session could not be resolved: ` +
+           `${(err as Error).message}`,
+       );
+     }
+     // same-origin: fall through to the legacy paths below
+   }
    await this.ensureRuntimeEnabled();
    const ctxId = this._executionContexts.get(frame.frameId);
    const { buildEvaluateExpression } = await import('./opencli/utils.js');

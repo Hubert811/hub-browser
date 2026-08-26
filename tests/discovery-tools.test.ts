@@ -32,7 +32,12 @@ describe('find tool (P2-6 batch 3)', () => {
     const result = await executeTool(find, { page: 1, css: '.btn' }, makeContext(page))
     expect(result.isError).toBeFalsy()
     expect(result.structuredContent).toEqual(FIND_RESULT)
-    expect(String((result.content as { text?: string }[])[0]?.text)).toContain('[e1] Save')
+    const text = String((result.content as { text?: string }[])[0]?.text)
+    expect(text).toContain('[e1]')
+    expect(text).toContain('Save')
+    // A4: the tag is surfaced in the text (inputs/buttons have no text —
+    // the tag + attrs are what identify them).
+    expect(text).toContain('<button>')
   })
 
   it('semantic locator fields build the semantic find expression', async () => {

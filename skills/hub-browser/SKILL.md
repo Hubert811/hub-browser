@@ -97,12 +97,12 @@ CLI 等价：`hub browser <session> tab list` / `hub browser <session> tab close
 | `read` | 提取页面内容：markdown / 纯文本 / 链接列表 | 读内容、抓数据；只读不操作 |
 | `extract` | 去噪 markdown（剥广告/导航），长页按段落感知分块：返回 content + `next_start_char`，回传即续读 | 长文/正文抓取；比 read 干净，超长页不用一次 dump |
 | `grep` | 在 ax 行或可见文本里搜索，不 dump 全页 | 只想知道页面上有没有某内容 |
-| `network` | 抓网络请求为 body-shape 预览（每条带稳定 key）；`detail=<key>` 取完整 body，`filter` 按字段名收窄，`failed` 只看失败请求 | 找隐藏 API、复现请求、排错；先跑一次拿 key 再取详情 |
+| `network` | 抓网络请求为 body-shape 预览（每条带稳定 key）；`detail=<key>` 取完整 body（含 POST 请求体），`filter` 按字段名收窄，`failed` 只看失败请求；未开捕获时自动开启（首条输出带提示——只记录开启之后的请求，历史不回放），`data:` URI 默认滤除 | 找隐藏 API、复现请求、排错；先跑一次拿 key 再取详情；捕获跨命令/跨进程存活 |
 | `console` | 读最近 console 消息；level 过滤（error 含 warning），sinceMs/untilMs 时间窗 | 页面行为异常时先看报错，再决定要不要 evaluate |
 | `analyze` | 站点侦察：导航 → 抓网络 → 探 cookies/initial-state → 分类（反爬厂商、真数据 API 候选、页面模式 A/B/C/D、最近适配器、建议下一步） | 规划抓取新站点的第一步 |
 | `diff` | 显示距上次 snapshot/diff 的变化 | 低成本确认动作生效，不用重 dump |
-| `evaluate` | 页面上下文执行 JS（CDP Runtime.evaluate） | read/grep 表达不了的页面状态读取或小脚本 |
-| `frames` | 列跨域 iframe target（快照顺序，带 target id 和 URL）；序号喂 evaluate 的 frame 选项进 frame 内执行 JS | 页面内容在跨域 iframe 里、顶层 evaluate 摸不到时 |
+| `evaluate` | 页面上下文执行 JS（CDP Runtime.evaluate）；`frame=N` 进第 N 帧（N 来自 `frames`），同源/跨源 iframe 内都能执行 | read/grep 表达不了的页面状态读取或小脚本 |
+| `frames` | 列全部 frame（深度序）：index 0 = 主 frame，每条标注 `main` / `same-origin` / `cross-origin` + frameId + URL；序号喂 evaluate 的 `frame` 选项进对应 frame 执行 JS | 页面内容在 iframe 里（门户壳+iframe 是企业系统常见形态）、顶层 evaluate 摸不到时；先看标注再选 frame |
 | `run` | server 端跑 `browser` SDK 多步脚本（pages/observe/input/nav/cdp） | 多步流程、批量提取，省大量工具调用 |
 | `download` | 点元素触发下载，存到输出文件 | 下载文件 |
 | `upload` | 给 `<input type="file">` 设置本地文件 | 上传文件 |

@@ -60,10 +60,14 @@ export class ConsoleCollector {
 
 /** Network request collector (P0-14: use this.cdp.rawSendJson, not destructured) */
 export class NetworkCollector {
+  // B1 fix: cap the ring buffer — collectors now outlive individual page
+  // objects (registry on the BrowserSession), so a long-lived daemon must
+  // not accumulate entries without bound.
+  private static readonly MAX_ENTRIES = 500;
   private entries: Array<Record<string, unknown>> = [];
   private pending = new Map<string, number>();
   private unsub: (() => void)[] = [];
-  private capturing = false;
+  capturing = false;
 
   constructor(
     private cdp: CdpBackend,
@@ -78,21 +82,39 @@ export class NetworkCollector {
     await this.cdp.rawSendJson('Network.enable', '{}', this.sessionId);
 
     this.unsub.push(onSessionEvent(this.cdp, this.sessionId, 'Network.requestWillBeSent', (p) => {
-      const params = p as { requestId: string; request: { method: string; url: string } };
+      const params = p as { requestId: string; request: { method: string; url: string; postData?: string } };
       if (!pattern || params.request.url.includes(pattern)) {
-        const idx = this.entries.push({
+        const entry: Record<string, unknown> = {
           url: params.request.url,
           method: params.request.method,
           timestamp: Date.now(),
-        }) - 1;
+        };
+        // C1 fix: keep the request body (POST payloads are the adapter
+        // contract — without them, replaying a query API is guesswork).
+        if (typeof params.request.postData === 'string' && params.request.postData.length > 0) {
+          entry.requestBody = params.request.postData.slice(0, 8192);
+          if (params.request.postData.length > 8192) {
+            entry.requestBodyTruncated = true;
+          }
+        }
+        const idx = this.entries.push(entry) - 1;
         this.pending.set(params.requestId, idx);
+        if (this.entries.length > NetworkCollector.MAX_ENTRIES) {
+          // Drop the oldest entry and reindex the pending map so response
+          // events still land on the right entry.
+          this.entries.shift();
+          for (const [k, v] of this.pending) {
+            if (v <= 0) this.pending.delete(k);
+            else this.pending.set(k, v - 1);
+          }
+        }
       }
     }));
 
     this.unsub.push(onSessionEvent(this.cdp, this.sessionId, 'Network.responseReceived', (p) => {
       const params = p as { requestId: string; response: { status: number; mimeType?: string } };
       const idx = this.pending.get(params.requestId);
-      if (idx !== undefined) {
+      if (idx !== undefined && idx < this.entries.length) {
         this.entries[idx].responseStatus = params.response.status;
         this.entries[idx].responseContentType = params.response.mimeType ?? '';
       }
@@ -111,7 +133,7 @@ export class NetworkCollector {
   // try-catch 不可移除：void 不防止 unhandledRejection，try-catch 是唯一保障
   private async handleLoadingFinished(params: { requestId: string }): Promise<void> {
     const idx = this.pending.get(params.requestId);
-    if (idx === undefined) return;
+    if (idx === undefined || idx >= this.entries.length) return;
     try {
       const bodyResult = await this.cdp.rawSendJson(
         'Network.getResponseBody',

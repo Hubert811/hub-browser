@@ -19,28 +19,30 @@ import { FakeBrowser, installFakeBridge, uninstallFakeBridge } from './helpers/f
 // ── Tool level ─────────────────────────────────────────────────────────────
 
 describe('frames tool (P2-6)', () => {
-  it('lists cross-origin frames with indices and a count', async () => {
+  it('lists frames with indices, kinds, and a count (A5: main frame labeled)', async () => {
     const page = createFakePage({
       frames: async () => [
-        { url: 'https://ads.example/frame', targetId: 't-1' },
-        { url: 'https://cdn.example/embed', targetId: 't-2' },
+        { url: 'https://site.example/page', kind: 'main' },
+        { url: 'https://site.example/embed', kind: 'same-origin' },
+        { url: 'https://cdn.example/frame', kind: 'cross-origin' },
       ],
     })
     const result = await executeTool(frames, { page: 1 }, makeContext(page))
     expect(result.isError).toBeFalsy()
-    expect(result.structuredContent).toMatchObject({
-      count: 2,
-      frames: [{ url: 'https://ads.example/frame' }, { url: 'https://cdn.example/embed' }],
-    })
-    expect(String((result.content as { text?: string }[])[0]?.text)).toContain('[0] https://ads.example/frame')
+    expect(result.structuredContent).toMatchObject({ count: 3 })
+    const text = String((result.content as { text?: string }[])[0]?.text)
+    // A5: the main frame is labeled as such, not presented as a "cross-origin
+    // frame"; iframes carry their origin kind.
+    expect(text).toContain('[0] (main)')
+    expect(text).toContain('[1] (same-origin) https://site.example/embed')
+    expect(text).toContain('[2] (cross-origin) https://cdn.example/frame')
   })
 
-  it('empty frame list degrades to a friendly no-frames answer', async () => {
-    const page = createFakePage({ frames: async () => [] })
+  it('a main-frame-only page degrades to a friendly no-iframes answer', async () => {
+    const page = createFakePage({ frames: async () => [{ url: 'https://site.example/page', kind: 'main' }] })
     const result = await executeTool(frames, { page: 1 }, makeContext(page))
     expect(result.isError).toBeFalsy()
-    expect(result.structuredContent).toMatchObject({ count: 0, frames: [] })
-    expect(String((result.content as { text?: string }[])[0]?.text)).toContain('no cross-origin frames')
+    expect(String((result.content as { text?: string }[])[0]?.text)).toContain('no iframes')
   })
 
   it('a failing frames() (unsupported backend) is a structured error, not a crash', async () => {
