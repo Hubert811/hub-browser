@@ -6,7 +6,7 @@ import type {
   SpaceIdentity,
   TaskSpaceManager,
 } from '../../../space/task-space-manager.js'
-import type { ZodRawShape } from 'zod'
+import type { ZodObject, ZodRawShape } from 'zod'
 import { attachSpaceEventNotifications } from '../space-notifications'
 import {
   executeTool,
@@ -26,8 +26,8 @@ type RegisterFn = (
   name: string,
   config: {
     description: string
-    inputSchema?: ZodRawShape
-    outputSchema?: ZodRawShape
+    inputSchema?: ZodObject<ZodRawShape>
+    outputSchema?: ZodObject<ZodRawShape>
     annotations?: Record<string, unknown>
   },
   handler: (
@@ -301,8 +301,16 @@ export function registerBrowserTools(
       tool.name,
       {
         description: tool.description,
-        inputSchema: tool.input.shape,
-        ...(tool.output && { outputSchema: tool.output.shape }),
+        // Pass the ZodObject itself, NOT its .shape: the SDK's
+        // normalizeObjectSchema rebuilds a raw shape into a plain (permissive)
+        // z.object and strips unknown keys BEFORE our executeTool strict
+        // check ever runs — silently defeating the .strict() contract
+        // (upstream #2432 parity). A constructed ZodObject (strict or not) is
+        // used as-is by the SDK, so unknown keys fail at the SDK's own
+        // Input validation error with a clear message. Nested schemas ride
+        // along by reference either way.
+        inputSchema: tool.input,
+        ...(tool.output && { outputSchema: tool.output }),
         ...(tool.annotations && {
           annotations: tool.annotations as Record<string, unknown>,
         }),
