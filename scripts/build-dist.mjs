@@ -35,6 +35,25 @@ const VENDOR = {
   'shared': `${VENDOR_REL}/shared`,
 };
 
+// 0. Release-manifest guard: the DEV manifest must keep `dependencies` free
+//    of the vendored @browseros/* `file:` entries. They would fight the
+//    workspace links bun installs for the vendored packages and flip
+//    node_modules/@browseros/* onto the type-less dist (tsc breaks). The
+//    PUBLISHED manifest gets them only through scripts/pack.mjs, which derives
+//    them from this dev list — so there is no second manifest to drift.
+{
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const devDeps = pkg.dependencies ?? {};
+  for (const name of Object.keys(devDeps)) {
+    if (name.startsWith('@browseros/')) {
+      console.error(
+        `[build] manifest guard FAILED: "${name}" must stay OUT of dependencies (dev tree — the workspace links own @browseros/*; scripts/pack.mjs adds the published file: entries).`,
+      );
+      process.exit(1);
+    }
+  }
+}
+
 function fixSpec(spec) {
   if (spec.endsWith('.ts')) return spec.slice(0, -3) + '.js';
   if (/\.(js|mjs|cjs|json)$/.test(spec)) return spec;
@@ -140,6 +159,14 @@ fs.copyFileSync(
 );
 for (const [pkg, rel] of Object.entries(VENDOR)) {
   const pkgJson = JSON.parse(fs.readFileSync(path.join(root, rel, 'package.json'), 'utf8'));
+  // Strip workspace:* dependencies: in an installed tree the three vendored
+  // packages are declared as file: deps of the ROOT package.json, so npm
+  // hoists them all to node_modules/@browseros/* and their cross-imports
+  // resolve by walking up — a leftover workspace: protocol would break the
+  // install (0.2.0 release-pipeline finding: pure-install layout could not
+  // resolve @browseros/shared at all).
+  delete pkgJson.dependencies;
+  delete pkgJson.devDependencies;
   fs.writeFileSync(
     path.join(dist, 'vendor', pkg, 'package.json'),
     JSON.stringify(rewriteExportsToJs(pkgJson), null, 2) + '\n',
@@ -150,6 +177,30 @@ fs.writeFileSync(
   path.join(dist, 'browser-mcp', 'package.json'),
   JSON.stringify(rewriteExportsToJs(mcpPkg), null, 2) + '\n',
 );
+
+// 4. P2-9 — agent guide resource: `hub --llm-txt` prints the bundled
+// hub-browser SKILL.md (single source with the skills system). The root
+// skills/ tree is not in package.json "files", so ship the one file the
+// flag needs inside dist/ (hub.mjs falls back to it when the dev tree is
+// absent).
+fs.mkdirSync(path.join(dist, 'skills', 'hub-browser'), { recursive: true });
+fs.copyFileSync(
+  path.join(root, 'skills', 'hub-browser', 'SKILL.md'),
+  path.join(dist, 'skills', 'hub-browser', 'SKILL.md'),
+);
+
+// 5. P2-3 — replay player assets: rrweb-player (UMD) + its stylesheet get
+// embedded into every exported self-contained replay HTML by
+// browser-mcp/src/tools/replay-tools.ts. Non-TS files never pass through
+// job 2, so ship them explicitly; the module locates them relative to
+// itself (dist/browser-mcp/assets), which this layout preserves.
+fs.mkdirSync(path.join(dist, 'browser-mcp', 'assets'), { recursive: true });
+for (const asset of ['rrweb-player.umd.min.js', 'rrweb-player.style.css']) {
+  fs.copyFileSync(
+    path.join(root, 'src', 'browser-mcp', 'assets', asset),
+    path.join(dist, 'browser-mcp', 'assets', asset),
+  );
+}
 
 // ── report ────────────────────────────────────────────────────────────
 const count = (dir) => {

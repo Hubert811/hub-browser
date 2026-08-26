@@ -3,3 +3,11 @@ dist/
 *.tsbuildinfo
 .DS_Store
 hub-browser-*.tgz
+
+# P3-6: pack-fork.mjs output (112MB distribution staging)
+hub-dist/
+
+# bun build cache spillover
+*.bun-build
+# stale packaging artifact (skills/ is the source)
+skills.zip

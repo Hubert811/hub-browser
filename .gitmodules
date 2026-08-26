@@ -1,3 +1,4 @@
 [submodule "vendor/browseros"]
 	path = vendor/browseros
-	url = https://github.com/browseros-ai/BrowserOS.git
+	url = https://github.com/Hubert811/BrowserOS.git
+	branch = ax-dom-probe

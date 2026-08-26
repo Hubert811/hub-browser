@@ -26,9 +26,15 @@ function prefer(primary, fallback) {
   return fs.existsSync(path.join(primary, 'package.json')) ? primary : fallback;
 }
 
+// Engine link: prefer DIST when present. A dev tree with a built dist/ must
+// serve node consumers the compiled JS — adapters resolve
+// '@jackwener/opencli' through this node_modules link, and under node the
+// src tree is unrunnable (TS sources + extensionless imports; node does no
+// extension probing). Bun runs either tree, so dist-first breaks nothing for
+// bun; a pure-source dev tree (no dist) falls back to src as before.
 const engineRoot = prefer(
-  path.join(root, 'src', 'opencli-engine'),
   path.join(root, 'dist', 'opencli-engine'),
+  path.join(root, 'src', 'opencli-engine'),
 );
 
 const vendorRoot = path.join(root, 'vendor', 'browseros', 'packages', 'browseros-agent', 'packages');
