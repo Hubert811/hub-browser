@@ -18,15 +18,25 @@
 
 import { createHash } from 'node:crypto'
 
-const DEFAULT_BASE_URL = 'http://127.0.0.1:9210'
+import { resolveClawServerPort } from '../../../cdp-port.js'
+
 const REPROBE_INTERVAL_MS = 5 * 60_000
 const QUEUE_LIMIT = 200
 const END_WAIT_MS = 1_500
 
-/** Base URL of the BrowserClaw server (HUB_CLAW_SERVER_URL override); shared
- * by the harness reporter (write path) and the replay read face. */
+/** Base URL of the BrowserClaw server; shared by the harness reporter (write
+ * path) and the replay read face.
+ *
+ * Resolution: HUB_CLAW_SERVER_URL (whole-URL override) → config.json
+ * `ports.server` (the server rebinds off 9210 when the port is taken, and the
+ * config file is the only place that drift is recorded) → fallback
+ * `http://127.0.0.1:9210`. Hard-coding 9210 broke the whole cockpit feed for
+ * as long as the server sat on a drifted port — found 2026-08-26 when a
+ * dogfooding run's tabs were invisible in the cockpit audit. */
 export function clawServerBaseUrl(): string {
-  return process.env.HUB_CLAW_SERVER_URL ?? DEFAULT_BASE_URL
+  const envUrl = process.env.HUB_CLAW_SERVER_URL?.trim()
+  if (envUrl) return envUrl
+  return `http://127.0.0.1:${resolveClawServerPort()}`
 }
 
 export interface ClawDispatchReport {

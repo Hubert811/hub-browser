@@ -23,22 +23,51 @@ import { join } from 'node:path'
  */
 export const CDP_PORT_FALLBACK = 9005
 
+/**
+ * Claw-server HTTP port fallback (the pre-drift default). The real port is
+ * read from config.json `ports.server` — the server binds 9210 by default but
+ * silently rebinds when the port is taken, and that drift is invisible to
+ * consumers that hard-code 9210 (the P2-3 cockpit feed broke exactly this way).
+ */
+export const CLAW_SERVER_PORT_FALLBACK = 9210
+
 let cachedPort: number | null = null
+let cachedClawServerPort: number | null = null
 
 /** Resolve the CDP port for this process. Never throws. */
 export function resolveCdpPort(opts: { configPath?: string } = {}): number {
   const envPort = parsePort(process.env.BROWSEROS_CDP_PORT)
   if (envPort !== null) return envPort
 
-  if (cachedPort !== null) return cachedPort
-
-  cachedPort = probeConfig(opts.configPath) ?? CDP_PORT_FALLBACK
+  if (cachedPort === null) {
+    cachedPort = probeConfig('cdp', opts.configPath) ?? CDP_PORT_FALLBACK
+  }
   return cachedPort
 }
 
 /** Test hook: drop the in-process probe cache. */
 export function _resetCdpPortCache(): void {
   cachedPort = null
+}
+
+/**
+ * Resolve the BrowserClaw server's HTTP port (harness API / cockpit feed).
+ * Same resolution shape as the CDP port: env override → config.json
+ * `ports.server` → fallback 9210. Probed once and cached in-process.
+ */
+export function resolveClawServerPort(opts: { configPath?: string } = {}): number {
+  const envPort = parsePort(process.env.HUB_CLAW_SERVER_PORT)
+  if (envPort !== null) return envPort
+
+  if (cachedClawServerPort === null) {
+    cachedClawServerPort = probeConfig('server', opts.configPath) ?? CLAW_SERVER_PORT_FALLBACK
+  }
+  return cachedClawServerPort
+}
+
+/** Test hook: drop the in-process claw-server port cache. */
+export function _resetClawServerPortCache(): void {
+  cachedClawServerPort = null
 }
 
 function parsePort(value: string | undefined): number | null {
@@ -48,16 +77,16 @@ function parsePort(value: string | undefined): number | null {
   return null
 }
 
-function probeConfig(explicitConfigPath?: string): number | null {
+function probeConfig(field: 'cdp' | 'server', explicitConfigPath?: string): number | null {
   const candidates = explicitConfigPath ? [explicitConfigPath] : configCandidates()
   for (const configPath of candidates) {
-    const port = readPortFromConfig(configPath)
+    const port = readPortFromConfig(configPath, field)
     if (port !== null) return port
   }
   return null
 }
 
-function readPortFromConfig(configPath: string): number | null {
+function readPortFromConfig(configPath: string, field: 'cdp' | 'server'): number | null {
   let raw: string
   try {
     raw = readFileSync(configPath, 'utf8')
@@ -65,8 +94,8 @@ function readPortFromConfig(configPath: string): number | null {
     return null // missing / unreadable → silent fallback
   }
   try {
-    const data = JSON.parse(raw) as { ports?: { cdp?: unknown } }
-    const port = data?.ports?.cdp
+    const data = JSON.parse(raw) as { ports?: Record<string, unknown> }
+    const port = data?.ports?.[field]
     if (typeof port === 'number' && Number.isInteger(port) && port > 0 && port <= 65535) {
       return port
     }

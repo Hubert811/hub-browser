@@ -11,8 +11,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   CDP_PORT_FALLBACK,
+  CLAW_SERVER_PORT_FALLBACK,
   _resetCdpPortCache,
+  _resetClawServerPortCache,
   resolveCdpPort,
+  resolveClawServerPort,
 } from '../src/cdp-port.ts'
 
 const tmpDir = mkdtempSync(join(tmpdir(), 'cdp-port-test-'))
@@ -20,7 +23,9 @@ const tmpDir = mkdtempSync(join(tmpdir(), 'cdp-port-test-'))
 beforeEach(() => {
   delete process.env.BROWSEROS_CDP_PORT
   delete process.env.BROWSERCLAW_DIR
+  delete process.env.HUB_CLAW_SERVER_PORT
   _resetCdpPortCache()
+  _resetClawServerPortCache()
 })
 
 afterAll(() => {
@@ -129,5 +134,44 @@ describe('resolveCdpPort — in-process caching', () => {
     const configPath = join(tmpDir, 'never-exists.json')
     expect(resolveCdpPort({ configPath })).toBe(CDP_PORT_FALLBACK)
     expect(resolveCdpPort({ configPath })).toBe(CDP_PORT_FALLBACK)
+  })
+})
+
+describe('resolveClawServerPort — config drift follows ports.server', () => {
+  // Found 2026-08-26: the claw server silently rebinds off 9210 when the
+  // port is taken; consumers that hard-coded 9210 (claw-reporter,
+  // replay-tools) went dark for the whole drift window.
+  it('reads ports.server from the BrowserOS config', () => {
+    const configPath = join(tmpDir, 'claw-server.json')
+    writeFileSync(configPath, JSON.stringify({ ports: { cdp: 9110, server: 9211 } }))
+    expect(resolveClawServerPort({ configPath })).toBe(9211)
+  })
+
+  it('HUB_CLAW_SERVER_PORT env overrides the config', () => {
+    process.env.HUB_CLAW_SERVER_PORT = '9299'
+    const configPath = join(tmpDir, 'claw-ignored.json')
+    writeFileSync(configPath, JSON.stringify({ ports: { server: 9211 } }))
+    expect(resolveClawServerPort({ configPath })).toBe(9299)
+  })
+
+  it('falls back to 9210 when the config has no ports.server', () => {
+    const configPath = join(tmpDir, 'claw-absent.json')
+    writeFileSync(configPath, JSON.stringify({ ports: { cdp: 9110 } }))
+    expect(resolveClawServerPort({ configPath })).toBe(CLAW_SERVER_PORT_FALLBACK)
+  })
+
+  it('missing config file falls back silently', () => {
+    expect(resolveClawServerPort({ configPath: join(tmpDir, 'nope.json') }))
+      .toBe(CLAW_SERVER_PORT_FALLBACK)
+  })
+
+  it('caches the probe; reset hook re-reads', () => {
+    const configPath = join(tmpDir, 'claw-cache.json')
+    writeFileSync(configPath, JSON.stringify({ ports: { server: 9211 } }))
+    expect(resolveClawServerPort({ configPath })).toBe(9211)
+    writeFileSync(configPath, JSON.stringify({ ports: { server: 9212 } }))
+    expect(resolveClawServerPort({ configPath })).toBe(9211)
+    _resetClawServerPortCache()
+    expect(resolveClawServerPort({ configPath })).toBe(9212)
   })
 })

@@ -1,6 +1,6 @@
 // sync-3 deployment verification (fork sync routine step): drive the DEPLOYED
 // hub (.app bundle) over MCP, confirm the claw harness reporter creates a
-// session on the redeployed fork server (9210). Reusable after every
+// session on the redeployed fork server (port from config.json). Reusable after every
 // deploy-fork-app.sh run:
 //   bun scripts/sync3-deploy-verify.mjs
 // then check the newest session label `sync3-verify` on the server:
