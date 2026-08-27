@@ -324,7 +324,10 @@ describe('bindAdapterPageToSpace — adapter command → current space', () => {
     expect(calls[1][1]).toBe('agent-b')
     expect(calls[1][2]).toBe('space-1')
     expect(calls[1][3]).toBe('https://zhihu.com')
-    expect(calls[1][4]).toEqual({ background: false, reuse: 'exact' })
+    // bug #20: domain-root binding targets reuse any same-origin tab (upstream
+    // opencli persistent semantics) instead of exact-URL matching, which never
+    // hit the deep page URL the previous run navigated to.
+    expect(calls[1][4]).toEqual({ background: false, reuse: 'origin' })
     expect(calls[1][5]).toBe('object') // gatewayFromPage(page) passed through
     expect(connects).toEqual([{ pageId: 42, cdpEndpoint: 'ws://cdp/' }])
   })

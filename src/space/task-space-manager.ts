@@ -1858,12 +1858,31 @@ export class TaskSpaceManager {
     }
     if (live.length === 0) return undefined
     const liveById = new Map(live.map((t) => [t.pageId, t]))
+    // bug #21 (same family as #15): pageId is a per-connection sequence — a
+    // fresh CLI/MCP process renumbers tabs, so a ledger ref's pageId points at
+    // a random live tab (or nothing) and reuse never hits, opening a duplicate
+    // tab on every adapter command (observed: one new tab per persistent
+    // adapter run). Match targetId first (stable across processes); bare
+    // pageId hits require the URL to agree, mirroring restore()'s guard.
+    const liveByTarget = new Map(
+      live.filter((t) => t.targetId).map((t) => [t.targetId as string, t]),
+    )
     for (const ref of space.tabs) {
-      const info = liveById.get(ref.pageId)
+      let info: TabLike | undefined
+      if (ref.targetId) info = liveByTarget.get(ref.targetId)
+      if (!info) {
+        const byId = liveById.get(ref.pageId)
+        // Bare pageId match is only trusted when the URL agrees (same-process
+        // idempotent case); a drifted number naming a different page must not
+        // cause a false reuse.
+        if (byId && byId.url && ref.url && this.sameRestoreUrl(byId.url) === this.sameRestoreUrl(ref.url)) {
+          info = byId
+        }
+      }
       if (!info) continue
       const liveUrl = info.url ?? ref.url
       if (!liveUrl) continue
-      if (this.tabUrlMatches(liveUrl, url, mode)) return ref.pageId
+      if (this.tabUrlMatches(liveUrl, url, mode)) return info.pageId
     }
     return undefined
   }

@@ -288,11 +288,21 @@ export async function bindAdapterPageToSpace({ page, browser, cdpEndpoint, cmd, 
         const targetUrl = await resolveSpaceTargetUrl(cmd, page);
         if (targetUrl === null)
             return { page, space, bound: false, pageId: undefined, manager: mgr, agentId };
+        // Persistent semantics parity (bug #20): when the binding target is a
+        // domain-root URL (the fallback when an adapter declares no preNav),
+        // 'exact' reuse never matches the deep page URL the previous run
+        // navigated to (e.g. product/view.htm?menuId=... on quickbi), so every
+        // run opened a NEW tab — 17 orphan tabs observed during dogfooding.
+        // Upstream opencli persistent mode reuses the session's tab by DOMAIN
+        // and lets the adapter navigate itself (curUrl check + goto). Match
+        // that: domain-root targets reuse any same-origin tab in the space;
+        // explicit deep URLs keep exact matching.
+        const reuseMode = cmd.domain && isDomainRootPreNav(targetUrl, cmd.domain) ? 'origin' : 'exact';
         const { pageId } = await mgr.openTabWithReuse(
             agentId,
             space.id,
             targetUrl,
-            { background: false, reuse: 'exact' },
+            { background: false, reuse: reuseMode },
             gateway,
         );
         // The page handle normally already follows the gateway's newTab /
