@@ -142,9 +142,22 @@ export class NetworkCollector {
       );
       const r = bodyResult as { body?: string; base64Encoded?: boolean };
       if (typeof r?.body === 'string') {
-        this.entries[idx].responsePreview = r.base64Encoded
+        const entry = this.entries[idx];
+        entry.responsePreview = r.base64Encoded
           ? `base64:${r.body.slice(0, 8192)}`
           : r.body.slice(0, 8192);
+        // Same honesty contract as requestBody above: the preview is capped
+        // at 8KiB, so surface the truncation + full size. Without these the
+        // downstream marker chain (bodyTruncated -> body_truncated -> detail
+        // warning) is dead code and `network --detail` silently hands out a
+        // body that looks whole but is cut mid-JSON — an adapter author
+        // parsing it concludes the response is corrupt when it was merely
+        // truncated (observed on QuickBI olap responses: 8192-byte body cut
+        // mid-SQL, JSON.parse failing with Unterminated string).
+        if (r.body.length > 8192) {
+          entry.responseBodyTruncated = true;
+          entry.responseBodyFullSize = r.body.length;
+        }
       }
     } catch { /* body unavailable */ }
     this.pending.delete(params.requestId);
