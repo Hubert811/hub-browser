@@ -60,9 +60,35 @@ export function buildFindJs(selector, opts = {}) {
 
       ${COMPOUND_INFO_JS}
 
+      // O2 fix: same-origin frame traversal. Portal-shell + iframe is a common
+      // enterprise shape (observed on QuickBI: every interactive control lives
+      // in the dashboard iframe) — CSS and semantic queries must see into it
+      // or find is blind to most of the page. Cross-origin frames throw on
+      // contentDocument and are skipped (they live in separate CDP sessions;
+      // AX frame stitching covers them there).
+      function allDocs() {
+        const docs = [document];
+        const seen = new Set(docs);
+        const walk = (doc, depth) => {
+          if (depth > 5) return;
+          let frames;
+          try { frames = doc.querySelectorAll('iframe'); } catch (_) { return; }
+          for (let i = 0; i < frames.length; i++) {
+            let cd = null;
+            try { cd = frames[i].contentDocument; } catch (_) {}
+            if (cd && !seen.has(cd)) { seen.add(cd); docs.push(cd); walk(cd, depth + 1); }
+          }
+        };
+        walk(document, 0);
+        return docs;
+      }
+      const docs = allDocs();
+
+      // Main document first — a bad selector throws here already, preserving
+      // the invalid_selector contract — then same-origin child frames.
       let matches;
       try {
-        matches = document.querySelectorAll(sel);
+        matches = Array.from(document.querySelectorAll(sel));
       } catch (e) {
         return {
           error: {
@@ -71,6 +97,11 @@ export function buildFindJs(selector, opts = {}) {
             hint: 'Check the selector syntax.',
           },
         };
+      }
+      for (let d = 1; d < docs.length; d++) {
+        try {
+          matches = matches.concat(Array.from(docs[d].querySelectorAll(sel)));
+        } catch (_) {}
       }
 
       if (matches.length === 0) {
@@ -118,11 +149,13 @@ export function buildFindJs(selector, opts = {}) {
       // map was cleared but annotations remain (e.g. soft navigation without a
       // fresh snapshot). Guarantees allocated refs don't collide.
       try {
-        const tagged = document.querySelectorAll('[data-opencli-ref]');
-        for (let t = 0; t < tagged.length; t++) {
-          const v = tagged[t].getAttribute('data-opencli-ref');
-          const n = v != null && /^\\d+$/.test(v) ? parseInt(v, 10) : NaN;
-          if (!isNaN(n) && n > maxRef) maxRef = n;
+        for (let d = 0; d < docs.length; d++) {
+          const tagged = docs[d].querySelectorAll('[data-opencli-ref]');
+          for (let t = 0; t < tagged.length; t++) {
+            const v = tagged[t].getAttribute('data-opencli-ref');
+            const n = v != null && /^\\d+$/.test(v) ? parseInt(v, 10) : NaN;
+            if (!isNaN(n) && n > maxRef) maxRef = n;
+          }
         }
       } catch (_) {}
 
@@ -162,6 +195,8 @@ export function buildFindJs(selector, opts = {}) {
           attrs: pickAttrs(el),
           visible: isVisible(el),
         };
+        const docIdx = docs.indexOf(el.ownerDocument);
+        if (docIdx > 0) entry.frame = docIdx;
         const compound = compoundInfoOf(el);
         if (compound) entry.compound = compound;
         entries.push(entry);
@@ -193,6 +228,27 @@ export function buildSemanticFindJs(opts) {
       const ATTR_WHITELIST = ${whitelist};
 
       ${COMPOUND_INFO_JS}
+
+      // O2 fix (same as the CSS branch above): query into same-origin child
+      // frames so portal-shell + iframe pages are not invisible to semantic
+      // locators. Cross-origin frames are skipped (separate CDP sessions).
+      function allDocs() {
+        const docs = [document];
+        const seen = new Set(docs);
+        const walk = (doc, depth) => {
+          if (depth > 5) return;
+          let frames;
+          try { frames = doc.querySelectorAll('iframe'); } catch (_) { return; }
+          for (let i = 0; i < frames.length; i++) {
+            let cd = null;
+            try { cd = frames[i].contentDocument; } catch (_) {}
+            if (cd && !seen.has(cd)) { seen.add(cd); docs.push(cd); walk(cd, depth + 1); }
+          }
+        };
+        walk(document, 0);
+        return docs;
+      }
+      const docs = allDocs();
 
       function normalize(value) {
         return String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
@@ -235,7 +291,7 @@ export function buildSemanticFindJs(opts) {
         }
         if (el.id) {
           try {
-            const label = document.querySelector('label[for="' + cssEscape(el.id) + '"]');
+            const label = (el.ownerDocument || document).querySelector('label[for="' + cssEscape(el.id) + '"]');
             if (label) parts.push(label.textContent || '');
           } catch (_) {}
         }
@@ -244,13 +300,13 @@ export function buildSemanticFindJs(opts) {
         return parts.join(' ');
       }
 
-      function byIdText(ids) {
+      function byIdText(ids, doc) {
         if (!ids) return '';
         const parts = [];
         for (const id of String(ids).split(/\\s+/)) {
           if (!id) continue;
           try {
-            const el = document.getElementById(id);
+            const el = (doc || document).getElementById(id);
             if (el) parts.push(el.textContent || '');
           } catch (_) {}
         }
@@ -260,7 +316,7 @@ export function buildSemanticFindJs(opts) {
       function accessibleName(el) {
         return [
           el.getAttribute('aria-label') || '',
-          byIdText(el.getAttribute('aria-labelledby')),
+          byIdText(el.getAttribute('aria-labelledby'), el.ownerDocument),
           labelText(el),
           el.getAttribute('alt') || '',
           el.getAttribute('title') || '',
@@ -315,7 +371,7 @@ export function buildSemanticFindJs(opts) {
         return true;
       }
 
-      const candidates = Array.from(document.querySelectorAll([
+      const CANDIDATE_SEL = [
         'a[href]',
         'button',
         'input',
@@ -330,7 +386,15 @@ export function buildSemanticFindJs(opts) {
         '[test-id]',
         'label',
         '[contenteditable="true"]',
-      ].join(',')));
+      ].join(',');
+      // Main document first (stable ordering), then same-origin child frames
+      // in traversal order — nth/entry order matches the CSS branch.
+      let candidates = Array.from(document.querySelectorAll(CANDIDATE_SEL));
+      for (let d = 1; d < docs.length; d++) {
+        try {
+          candidates = candidates.concat(Array.from(docs[d].querySelectorAll(CANDIDATE_SEL)));
+        } catch (_) {}
+      }
       const matchesList = candidates.filter(matches);
 
       if (matchesList.length === 0) {
@@ -350,11 +414,13 @@ export function buildSemanticFindJs(opts) {
         if (!isNaN(n) && n > maxRef) maxRef = n;
       }
       try {
-        const tagged = document.querySelectorAll('[data-opencli-ref]');
-        for (let t = 0; t < tagged.length; t++) {
-          const v = tagged[t].getAttribute('data-opencli-ref');
-          const n = v != null && /^\\d+$/.test(v) ? parseInt(v, 10) : NaN;
-          if (!isNaN(n) && n > maxRef) maxRef = n;
+        for (let d = 0; d < docs.length; d++) {
+          const tagged = docs[d].querySelectorAll('[data-opencli-ref]');
+          for (let t = 0; t < tagged.length; t++) {
+            const v = tagged[t].getAttribute('data-opencli-ref');
+            const n = v != null && /^\\d+$/.test(v) ? parseInt(v, 10) : NaN;
+            if (!isNaN(n) && n > maxRef) maxRef = n;
+          }
         }
       } catch (_) {}
 
@@ -381,6 +447,8 @@ export function buildSemanticFindJs(opts) {
           attrs: pickAttrs(el),
           visible: isVisible(el),
         };
+        const docIdx = docs.indexOf(el.ownerDocument);
+        if (docIdx > 0) entry.frame = docIdx;
         const compound = compoundInfoOf(el);
         if (compound) entry.compound = compound;
         entries.push(entry);

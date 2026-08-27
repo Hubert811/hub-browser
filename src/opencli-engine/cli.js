@@ -1313,6 +1313,42 @@ Examples:
         console.log(`URL: ${url}\n`);
         console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
     }));
+    // O1 fix: MCP↔CLI naming alignment. The MCP tool is `snapshot` (AX tree
+    // with [ref=eN]); the CLI only exposed it as `state --source ax`, so an
+    // agent moving between the two faces hit `unknown command 'snapshot'`.
+    // `snapshot` is the AX face (matching MCP semantics); `state` keeps its
+    // DOM-backend default for the opencli-compatible [N]-index surface.
+    addBrowserTabOption(browser.command('snapshot').description('AX-tree snapshot with [ref=eN] (same as MCP snapshot; = state --source ax)')
+        .option('--source <source>', 'Snapshot backend: ax (default) or dom', 'ax')
+        .option('--compare-sources', 'Print DOM vs AX snapshot metrics for observation promotion decisions', false))
+        .action(browserAction(async (page, opts) => {
+        if (opts.compareSources === true) {
+            const [dom, ax] = await Promise.all([
+                snapshotSourceMetrics(page, 'dom'),
+                snapshotSourceMetrics(page, 'ax'),
+            ]);
+            console.log(JSON.stringify({
+                url: await page.getCurrentUrl?.() ?? '',
+                sources: { dom, ax },
+            }, null, 2));
+            return;
+        }
+        const source = String(opts.source ?? 'ax').toLowerCase();
+        if (source !== 'dom' && source !== 'ax') {
+            console.log(JSON.stringify({
+                error: {
+                    code: 'invalid_source',
+                    message: `--source must be "ax" or "dom", got "${opts.source}"`,
+                },
+            }, null, 2));
+            process.exitCode = EXIT_CODES.USAGE_ERROR;
+            return;
+        }
+        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source });
+        const url = await page.getCurrentUrl?.() ?? '';
+        console.log(`URL: ${url}\n`);
+        console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
+    }));
     addBrowserTabOption(browser.command('frames').description('List cross-origin iframe targets in snapshot order'))
         .action(browserAction(async (page) => {
         // P2-6 (batch 1): thin wrapper over the shared `frames` tool definition

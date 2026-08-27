@@ -81,6 +81,28 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
       const firstOnMulti = ${firstOnMulti};
       const identity = window.__opencli_ref_identity || {};
 
+      // O2 fix: same-origin frame traversal. Portal-shell + iframe pages
+      // (QuickBI & friends) keep most interactive controls inside a
+      // same-origin iframe; ref tags and CSS selectors must resolve across
+      // documents or the numeric-ref contract silently breaks there.
+      // Cross-origin frames throw on contentDocument and are skipped.
+      function allDocs() {
+        const docs = [document];
+        const seen = new Set(docs);
+        const walk = (doc, depth) => {
+          if (depth > 5) return;
+          let frames;
+          try { frames = doc.querySelectorAll('iframe'); } catch (_) { return; }
+          for (let i = 0; i < frames.length; i++) {
+            let cd = null;
+            try { cd = frames[i].contentDocument; } catch (_) {}
+            if (cd && !seen.has(cd)) { seen.add(cd); docs.push(cd); walk(cd, depth + 1); }
+          }
+        };
+        walk(document, 0);
+        return docs;
+      }
+
       // ── Classify input ──
       // Numeric = snapshot ref. Everything else is handed to querySelectorAll
       // and whatever the browser parser accepts is a valid selector. No regex
@@ -134,6 +156,18 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
           return 'mismatch';
         }
 
+        function queryAllDocs(q) {
+          const out = [];
+          const docs = allDocs();
+          for (let i = 0; i < docs.length; i++) {
+            try {
+              const list = docs[i].querySelectorAll(q);
+              for (let j = 0; j < list.length; j++) out.push(list[j]);
+            } catch (_) {}
+          }
+          return out;
+        }
+
         // Try to recover a stale ref by searching the page for a live element
         // whose fingerprint still matches. Uniqueness is required — if two
         // candidates match equally well, we refuse rather than silently pick
@@ -150,18 +184,23 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
           // unique element, that's our hit.
           try {
             if (fp.id) {
-              const byId = document.getElementById(fp.id);
-              if (byId) tryAdd(byId);
+              const docs = allDocs();
+              for (let i = 0; i < docs.length; i++) {
+                try {
+                  const byId = docs[i].getElementById(fp.id);
+                  if (byId) tryAdd(byId);
+                } catch (_) {}
+              }
             }
             if (fp.testId) {
-              const byTestIdA = document.querySelectorAll('[data-testid="' + fp.testId.replace(/"/g, '\\\\"') + '"]');
+              const byTestIdA = queryAllDocs('[data-testid="' + fp.testId.replace(/"/g, '\\\\"') + '"]');
               for (let i = 0; i < byTestIdA.length; i++) tryAdd(byTestIdA[i]);
-              const byTestIdB = document.querySelectorAll('[data-test="' + fp.testId.replace(/"/g, '\\\\"') + '"]');
+              const byTestIdB = queryAllDocs('[data-test="' + fp.testId.replace(/"/g, '\\\\"') + '"]');
               for (let i = 0; i < byTestIdB.length; i++) tryAdd(byTestIdB[i]);
             }
             // aria-label is only a useful shortlist when nothing stronger is set
             if (candidates.length === 0 && fp.ariaLabel) {
-              const byAria = document.querySelectorAll('[aria-label="' + fp.ariaLabel.replace(/"/g, '\\\\"') + '"]');
+              const byAria = queryAllDocs('[aria-label="' + fp.ariaLabel.replace(/"/g, '\\\\"') + '"]');
               for (let i = 0; i < byAria.length; i++) tryAdd(byAria[i]);
             }
           } catch (_) { /* bad selectors from weird fp values — skip */ }
@@ -169,8 +208,19 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
         }
 
         const fp = identity[ref];
-        let el = document.querySelector('[data-opencli-ref="' + ref + '"]');
-        if (!el) el = document.querySelector('[data-ref="' + ref + '"]');
+        function findByAttr(attr) {
+          const q = '[' + attr + '="' + ref + '"]';
+          const docs = allDocs();
+          for (let i = 0; i < docs.length; i++) {
+            try {
+              const hit = docs[i].querySelector(q);
+              if (hit) return hit;
+            } catch (_) {}
+          }
+          return null;
+        }
+        let el = findByAttr('data-opencli-ref');
+        if (!el) el = findByAttr('data-ref');
 
         // If the ref tag is gone from the DOM, last-chance reidentify.
         if (!el) {
@@ -230,9 +280,18 @@ export function resolveTargetJs(ref: string, opts: ResolveOptions = {}): string 
 
       // ── CSS selector path (any non-numeric input) ──
       {
+        // Main document first (preserves the invalid_selector contract), then
+        // same-origin child frames — same ordering as the patched find, so
+        // --nth indices agree between the two commands.
         let matches;
         try {
-          matches = document.querySelectorAll(ref);
+          matches = Array.from(document.querySelectorAll(ref));
+          const docs = allDocs();
+          for (let d = 1; d < docs.length; d++) {
+            try {
+              matches = matches.concat(Array.from(docs[d].querySelectorAll(ref)));
+            } catch (_) {}
+          }
         } catch (e) {
           return {
             ok: false,

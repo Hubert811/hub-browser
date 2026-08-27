@@ -9,14 +9,54 @@
 function resolveElementJs(safeRef: string, selectorSet: string): string {
   return `
       const ref = ${safeRef};
-      let el = document.querySelector('[data-opencli-ref="' + ref + '"]');
-      if (!el) el = document.querySelector('[data-ref="' + ref + '"]');
+      // O2 fix: same-origin frame traversal — portal-shell + iframe pages keep
+      // most controls inside the iframe; ref tags and CSS selectors must
+      // resolve across documents. Cross-origin frames are skipped.
+      function allDocs() {
+        const docs = [document];
+        const seen = new Set(docs);
+        const walk = (doc, depth) => {
+          if (depth > 5) return;
+          let frames;
+          try { frames = doc.querySelectorAll('iframe'); } catch (_) { return; }
+          for (let i = 0; i < frames.length; i++) {
+            let cd = null;
+            try { cd = frames[i].contentDocument; } catch (_) {}
+            if (cd && !seen.has(cd)) { seen.add(cd); docs.push(cd); walk(cd, depth + 1); }
+          }
+        };
+        walk(document, 0);
+        return docs;
+      }
+      function findByAttr(attr) {
+        const q = '[' + attr + '="' + ref + '"]';
+        const docs = allDocs();
+        for (let i = 0; i < docs.length; i++) {
+          try {
+            const hit = docs[i].querySelector(q);
+            if (hit) return hit;
+          } catch (_) {}
+        }
+        return null;
+      }
+      let el = findByAttr('data-opencli-ref');
+      if (!el) el = findByAttr('data-ref');
       if (!el && ref.match(/^[a-zA-Z#.\\[]/)) {
         try { el = document.querySelector(ref); } catch {}
+        if (!el) {
+          try {
+            const docs = allDocs();
+            for (let i = 1; i < docs.length && !el; i++) {
+              el = docs[i].querySelector(ref);
+            }
+          } catch (_) {}
+        }
       }
       if (!el) {
         const idx = parseInt(ref, 10);
         if (!isNaN(idx)) {
+          // Numeric index stays main-frame only: the [N] indices come from the
+          // DOM snapshot, which numbers main-frame candidates.
           el = document.querySelectorAll('${selectorSet}')[idx];
         }
       }`;
