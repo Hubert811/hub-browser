@@ -1,6 +1,36 @@
 # 元素定位策略
 
-> DOM 结构差异、下拉可见性检查、选项模糊匹配
+> DOM 结构差异、下拉可见性检查、选项模糊匹配。
+> 定位信息的**首选来源是 AX 快照**（selector 直接摆在快照行尾，见 §0）。
+
+---
+
+## 0 快照侦察提 selector（首选入口，2026-08-27 实证）
+
+快照行尾的 `→ tag#id [sel="..."]`（P3-5 DOM 单元）就是「AX 语义 + DOM 定位」一体：
+拍一张快照，**交互元素的稳定 class selector 直接摆在行尾**，不用裸 eval 一轮轮摸。
+
+实测对照（QuickBI advance-select 弹层，快照 0.146s）：
+
+| 快照给出 | 手写适配器时的老办法 | 快照优势 |
+|---|---|---|
+| `button.query-area-button` | innerText 正则 `/查\s*询/` 找按钮 | class 直命中，不受多个含「查询」文本的按钮干扰 |
+| `button.advance-select-add-all-button` | innerText includes('添加左侧全部字段值') | 同上 |
+| `button.advance-select-footer-cancel/confirm` | innerText replace(/\s/g,'') 匹配（「取 消」带空格） | 同上 |
+| `div.advance-select-tip-delete-all`（清空） | 手摸多轮试出 | 完全一致，零成本 |
+| `div.advance-select-max-tip`（截断警告） | innerText includes('默认展示前') | class 更直接 |
+| `div.bi-tabs-tab` / `div.single-select` | 手摸 | 一致 |
+
+**边界（快照给不了的）**：无 role 的纯容器/布局节点不进 AX 树——
+`.advance-select-popup`（弹层容器）、`.advance-select-items`（列表容器）、
+`.query-field`（字段容器）、`.ant-picker-cell`（日历格子）。这些用
+`browser find --css "<selector>"` 验证（返回 tag/role/text/class/frame，
+iframe 内自动标注 frame=N）；无 class 节点快照只能给 nth-of-type 位置路径
+（脆弱，不进适配器）。
+
+**工作流**：①侦察先 `snapshot`，提取全部 `[sel=...]` 中带 class 的作为候选；
+②容器类用 `find --css` 验证；③只对动态弹层/日历这类「快照看不见的容器内部」
+才裸 eval 手摸。innerText 匹配仅作为无 class 时的兜底，不作首选。
 
 ---
 
