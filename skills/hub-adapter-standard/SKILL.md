@@ -27,8 +27,9 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 > - `pitfalls/network-capture.md` — 网络捕获通道：自带收集器无 postData、CDP 在 portal iframe 上不可靠、patch 主+CDP 次
 > - `pitfalls/escaping-ladder.md` — 模板字符串/正则的跨层转义阶梯
 > - `pitfalls/verify-timeout.md` — hub browser verify 30s 子进程上限
-> - `patterns/input-channels.md` — 输入通道规范：受控组件写值四通道实测对比（native setter 首选 / insertText 有效需 eval focus 前置 / 裸 CDP 逐键不路由 iframe / eval execCommand 的 iframe 边界）
-> - `patterns/persistent-reset.md` — persistent 适配器三级复位（R1 字段级双向集合相等幂等 / R2 面板级「未传=不筛选」 / R3 页面活性守卫），含可直接复用的落地范式
+> - `patterns/input-channels.md` — 输入通道规范：受控组件写值五通道实测对比（native setter 首选 / CDP insertText 改 DOM value 但 onChange 不保证触发 / 裸 CDP 逐键不路由 iframe / eval execCommand 需同一次 eval 内 focus+select+insert）
+> - `patterns/keyword-select.md` — 关键词搜索范式（enum 大列表字段默认范式）：「搜索词=过滤器，结果集=选择集」，搜关键词→添加全部匹配项；含高亮拆分去重/清空 no-op/断言语义变更三大陷阱
+> - `patterns/persistent-reset.md` — persistent 适配器三级复位（R1 字段级双向集合相等幂等 / R2 面板级「未传=不筛选」且清空必须独立实现 / R3 页面活性守卫），含可直接复用的落地范式
 > - `pitfalls/timing-and-assertion.md` — 时序与断言八大陷阱：早点击静默丢失（勾选证据锚点）/ toggle 触发器 / 禁止长驻 evaluate / 断言器假阴性 / 锚定面可信度分级 / postData 不内联 / 网络抖动静默 / 多组件过滤
 >
 > 编写适配器时，应根据目标站点的技术栈和具体场景，主动查阅 `references/` 下的相关文件获取可直接复用的代码范式和解决方案。
@@ -60,7 +61,8 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 - **文本输入框**：通过 placeholder 匹配定位，用 shared.js 的 `fillInput`（execCommand + native setter + `_value` 修复）填值
 - **可搜索下拉框**：用 shared.js 的 `fillFilterableSelect`（输入文本 → 等待选项 → 点击匹配项）
 - **普通下拉框**：用 shared.js 的 `clickDropdownOption`（打开下拉 → 匹配选项 → 点击选中）
-- **多选下拉框**：用 shared.js 的 `fillMultiSelect`（打开下拉 → 逐个点击匹配选项 → 关闭）
+- **多选下拉框（enum 大列表）**：**默认走关键词搜索范式**——搜关键词→「添加左侧全部字段值」全选匹配项（无按钮则手动全选+行级去重），想精确就把关键词写全（详见 `patterns/keyword-select.md`，QuickBI order-detail 实证）；仅小列表静态字段才考虑逐个点击匹配选项（`fillMultiSelect`）
+- **多选下拉框（小列表）**：用 shared.js 的 `fillMultiSelect`（打开下拉 → 逐个点击匹配选项 → 关闭）；触发组件搜索/联想的输入必须 eval 内 focus+select+execCommand 同一次完成（`patterns/input-channels.md`）
 - **日期范围选择器**：用 shared.js 的 `fillDateRange`（native setter + Enter 确认）
 - **无值不操作（ephemeral）**：用户不传某个字段时跳过该字段，保持页面当前值
 - **无值清除（persistent）**：复用 tab 的适配器必须先做面板级复位——未传的字段清残留（保证「未传=不筛选」语义），仅带出厂默认值的字段例外（详见第 12 条与 `patterns/persistent-reset.md`）

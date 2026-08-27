@@ -72,14 +72,21 @@ async function resetPanelResidue(page, args) {
   if (!String(args.dealFlag || '').trim()) await clearSingleSelect(page, F_DEAL);
   // 文本:未传但 input 有值 → native setter 置空(见 input-channels.md)
   if (!String(args.customerName || '').trim()) await clearCustomerName(page);
-  // enum:未传但字段有值 → 用 fill 函数的空 list 流程(打开→清空→确定)
+  // enum:未传但字段有值 → 独立的 clearEnumSelect(开弹层→清空→确定→锚点验证已空)
   for (const ef of ENUM_FIELDS) {
     if (String(args[ef.arg] || '').trim()) continue;
     // 探测字段有值才清(避免空转)
-    if (await fieldHasValue(page, ef.label)) await fillEnumMultiSelect(page, ef.label, []);
+    if (await fieldHasValue(page, ef.label)) await clearEnumSelect(page, ef.label);
   }
 }
 ```
+
+> **清空 no-op 陷阱(order-detail 实证 2026-08-27)**:「调 fill 函数传空列表」≠清空。
+> fillEnumMultiSelect 的第一行就是 `if (list.length === 0) return`——空列表直接
+> 返回,弹层根本不开,清空从未执行,而且**没有任何报错**(静默假成功)。本文件
+> 早期版本就写着「用 fill 函数的空 list 流程」,从 quote-detail 抄到 order-detail
+> 才暴露。清空必须独立实现:开弹层 → 点「清空」(已添加>0 时) → 确定 →
+> **锚点验证字段显示文本确实为空**。
 
 ### R2 例外语义
 
