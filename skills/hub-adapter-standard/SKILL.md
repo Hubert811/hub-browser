@@ -20,7 +20,7 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 > - `patterns/implementation-patterns.md` — 策略选择（契约分级）、page.evaluate 使用模式、SPA 加载、错误处理、Vue 状态操作、stub 检测
 > - `pitfalls/filterable-select.md` — 可搜索下拉固定等待 flaky 的轮询修复方案
 > - `pitfalls/micro-frontend.md` — 微前端框架（wujie/qiankun）proxy 拦截坑点与 safeEval 兜底
-> - `patterns/anchor-assert.md` — 锚点断言范式：操作→等待锚点→断言（AAA）、两层断言（UI 值+真实值）、页面自身 API 取数、幂等、禁止兜底
+> - `patterns/anchor-assert.md` — 锚点断言范式：操作→等待锚点→断言（AAA）、三层断言（UI 值+真实值+AX 快照独立通道）、页面自身 API 取数、幂等、禁止兜底
 > - `pitfalls/evaluate-return.md` — page.evaluate 返回值丢失（块体不隐式返回）
 > - `pitfalls/search-race.md` — 可搜索下拉：搜索竞态与「暂无结果」瞬态误判
 > - `pitfalls/iframe-window-context.md` — iframe 上下文：window 指顶层
@@ -45,7 +45,7 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 | 使用顺序 | 先用 hub-adapter-author 做 recon 和框架搭建 | 再用本标准细化实现并通过验收清单 |
 
 **工作流**：
-1. **观察先行**：在真实浏览器逐步操作，对每个交互组件建立「操作→锚点→真实值」规格表（锚点=操作后轮询等待的预期状态，真实值=页面自己发出的请求 payload；等价于 MCP 观察通道，详见 `patterns/anchor-assert.md`）；再调用 `/hub-adapter-author` 进行页面探索和适配器骨架生成
+1. **观察先行**：先 `browser snapshot` 拍一全页快照看结构/字段/出厂默认值（iframe 穿透+值直读，色含关系 label 陷阱侦察期就暴露，比逐个 eval 探便宜且全）；再在真实浏览器逐步操作，对每个交互组件建立「操作→锚点→真实值」规格表（锚点=操作后轮询等待的预期状态，真实值=页面自己发出的请求 payload；等价于 MCP 观察通道，详见 `patterns/anchor-assert.md`）；再调用 `/hub-adapter-author` 进行页面探索和适配器骨架生成
 2. **逐组件攻克**：一个组件一个组件地走「侦察 → 手测 → 锚点链 → 回写 → 单组件验证」，通过后才进下一个——**禁止一次性写完所有组件再跑测试矩阵**（失败时无法定位）。两条配套纪律：**验证通道必须与实现通道一致**（手测用什么通道，适配器就用同一通道实现）；**不在污染页面上叠试错**（每次验证从已知干净状态出发，页面异常唯一正确动作是页面级复位）
 3. 基于 `references/shared-js/eval-helpers.md` 的适配器标准结构创建站点的 shared.js，按 UI 框架调整选择器默认值
 4. 按本标准的 12 条规范细化每个筛选字段、按钮、弹窗交互
@@ -72,6 +72,7 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 - **锚点等待（强制）**：每个筛选操作必须「操作 → 轮询等待预期状态出现（锚点）→ 断言」，禁止固定 sleep（函数：`waitForAnchor`，范式：`patterns/anchor-assert.md`）。
 - **幂等（强制）**：操作前先读当前值，已是目标值则跳过，避免重复点击把默认值 toggle 掉。多选集合的幂等必须是**双向集合相等**（`curSet.length === list.length && list.every(v => curSet.includes(v))`）——「目标 ⊆ 字段」的子集检查会放过额外残留，按并集查询结果错。
 - **两层断言（强制）**：UI 值（控件显示文本）+ 真实值（页面实际请求 payload）都要校验（见 `patterns/anchor-assert.md` §4）。
+- **关键断言点快照互证（强制）**：fill 链完成后/查询前，`page.snapshot({compact:true})` 拍 AX 快照做机械断言（值/关键词在快照文本中出现）——与 DOM 锚点**通道独立**（eval 断言和操作共通道，React 状态错则 DOM 断言跟着错），两通道都绿才算绿；快照纯文本便宜，截图贵只留给人工排障（见 `patterns/anchor-assert.md` §4.2）。
 
 所有筛选字段值**必须在页面上可见**（人类能在浏览器中看到输入的值）。
 

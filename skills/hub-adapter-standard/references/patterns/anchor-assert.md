@@ -85,6 +85,44 @@ const hit = posValues.some((x) => String(x).includes(kw));
 同理 UI 面断言也从「字段显示文本 == 目标值」放宽为「显示文本含至少一个匹配项」。
 语义不跟着变就会全部假阴性——这不是断言器 bug，是契约变了。
 
+### 4.2 第三断言面：AX 快照（独立验证通道）
+
+DOM 锚点与 eval 断言和操作共用同一条 CDP evaluate 通道——React 状态机错了，DOM 渲染
+的就是错的，DOM 断言跟着一起错（CDP insertText 假阳性实证：input.value 对但 onChange
+没触发）。**AX 快照是独立通道**：语义角色+名称+值+状态一次拍全，人类可读，与操作
+代码零共享。实测（2026-08-27 未清订单报表验证）：
+
+| 验证项 | 结果 |
+|---|---|
+| iframe 穿透 | 快照直接包含 iframe 内字段（textbox/combobox 带 ref） |
+| 值直读 | 日期输入值、enum 字段值（含出厂默认）都拼在节点行内：`textbox "请选择时间" [ref=e62]: "2026-08-01"`、`generic "订单行类型VPI供应商直发,供应商直发,标准项目"` |
+| 弹层内容 | 搜索框值、截断警告「默认展示前1000条」、列表项、已添加(N)、全部按钮带 ref——**前端过滤截断在快照里裸奔** |
+| 静默失败抓取 | start==end 错误态：diff 两行直接暴露（`- e62: "2026-08-01"` → `+ e62: "2026-08-10"`，两行同值一眼假） |
+| 成本 | CLI 全程 0.146s/次；适配器内 `page.snapshot({compact:true})` 更低（官方 desktop-commands.js 同款用法） |
+
+**落地范式（适配器内）**：
+
+```javascript
+// 关键断言点（fill 链完成后、查询前、取数前）：
+const snap = await page.snapshot({ compact: true });
+const text = typeof snap === 'string' ? snap : JSON.stringify(snap);
+// 机械断言——与 DOM 锚点互为犄角：两个通道都绿才算绿
+if (!text.includes('"' + kw + '"')) throw new CommandExecutionError('快照未见关键词 ' + kw);
+for (const v of [start, end]) {
+  if (!new RegExp('"' + v + '"').test(text)) throw new CommandExecutionError('快照未见日期 ' + v);
+}
+```
+
+**纪律**：
+1. 过程锚点（轮询步）仍用 DOM 锚点——快照不是拿来得零轮询的；快照用于**关键断言点**
+   与**侦察**（写适配器前先 snapshot 看全页面结构/字段/默认值，包含关系 label 陷阱
+   侦察期就暴露，不用逐个 eval 探）
+2. 截图贵（读图耗 token），快照便宜（纯文本）——**证据链默认用快照，截图只留给
+   人工排障**（错误报告附路径，不默认读回）
+3. CLI `browser diff` 的基线是「上次 snapshot/diff」——操作后**直接 diff** 才有信号，
+   中间插 snapshot 会刷基线
+
+
 
 ---
 
