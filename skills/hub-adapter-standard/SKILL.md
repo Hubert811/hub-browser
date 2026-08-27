@@ -27,6 +27,9 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 > - `pitfalls/network-capture.md` — 网络捕获通道：自带收集器无 postData、CDP 在 portal iframe 上不可靠、patch 主+CDP 次
 > - `pitfalls/escaping-ladder.md` — 模板字符串/正则的跨层转义阶梯
 > - `pitfalls/verify-timeout.md` — hub browser verify 30s 子进程上限
+> - `patterns/input-channels.md` — 输入通道规范：受控组件写值四通道实测对比（native setter 首选 / insertText 有效需 eval focus 前置 / 裸 CDP 逐键不路由 iframe / eval execCommand 的 iframe 边界）
+> - `patterns/persistent-reset.md` — persistent 适配器三级复位（R1 字段级双向集合相等幂等 / R2 面板级「未传=不筛选」 / R3 页面活性守卫），含可直接复用的落地范式
+> - `pitfalls/timing-and-assertion.md` — 时序与断言八大陷阱：早点击静默丢失（勾选证据锚点）/ toggle 触发器 / 禁止长驻 evaluate / 断言器假阴性 / 锚定面可信度分级 / postData 不内联 / 网络抖动静默 / 多组件过滤
 >
 > 编写适配器时，应根据目标站点的技术栈和具体场景，主动查阅 `references/` 下的相关文件获取可直接复用的代码范式和解决方案。
 
@@ -42,10 +45,11 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 
 **工作流**：
 1. **观察先行**：在真实浏览器逐步操作，对每个交互组件建立「操作→锚点→真实值」规格表（锚点=操作后轮询等待的预期状态，真实值=页面自己发出的请求 payload；等价于 MCP 观察通道，详见 `patterns/anchor-assert.md`）；再调用 `/hub-adapter-author` 进行页面探索和适配器骨架生成
-2. 基于 `references/shared-js/eval-helpers.md` 的适配器标准结构创建站点的 shared.js，按 UI 框架调整选择器默认值
-3. 按本标准的 10 条规范细化每个筛选字段、按钮、弹窗交互
-4. 按本标准的测试清单逐项验收（配合 `hub browser verify <site>/<name>` 自动验收）
-5. 输出覆盖报告（见下方"覆盖报告"章节），供用户检查覆盖完整性
+2. **逐组件攻克**：一个组件一个组件地走「侦察 → 手测 → 锚点链 → 回写 → 单组件验证」，通过后才进下一个——**禁止一次性写完所有组件再跑测试矩阵**（失败时无法定位）。两条配套纪律：**验证通道必须与实现通道一致**（手测用什么通道，适配器就用同一通道实现）；**不在污染页面上叠试错**（每次验证从已知干净状态出发，页面异常唯一正确动作是页面级复位）
+3. 基于 `references/shared-js/eval-helpers.md` 的适配器标准结构创建站点的 shared.js，按 UI 框架调整选择器默认值
+4. 按本标准的 12 条规范细化每个筛选字段、按钮、弹窗交互
+5. 按本标准的测试清单逐项验收（配合 `hub browser verify <site>/<name>` 自动验收）
+6. 输出覆盖报告（见下方"覆盖报告"章节），供用户检查覆盖完整性
 
 ---
 
@@ -58,11 +62,13 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 - **普通下拉框**：用 shared.js 的 `clickDropdownOption`（打开下拉 → 匹配选项 → 点击选中）
 - **多选下拉框**：用 shared.js 的 `fillMultiSelect`（打开下拉 → 逐个点击匹配选项 → 关闭）
 - **日期范围选择器**：用 shared.js 的 `fillDateRange`（native setter + Enter 确认）
-- **无值不操作**：用户不传某个字段时跳过该字段，保持默认值
+- **无值不操作（ephemeral）**：用户不传某个字段时跳过该字段，保持页面当前值
+- **无值清除（persistent）**：复用 tab 的适配器必须先做面板级复位——未传的字段清残留（保证「未传=不筛选」语义），仅带出厂默认值的字段例外（详见第 12 条与 `patterns/persistent-reset.md`）
+- **受控组件写值通道**：React/Vue 受控 input 用 native setter + input 事件（首选）；`page.insertText` 有效但需 eval focus 前置；通道实测对比见 `patterns/input-channels.md`
 - **隐藏字段展开**：用 shared.js 的 `expandHiddenFields`，在 `resetFilters` 后自动执行
 
 - **锚点等待（强制）**：每个筛选操作必须「操作 → 轮询等待预期状态出现（锚点）→ 断言」，禁止固定 sleep（函数：`waitForAnchor`，范式：`patterns/anchor-assert.md`）。
-- **幂等（强制）**：操作前先读当前值，已是目标值则跳过，避免重复点击把默认值 toggle 掉。
+- **幂等（强制）**：操作前先读当前值，已是目标值则跳过，避免重复点击把默认值 toggle 掉。多选集合的幂等必须是**双向集合相等**（`curSet.length === list.length && list.every(v => curSet.includes(v))`）——「目标 ⊆ 字段」的子集检查会放过额外残留，按并集查询结果错。
 - **两层断言（强制）**：UI 值（控件显示文本）+ 真实值（页面实际请求 payload）都要校验（见 `patterns/anchor-assert.md` §4）。
 
 所有筛选字段值**必须在页面上可见**（人类能在浏览器中看到输入的值）。
@@ -228,7 +234,7 @@ if (args.createTimeFrom || args.createTimeTo) {
 
 1. **数据来源**：捕获页面自己发出的请求（`installRequestCapture`，patch 主 + CDP 次）→ 解析 payload → 用页面自己的 payload 分页取数。
 2. **禁止**：从 DOM 解析数据（脆弱、与展示耦合）；适配器凭空构造请求体（会与页面实际查询分叉）。
-3. **真实值断言**：捕获的请求条件必须 == 期望（日期区间/团队列表/阶段等），不一致抛 `CommandExecutionError` 并带上实际条件。
+3. **真实值断言**：捕获的请求条件必须 == 期望（日期区间/团队列表/阶段等），不一致抛 `CommandExecutionError` 并带上实际条件。存在性断言的值集合必须覆盖**全部操作符**（in/equalTo/…，不筛 functionalOperator）——只认单一操作符的断言器会把「值已生效」误报成「未生效」（equalTo 假阴性实证）。**断言失败时第一步审计断言器本身**，先用不同源通道（独立 CDP 监听）核实原始事实，第二步才动实现链。
 4. **禁止兜底掩盖失败**：字段值必须来自控件实际选中值，取不到就报错（宁可失败得难看，不可成功得虚假）。
 5. 范式与示例见 `patterns/anchor-assert.md` §4-5。
 
@@ -253,6 +259,20 @@ hub <site> <command> --customerName "真实客户名"
 
 ---
 
+## 12. persistent 适配器三级复位
+
+复用同一 tab 的适配器（`siteSession: 'persistent'`），每次执行开始时 **reset 先于一切 fill**——上一次执行（或中途失败）留下的字段值/弹层/假值会污染本次查询：
+
+- **R1 字段级**（fill 函数内置）：弹层残留先取消；幂等检查双向集合相等；不一致先清空重选
+- **R2 面板级**（fill 前统一执行）：未传参数的字段清残留，保证页面筛选状态 == 本次入参的精确投影；出厂默认字段例外
+- **R3 页面级**（自动降级）：fill 链前主 frame 活性探测（evaluate '1+1'），僵死直接 goto 重载 + dashboard 就绪锚点兜底
+
+时序陷阱补充（详见 `pitfalls/timing-and-assertion.md`）：「列表可见 ≠ 可交互」——点选后必须锚定勾选证据（已添加计数真实增加）；弹层触发器常是 toggle 语义，打开前必须探测当前态；等待循环一律 Node 侧分片轮询，**禁止把循环塞进单次 evaluate**（页面忙时撞 CDP 60s 单命令超时）。
+
+范式与 persistent 专用验证清单见 `references/patterns/persistent-reset.md`。
+
+---
+
 ## 测试清单
 
 新适配器完成后，逐项测试：
@@ -265,6 +285,8 @@ hub <site> <command> --customerName "真实客户名"
 - [ ] 每个多选下拉单独测试（使用系统中已有的真实数据）
 - [ ] 每个日期范围单独测试（注意：部分系统要求时间范围不超过一定期限，超过会触发错误弹窗并回退到默认范围）
 - [ ] 字段组合测试（至少 3 种组合，使用不同真实数据）
+- [ ] **persistent 复位**：连续跑两个不同筛选组合，第二个 case 的结果不含第一个 case 的残留条件；无参默认 case 跑在有残留的页面上，结果与干净页面一致
+- [ ] **幂等重跑**：同参数连续跑两次，结果一致且 tab 数恒定（复用而非新开）
 - [ ] 导出按钮无筛选（应报错）
 - [ ] 导出按钮有筛选（应成功）
 - [ ] 批量操作按钮
