@@ -90,10 +90,10 @@ CLI 等价：`hub browser <session> tab list` / `hub browser <session> tab close
 |---|---|---|
 | `tabs` | list / active / new / close；list 只显示本 space 的页面 | 找 pageId、看当前页、新开或关闭页面 |
 | `navigate` | 加载 url / 后退 / 前进 / 刷新，返回新 snapshot | 跳转；导航后 refs 失效，需重新 snapshot |
-| `snapshot` | 页面可访问性树，带稳定 `[ref=eN]`；P3-5 起每个 ref 行尾内嵌 DOM 定位单元 `→ tag#id [sel="..."]`（最短唯一稳定 selector，写适配器/定位元素直接用） | 每个交互前；主循环的起点 |
+| `snapshot` | 页面可访问性树，带稳定 `[ref=eN]`；P3-5 起每个 ref 行尾内嵌 DOM 定位单元 `→ tag#id [sel="..."]`（最短唯一稳定 selector，写适配器/定位元素直接用）；同源 iframe 内容 stitch 进同一棵树 | 每个交互前；主循环的起点 |
 | `act` | click / type / fill / press / hover / focus / check / uncheck / select / scroll / drag（用 ref）；完成后自动回读 diff，含 DOM 维度 `DOM changes (+N/-M)`（spinner 等无 role 节点的出现/消失也可见） | 操作页面元素 |
 | `inspect` | 按 ref 深挖单元素：完整 class/属性、祖先路径、候选 selector（标注策略且已验证唯一）、outerHTML 头 | 写适配器要精确细节时；快照内嵌单元不够用 |
-| `find` | CSS selector 或语义定位（role/name/label/text/testid）查元素，返回带 ref/tag/text/attrs 的匹配列表 | 知道要找什么但不扫全页；返回的 ref 直接喂 act |
+| `find` | CSS selector 或语义定位（role/name/label/text/testid）查元素，返回带 ref/tag/text/attrs 的匹配列表；同源 iframe 内也会查到（条目带 `frame` 标注），iframe 内元素的 ref 同样可被 click/type 消费 | 知道要找什么但不扫全页；返回的 ref 直接喂 act |
 | `read` | 提取页面内容：markdown / 纯文本 / 链接列表 | 读内容、抓数据；只读不操作 |
 | `extract` | 去噪 markdown（剥广告/导航），长页按段落感知分块：返回 content + `next_start_char`，回传即续读 | 长文/正文抓取；比 read 干净，超长页不用一次 dump |
 | `grep` | 在 ax 行或可见文本里搜索，不 dump 全页 | 只想知道页面上有没有某内容 |
@@ -165,7 +165,7 @@ CLI 等价：
 # work 是 session 名：CLI 用同一 session 串起多步操作（MCP 无 session）
 hub space create "查 github issue"          # 1. 建 space
 hub browser work open "https://github.com/..."   # 2. 开 tab
-hub browser work state                           # 3. 看页面
+hub browser work snapshot                        # 3. 看页面（AX 树 = MCP snapshot；旧写法 state --source ax 仍可用）
 hub space close <id>                        # 6. 完成默认全关
 ```
 

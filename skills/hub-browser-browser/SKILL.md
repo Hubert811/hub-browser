@@ -183,7 +183,7 @@ hub-browser 是 MCP 驱动（主 skill：`hub-browser`）。CLI 命令和 MCP �
 | 命令 | 用途 |
 |------|------|
 | `browser state` | 快照：带 `[N]` ref 的文本树、滚动提示、hidden-interactive 提示、`compounds (N):` 侧栏（date/select/file ref）。 |
-| `browser state --source ax` | 可访问性树快照（opt-in）。自定义控件、portal、iframe 内容在普通 `state` 里难识别时用。AX ref 能按 role/name/nth 找回 stale 的 React 重渲染，也能路由同源 iframe ref；跨源 iframe ref 是 best-effort（Chrome 未必暴露可 attach 的 OOPIF target）。 |
+| `browser snapshot` | 可访问性树快照（默认 AX，= MCP `snapshot`；旧写法 `state --source ax` 仍可用）。自定义控件、portal、iframe 内容在普通 `state` 里难识别时用。AX ref 能按 role/name/nth 找回 stale 的 React 重渲染，也能路由同源 iframe ref；跨源 iframe ref 是 best-effort（Chrome 未必暴露可 attach 的 OOPIF target）。 |
 | `browser state --compare-sources` | 只出指标的 DOM vs AX 对比，用来判断该不该把 AX 设为默认。它打印计数和体积，不打页面文本，适合安全分享做校验。 |
 | `browser find --css <sel> [--limit N] [--text-max N]` | 跑一次 CSS 查询，每个命中返回 `{nth, ref, tag, role, text, attrs, visible, compound?}`。会给之前快照没标记的命中分配 ref。已知 selector 时比 `state` 便宜。 |
 | `browser find --role button --name Save` | 语义定位查询。也支持 `--label`、`--text`、`--testid`。控件有可访问标签时，先于裸 CSS 用。 |
