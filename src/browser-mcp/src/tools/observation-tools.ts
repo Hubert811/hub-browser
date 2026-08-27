@@ -84,13 +84,51 @@ export const network = defineTool({
     const text =
       args.detail
         ? `network detail ${String(env.key ?? args.detail)}: status ${String(env.status ?? '?')} ${String(env.method ?? '')} ${String(env.url ?? '')}`
-        : `Captured ${count ?? 0} requests${args.failed ? ' (failed only)' : ''}.\nRun again with detail=<key> for a full body.`
+        : renderNetworkListText(env, count, args.failed === true)
     return {
       content: [{ type: 'text' as const, text }],
       structuredContent: env,
     }
   },
 })
+
+/**
+ * P2 fix — the list branch used to render ONLY a count line ("Captured N
+ * requests.") with every entry living in structuredContent alone: a
+ * text-channel consumer (agent reading content blocks, a human in a
+ * terminal) saw nothing but the number and could not even pick a detail
+ * key. Render the entries compactly in text too, mirroring the find/analyze
+ * renderers.
+ */
+function renderNetworkListText(
+  env: Record<string, unknown>,
+  count: number | undefined,
+  failedOnly: boolean,
+): string {
+  const entries =
+    (Array.isArray(env.entries) ? env.entries : []) as Array<
+      Record<string, unknown>
+    >
+  const lines: string[] = [
+    `Captured ${count ?? 0} requests${failedOnly ? ' (failed only)' : ''}.`,
+  ]
+  if (env.capture_started_now === true) {
+    lines.push(
+      'Capture just started — only requests from this moment on are visible. Re-trigger the page action (click, navigate) and query again.',
+    )
+  }
+  const MAX_TEXT_ENTRIES = 20
+  for (const e of entries.slice(0, MAX_TEXT_ENTRIES)) {
+    lines.push(
+      `- [${String(e.key ?? '?')}] ${String(e.method ?? '')} ${String(e.url ?? '')} → ${String(e.status ?? '?')}${typeof e.size === 'number' ? ` (${e.size}B)` : ''}`,
+    )
+  }
+  if (entries.length > MAX_TEXT_ENTRIES) {
+    lines.push(`(+${entries.length - MAX_TEXT_ENTRIES} more)`)
+  }
+  lines.push('Run again with detail=<key> for a full body.')
+  return lines.join('\n')
+}
 
 async function runNetworkDetailFor(
   ctx: ToolContext,
