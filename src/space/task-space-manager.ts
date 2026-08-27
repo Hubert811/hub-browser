@@ -78,6 +78,16 @@ export interface TabLike {
 /** One tab attributed to a space (ledger). */
 export interface TabRef {
   pageId: number
+  /**
+   * Stable tab identity (CDP targetId). pageId is a per-connection sequence
+   * number — it drifts across process restarts, so a ledger reconciled by
+   * pageId alone binds whatever tab happens to hold that number in the new
+   * connection and can even overwrite the ledger's url with the wrong tab's
+   * url (observed: the QuickBI ledger got rewritten to chrome://newtab).
+   * targetId is the cross-process anchor; pageId stays for same-connection
+   * idempotency, always double-checked against the url.
+   */
+  targetId?: string
   url: string
   title?: string
   /**
@@ -130,6 +140,8 @@ export interface SpaceInfo {
 
 export interface SpaceTabInfo {
   pageId: number
+  /** Stable tab identity (present when known) — see TabRef.targetId. */
+  targetId?: string
   url: string
   title?: string
   isActive?: boolean
@@ -1155,9 +1167,11 @@ export class TaskSpaceManager {
       tabGroupId: opts?.tabGroupId,
     })
     let pageId: number | undefined
+    let stableTargetId: string | undefined
     if (typeof targetId === 'number') {
       pageId = targetId
     } else {
+      stableTargetId = targetId
       const tabs = await gw.listTabs()
       pageId = tabs.find((t) => t.targetId === targetId)?.pageId
     }
@@ -1170,8 +1184,9 @@ export class TaskSpaceManager {
     }
     space.tabs = space.tabs.filter((t) => t.pageId !== pageId)
     // Fresh tabs are pending restore: the next daemon/MCP start reconciles them
-    // (re-attach if still open, re-open by URL if gone) exactly once.
-    space.tabs.push({ pageId, url, title: undefined, restored: false })
+    // (re-attach if still open, re-open by URL if gone) exactly once. The
+    // stable targetId rides along so restart reconciliation cannot misbind.
+    space.tabs.push({ pageId, targetId: stableTargetId, url, title: undefined, restored: false })
     space.lastActiveAt = this.now()
     this.save()
     this.recordTabOp(pageId)
@@ -1207,19 +1222,31 @@ export class TaskSpaceManager {
       }
     }
     if (live.length > 0) {
-      const liveIds = new Set(live.map((t) => t.pageId))
+      // Cross-process prune guard: a tab stays when its stable targetId is
+      // live, or when its pageId is live AND the url agrees (a stranger
+      // holding the renumbered id must not keep the ledger entry alive).
+      const liveByTarget = new Set(live.map((t) => t.targetId).filter(Boolean))
+      const liveById = new Map(live.map((t) => [t.pageId, t]))
       const before = space.tabs.length
-      space.tabs = space.tabs.filter((t) => liveIds.has(t.pageId))
+      space.tabs = space.tabs.filter((t) => {
+        if (t.targetId && liveByTarget.has(t.targetId)) return true
+        const li = liveById.get(t.pageId)
+        return !!li && !!t.url && !!li.url && this.sameRestoreUrl(li.url) === this.sameRestoreUrl(t.url)
+      })
       if (space.tabs.length !== before) {
         space.lastActiveAt = this.now()
         this.save()
       }
     }
     return space.tabs.map((ref) => {
-      const liveInfo = live.find((t) => t.pageId === ref.pageId)
+      const liveInfo =
+        (ref.targetId
+          ? live.find((t) => t.targetId === ref.targetId)
+          : undefined) ?? live.find((t) => t.pageId === ref.pageId)
       const health = this.tabHealthFor(ref.pageId)
       return {
         pageId: ref.pageId,
+        targetId: liveInfo?.targetId ?? ref.targetId,
         url: liveInfo?.url ?? ref.url,
         title: liveInfo?.title ?? ref.title,
         isActive: liveInfo?.isActive,
@@ -1237,10 +1264,53 @@ export class TaskSpaceManager {
    * close failure must not abort the batch, and the caller's ledger cleanup
    * stays authoritative.
    */
+  /** P1: bound one best-effort tab close (gateway call + fallbacks) to a deadline. */
+  private async closeTabWithDeadline(
+    gw: SpaceTabGateway,
+    ref: TabRef,
+  ): Promise<void> {
+    const CLOSE_TAB_DEADLINE_MS = 20_000
+    return new Promise<void>((resolve, _reject) => {
+      const timer = setTimeout(
+        () => resolve(), // deadline = give up silently; ledger cleanup proceeds
+        CLOSE_TAB_DEADLINE_MS,
+      )
+      this.closeTabBestEffort(gw, ref).then(
+        () => { clearTimeout(timer); resolve() },
+        () => { clearTimeout(timer); resolve() }, // best-effort: errors are already swallowed inside
+      )
+    })
+  }
+
+  /** P1: bound the tab-group close the same way. */
+  private async tabGroupCloseWithDeadline(
+    gw: SpaceTabGateway,
+    tabGroupId: string,
+  ): Promise<void> {
+    const CLOSE_GROUP_DEADLINE_MS = 10_000
+    return new Promise<void>((resolve, _reject) => {
+      const timer = setTimeout(() => resolve(), CLOSE_GROUP_DEADLINE_MS)
+      gw.tabGroupClose?.(tabGroupId).then(
+        () => { clearTimeout(timer); resolve() },
+        () => { clearTimeout(timer); resolve() },
+      )
+    })
+  }
+
   private async closeTabBestEffort(
     gw: SpaceTabGateway,
     ref: TabRef,
   ): Promise<void> {
+    // Stable identity first: the ledger pageId is a per-connection number and
+    // may address a different tab in this connection; targetId never drifts.
+    if (ref.targetId) {
+      try {
+        await gw.closeTab(ref.targetId)
+        return
+      } catch {
+        // targetId close unsupported/stale — fall through to the legacy path.
+      }
+    }
     try {
       await gw.closeTab(ref.pageId)
       return
@@ -1321,13 +1391,22 @@ export class TaskSpaceManager {
       for (const ref of [...space.tabs]) {
         // Best-effort: stale pageIds fall back to exact-URL matching against
         // the live tab list (bug #8); a still-failing close is skipped and the
-        // ledger entry is dropped below regardless.
-        await this.closeTabBestEffort(gw, ref)
+        // ledger entry is dropped below regardless. P1 (space.close hang):
+        // a wedged closeTab used to hang the whole space.close forever —
+        // bound each attempt so closeSpace always finishes; the tab may leak
+        // open, which the ledger cleanup below tolerates by design.
+        try {
+          await this.closeTabWithDeadline(gw, ref)
+        } catch (err) {
+          console.warn(
+            `[hub-spaces] tab close skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
+          )
+        }
       }
       // D5 — 关组（连 tab 一起，已有语义）。Best-effort：失败继续，账本清理照旧。
       if (space.tabGroupId && gw.tabGroupClose) {
         try {
-          await gw.tabGroupClose(space.tabGroupId)
+          await this.tabGroupCloseWithDeadline(gw, space.tabGroupId)
         } catch (err) {
           console.warn(
             `[hub-spaces] tab-group close skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
@@ -1599,14 +1678,47 @@ export class TaskSpaceManager {
       // not keep an idle space "fresh" forever or the TTL reaper never fires.
       let touched = false
       for (const ref of space.tabs) {
-        // 1. Same pageId still live → keep (same-process / same-connection idempotency).
+        // 1a. Stable targetId match — the cross-process anchor. pageId is a
+        //     per-connection sequence number and MUST NOT reconcile a ledger
+        //     on its own: a new connection renumbers tabs, and binding by the
+        //     stale number silently re-attributes whatever tab holds it now
+        //     (then overwrites the ledger url with that wrong tab's url —
+        //     the QuickBI-ledger-turned-newtab corruption).
+        const byTarget = ref.targetId
+          ? live.find(
+              (t) => t.targetId === ref.targetId && !used.has(t.pageId),
+            )
+          : undefined
+        if (byTarget) {
+          used.add(byTarget.pageId)
+          next.push({
+            pageId: byTarget.pageId,
+            targetId: byTarget.targetId,
+            url: byTarget.url ?? ref.url,
+            title: byTarget.title ?? ref.title,
+            restored: true,
+          })
+          if (!ref.restored || byTarget.pageId !== ref.pageId) {
+            reconciled++
+            touched = true
+          }
+          continue
+        }
+        // 1b. Same pageId AND same url → keep (same-connection idempotency;
+        //     the url check rejects a renumbered stranger holding the id).
         const liveById = live.find(
           (t) => t.pageId === ref.pageId && !used.has(t.pageId),
         )
-        if (liveById) {
+        if (
+          liveById &&
+          liveById.url &&
+          ref.url &&
+          this.sameRestoreUrl(liveById.url) === this.sameRestoreUrl(ref.url)
+        ) {
           used.add(liveById.pageId)
           next.push({
             pageId: ref.pageId,
+            targetId: liveById.targetId ?? ref.targetId,
             url: liveById.url ?? ref.url,
             title: liveById.title ?? ref.title,
             restored: true,
@@ -1630,6 +1742,7 @@ export class TaskSpaceManager {
           used.add(byUrl.pageId)
           next.push({
             pageId: byUrl.pageId,
+            targetId: byUrl.targetId ?? ref.targetId,
             url: ref.url,
             title: ref.title ?? byUrl.title,
             restored: true,
@@ -1663,7 +1776,15 @@ export class TaskSpaceManager {
           }
           if (pageId !== undefined) {
             used.add(pageId)
-            next.push({ pageId, url: ref.url, title: ref.title, restored: true })
+            const reopenedTargetId =
+              typeof targetId === 'string' ? targetId : undefined
+            next.push({
+              pageId,
+              targetId: reopenedTargetId ?? ref.targetId,
+              url: ref.url,
+              title: ref.title,
+              restored: true,
+            })
             reconciled++
             touched = true
           }
@@ -2216,6 +2337,7 @@ export class TaskSpaceManager {
     owner: string,
     pageId: number,
     url?: string,
+    targetId?: string,
   ): Promise<boolean> {
     const currentId = this.state.currentSpaceByOwner[owner]
     if (!currentId) return false
@@ -2228,7 +2350,7 @@ export class TaskSpaceManager {
     if (holder && holder.id !== space.id) return false
     this.assertAgentCanAct(owner, space)
     if (space.tabs.some((t) => t.pageId === pageId)) return true
-    space.tabs.push({ pageId, url: url ?? 'about:blank', restored: false })
+    space.tabs.push({ pageId, targetId, url: url ?? 'about:blank', restored: false })
     space.lastActiveAt = this.now()
     this.save()
     return true
@@ -2278,11 +2400,29 @@ export class TaskSpaceManager {
       from.tabs = from.tabs.filter((t) => t.pageId !== opts.pageId)
       from.lastActiveAt = this.now()
     }
+    // Claim with the stable identity when the gateway knows this tab: the
+    // live targetId anchors future reconciles, and the live url beats the
+    // about:blank fallback (a pageId-only entry gets pruned by listTabs'
+    // cross-process guard when the ids drift).
+    let claimedTargetId = existing?.targetId
+    let claimedUrl = existing?.url
+    const gw = this.gateway
+    if (gw && (claimedTargetId === undefined || !claimedUrl || claimedUrl === 'about:blank')) {
+      try {
+        const live = await gw.listTabs()
+        const li = live.find((t) => t.pageId === opts.pageId)
+        if (li) {
+          claimedTargetId = claimedTargetId ?? li.targetId
+          if (li.url && (!claimedUrl || claimedUrl === 'about:blank')) claimedUrl = li.url
+        }
+      } catch {
+        // best-effort: fall back to the legacy claim shape below
+      }
+    }
     to.tabs.push({
       pageId: opts.pageId,
-      // Keep the ledger url when known; a brand-new claim falls back to
-      // about:blank until updateTabUrl/restore corrects it.
-      url: existing?.url ?? 'about:blank',
+      targetId: claimedTargetId,
+      url: claimedUrl ?? 'about:blank',
       title: existing?.title,
       restored: true, // the browser tab is live by construction (drag/claim)
     })

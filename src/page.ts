@@ -36,9 +36,33 @@ import { resolveCdpPort } from './cdp-port.js';
 function serialOp<T>(session: unknown, fn: () => Promise<T>): Promise<T> {
   const holder = session as { __hubOpChain?: Promise<unknown> }
   const chain = holder.__hubOpChain ?? Promise.resolve()
-  const next = chain.then(fn, fn)
+  // P1 (space.close hang): a wedged CDP call inside one tab op (observed:
+  // Browser.closeTab occasionally never answers on the QuickBI page) left
+  // the chain pending forever — every later tab op, including space.close,
+  // queued behind a dead promise. Degrade a stuck op to a timeout error so
+  // the chain keeps settling; the JS promise itself is not cancellable, so
+  // a late CDP answer may still land, which closeTabBestEffort tolerates.
+  const run = () => withDeadline(fn, TAB_OP_DEADLINE_MS, 'tab op')
+  const next = chain.then(run, run)
   holder.__hubOpChain = next.catch(() => {})
   return next
+}
+
+/** Deadline for one serial tab op (open/close/select). */
+const TAB_OP_DEADLINE_MS = 12_000
+
+function withDeadline<T>(p: Promise<T> | (() => Promise<T>), ms: number, label: string): Promise<T> {
+  const body = typeof p === 'function' ? p() : p
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms (wedged CDP call)`)),
+      ms,
+    )
+    body.then(
+      (v) => { clearTimeout(timer); resolve(v) },
+      (e) => { clearTimeout(timer); reject(e) },
+    )
+  })
 }
 
 export class UnifiedPage extends BasePage {

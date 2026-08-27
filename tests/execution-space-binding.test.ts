@@ -138,7 +138,7 @@ describe('bindAdapterPageToSpace — adapter command → current space', () => {
     // The tab is attributed to the space ledger (bug #2/#6: owned + closable).
     const spaces = ledgerSpaces(storagePath)
     expect(spaces[space.id].tabs).toEqual([
-      { pageId: 100, url: 'https://zhihu.com', restored: false },
+      { pageId: 100, targetId: 'target-100', url: 'https://zhihu.com', restored: false },
     ])
     expect(spaces[space.id].owner).toBe('agent-a')
   })

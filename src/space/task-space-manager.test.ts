@@ -1367,7 +1367,9 @@ describe('TabFreshness health telemetry — in-memory ops/ageMs', () => {
     const tab = raw.spaces[space.id].tabs[0]
     expect(tab).not.toHaveProperty('ops')
     expect(tab).not.toHaveProperty('ageMs')
-    expect(Object.keys(tab).sort()).toEqual(['pageId', 'restored', 'url'])
+    // targetId (stable tab anchor) is a legal persisted field since the
+    // pageId-drift fix; ops/ageMs telemetry must still never persist.
+    expect(Object.keys(tab).sort()).toEqual(['pageId', 'restored', 'targetId', 'url'])
   })
 })
 

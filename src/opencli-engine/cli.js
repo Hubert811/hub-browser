@@ -3721,8 +3721,19 @@ cli({
         const { manager, space } = await currentSpaceForBrowser(gateway);
         if (!space) return [];
         const refs = await manager.listTabs(space.id);
-        const pageIds = new Set(refs.map((t) => t.pageId).filter((id) => typeof id === 'number'));
-        return tabs.filter((t) => pageIds.has(t.pageId));
+        // P1 (tab-list 1/N bug): pageId is a per-connection sequence number —
+        // across process restarts the live list's pageId N can be a DIFFERENT
+        // tab than the ledger's pageId N, so scoping by pageId alone showed a
+        // random one tab (and restore even rewrote ledger urls this way).
+        // Anchor on the stable targetId; a pageId hit only counts when the
+        // url agrees too.
+        const byTarget = new Set(refs.map((t) => t.targetId).filter(Boolean));
+        const refById = new Map(refs.filter((t) => typeof t.pageId === 'number').map((t) => [t.pageId, t]));
+        return tabs.filter((t) => {
+            if (t.targetId && byTarget.has(t.targetId)) return true;
+            const ref = refById.get(t.pageId);
+            return !!ref && !!ref.url && !!t.url && ref.url === t.url;
+        });
     }
     /** Reject a tab that doesn't belong to the current space (bug #4). D3 —
      *  without a current space the operation is rejected too (no legacy no-op).
