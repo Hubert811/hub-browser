@@ -15,6 +15,7 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 > - `shared-js/wait-and-state.md` — 等待与状态类公共函数（7 个，完整实现）
 > - `shared-js/eval-helpers.md` — EVAL 代码块常量（setVal 等）+ 适配器标准结构模板
 > - `patterns/filter-input.md` — 5 种筛选字段输入范式（文本、可搜索下拉、多选、日期范围、批量输入），Element Plus vs Ant Design 对比
+> - `patterns/site-lib.md` — 站点组件库分层规范：单文件 shared.js 升级为 lib/ 模块树的阈值/五层结构/依赖规则/各层契约/迁移工作流（QuickBI 实例）
 > - `patterns/element-location.md` — 元素定位策略：DOM 结构差异、下拉可见性检查、选项模糊匹配、隐藏字段展开
 > - `patterns/button-actions.md` — 按钮前置条件、行内操作、弹窗交互、输出字段限制、截图时机
 > - `patterns/implementation-patterns.md` — 策略选择（契约分级）、page.evaluate 使用模式、SPA 加载、错误处理、Vue 状态操作、stub 检测
@@ -47,7 +48,7 @@ description: "hub 适配器编写规范与标准。当需要创建 hub 适配器
 **工作流**：
 1. **观察先行**：先 `browser snapshot` 拍一全页快照看结构/字段/出厂默认值（iframe 穿透+值直读，色含关系 label 陷阱侦察期就暴露，比逐个 eval 探便宜且全）；再在真实浏览器逐步操作，对每个交互组件建立「操作→锚点→真实值」规格表（锚点=操作后轮询等待的预期状态，真实值=页面自己发出的请求 payload；等价于 MCP 观察通道，详见 `patterns/anchor-assert.md`）；再调用 `/hub-adapter-author` 进行页面探索和适配器骨架生成
 2. **逐组件攻克**：一个组件一个组件地走「侦察 → 手测 → 锚点链 → 回写 → 单组件验证」，通过后才进下一个——**禁止一次性写完所有组件再跑测试矩阵**（失败时无法定位）。两条配套纪律：**验证通道必须与实现通道一致**（手测用什么通道，适配器就用同一通道实现）；**不在污染页面上叠试错**（每次验证从已知干净状态出发，页面异常唯一正确动作是页面级复位）
-3. 基于 `references/shared-js/eval-helpers.md` 的适配器标准结构创建站点的 shared.js，按 UI 框架调整选择器默认值
+3. 基于 `references/shared-js/eval-helpers.md` 的适配器标准结构创建站点的 shared.js，按 UI 框架调整选择器默认值；适配器 ≥3 个且 shared.js 超过千行后，按 `references/patterns/site-lib.md` 升级为 lib/ 分层模块树（五层结构/依赖规则/各层契约/迁移工作流）
 4. 按本标准的 12 条规范细化每个筛选字段、按钮、弹窗交互
 5. 按本标准的测试清单逐项验收（配合 `hub browser verify <site>/<name>` 自动验收）
 6. 输出覆盖报告（见下方"覆盖报告"章节），供用户检查覆盖完整性
