@@ -64,6 +64,13 @@ export class NetworkCollector {
   // objects (registry on the BrowserSession), so a long-lived daemon must
   // not accumulate entries without bound.
   private static readonly MAX_ENTRIES = 500;
+  /** Bug #22: request bodies are the replay contract, not a preview — cap at
+   * 1MiB (aligned with the JS interceptor path) instead of the 8KiB response
+   * preview budget. Form-encoded query payloads are KB-scale; 1MiB covers
+   * them with headroom while keeping worst-case memory bounded
+   * (MAX_ENTRIES × 1MiB only if every entry is a max-size POST — in practice
+   * request bodies are tiny and the 500-entry ring bounds the tail). */
+  private static readonly MAX_REQUEST_BODY = 1024 * 1024;
   private entries: Array<Record<string, unknown>> = [];
   private pending = new Map<string, number>();
   private unsub: (() => void)[] = [];
@@ -91,9 +98,18 @@ export class NetworkCollector {
         };
         // C1 fix: keep the request body (POST payloads are the adapter
         // contract — without them, replaying a query API is guesswork).
+        // Bug #22 (2026-08-27, QuickBI order-detail dogfooding): request bodies
+        // used to share the 8KiB response-preview budget, silently truncating
+        // the adapter replay contract — the order-detail olap body is ~12KB and
+        // `network --detail` handed out a cut mid-JSON body. Request bodies are
+        // the CONTRACT (replay target), not a preview: cap them at 1MiB,
+        // aligned with the JS interceptor path (network-interceptor.js), so both
+        // capture channels agree. Response previews stay at 8KiB (memory
+        // budget; see O5).
         if (typeof params.request.postData === 'string' && params.request.postData.length > 0) {
-          entry.requestBody = params.request.postData.slice(0, 8192);
-          if (params.request.postData.length > 8192) {
+          const cap = NetworkCollector.MAX_REQUEST_BODY;
+          entry.requestBody = params.request.postData.slice(0, cap);
+          if (params.request.postData.length > cap) {
             entry.requestBodyTruncated = true;
           }
         }
