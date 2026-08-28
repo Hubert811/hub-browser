@@ -121,6 +121,12 @@ for (const v of [start, end]) {
    人工排障**（错误报告附路径，不默认读回）
 3. CLI `browser diff` 的基线是「上次 snapshot/diff」——操作后**直接 diff** 才有信号，
    中间插 snapshot 会刷基线
+4. **快照本身也有盲区，断言失败先审快照层**（bug #23 实证 2026-08-28）：带长值的 enum
+   字段（58 值≈1226 字符）曾在快照里渲染成匿名 `- generic [ref=eN] [cursor=pointer]`
+   ——cursor-augment 的 label 收割旧实现对 >60 字符文本直接丢弃，空字段反而清晰可辨。
+   引擎已修（截断到 120，fork 5b69d13fa），但教训长存：快照断言报「未见 X」时，
+   先用 `browser state`（DOM 源）或 eval 复核字段真实状态，区分「页面真没设上」vs
+   「快照层丢了节点」——同源不同面的两个快照通道本身就是互证手段。
 
 
 
