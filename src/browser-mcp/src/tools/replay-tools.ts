@@ -20,12 +20,32 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
-import { clawServerBaseUrl, clawSessionIdOf } from './claw-reporter'
+import { clawServerBaseUrl, clawHarnessReporter } from './claw-reporter'
 import { defineTool } from './framework'
 import { hubUserRoot, ownerOf } from '../../../space/task-space-manager.js'
 
 const REQUEST_TIMEOUT_MS = 8_000
 const DEFAULT_LIST_LIMIT = 50
+
+/** Latest claw working-period session id recorded for the owner in the
+ * session ledger (see claw-reporter.ts). Covers cross-process lookups —
+ * e.g. replay.export running in a process that never started a session. */
+function latestLedgerSessionIdOf(owner: string): string | undefined {
+  try {
+    const file =
+      process.env.HUB_CLAW_SESSIONS_FILE ??
+      join(hubUserRoot(), 'state', 'claw-sessions.json')
+    const entries = JSON.parse(readFileSync(file, 'utf-8')) as Array<{
+      owner?: string
+      sessionId?: string
+    }>
+    if (!Array.isArray(entries)) return undefined
+    const hit = entries.find((e) => e && e.owner === owner && typeof e.sessionId === 'string')
+    return hit?.sessionId
+  } catch {
+    return undefined
+  }
+}
 const MAX_LIST_LIMIT = 200
 
 export interface ClawStreamEntry {
@@ -562,10 +582,14 @@ export const replay_export = defineTool({
   annotations: { title: 'Export replay as HTML' },
   handler: async (args, ctx) => {
     // Default timeline = the calling conversation's own claw session, so an
-    // agent exporting its replay sees its own actions by default.
+    // agent exporting its replay sees its own actions by default. Sessions
+    // are per-working-period now: prefer this process's live session, then
+    // the ledger's latest entry for the owner (covers cross-process export).
     let sessionId = args.sessionId
     if (sessionId === undefined && ctx.identity !== undefined) {
-      sessionId = clawSessionIdOf(ownerOf(ctx.identity))
+      sessionId =
+        clawHarnessReporter.currentSessionIdOf(ownerOf(ctx.identity)) ??
+        latestLedgerSessionIdOf(ownerOf(ctx.identity))
     }
     const outcome = await exportClawReplay({
       documentId: args.documentId,

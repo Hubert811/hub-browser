@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -12,7 +12,6 @@ import {
   replay_list,
   type ClawStreamEntry,
 } from './replay-tools'
-import { clawSessionIdOf } from './claw-reporter'
 
 /**
  * P2-3 batch 3b — the replay read face contract.
@@ -339,8 +338,18 @@ describe('P2-3 replay MCP tools', () => {
     }
   })
 
-  test('replay.export derives the timeline session from ctx.identity by default', async () => {
+  test('replay.export derives the timeline session from the session ledger by default', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'hub-replay-'))
+    // Sessions are per-working-period now: the default lookup is this
+    // process's live session (disabled under test) → the ledger's latest
+    // entry for the owner.
+    const ledger = join(dir, 'claw-sessions.json')
+    const expected = '01JZZLEDGERSESSION000000000'
+    writeFileSync(
+      ledger,
+      JSON.stringify([{ owner: 'mcp:claude:s1', sessionId: expected, startedAt: 1 }]),
+    )
+    process.env.HUB_CLAW_SESSIONS_FILE = ledger
     const mock = withClawMock(
       clawRoutes({
         session: {
@@ -356,12 +365,12 @@ describe('P2-3 replay MCP tools', () => {
         undefined as never,
       )
       expect(result?.isError).toBeFalsy()
-      // The timeline was fetched for the conversation's derived claw session.
-      const expected = clawSessionIdOf('mcp:claude:s1')
+      // The timeline was fetched for the ledger-recorded working period.
       expect(mock.requests.some((req) => req.url.endsWith(`/api/v1/sessions/${expected}`))).toBe(true)
       const structured = result?.structuredContent as { dispatchCount: number }
       expect(structured.dispatchCount).toBe(1)
     } finally {
+      delete process.env.HUB_CLAW_SESSIONS_FILE
       mock.restore()
       rmSync(dir, { recursive: true, force: true })
     }

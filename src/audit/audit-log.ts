@@ -68,7 +68,10 @@ export interface AuditRetentionPolicy {
 }
 const DEFAULT_RETENTION: Required<AuditRetentionPolicy> = {
   maxAgeDays: 30,
-  maxCount: 20_000,
+  // Adapter commands now land parent rows + primitive child rows (F17
+  // companion): a heavy command is hundreds of rows, so the old 20k window
+  // would roll over within days. Rows are small; 100k stays tens of MB.
+  maxCount: 100_000,
 }
 /** Prune is checked every N writes so the write path self-maintains. */
 const PRUNE_EVERY_WRITES = 500

@@ -23,6 +23,8 @@ import { isElectronApp } from './electron-apps.js';
 import { probeCDP, resolveElectronEndpoint } from './launcher.js';
 import { ObservationSession, exportObservationSession } from './observation/index.js';
 import { resolveAdapterSourcePath } from './adapter-source.js';
+import { makeAdapterAudit } from './adapter-audit.js';
+import { isDaemonMode } from './runtime-globals.js';
 import { hubUserRoot } from './discovery.js';
 const _loadedModules = new Map();
 /** Track mtime of loaded user adapter files for hot-reload. */
@@ -442,140 +444,169 @@ export async function executeCommand(cmd, rawKwargs, debug = false, opts = {}) {
                 // per-process there, so env is correct for them but would
                 // collapse identities in a shared MCP process).
                 const agentId = opts.agentId ?? (process.env.HUB_AGENT_ID || 'cli:local');
-                const binding = await bindAdapterPageToSpace({
-                    page,
-                    browser,
-                    cdpEndpoint,
+                // F17 companion: adapter commands are the agent's heaviest
+                // activity yet were invisible to every audit surface. One
+                // parent dispatch (SQLite + claw dual-write) plus primitive
+                // child rows (SQLite) per command; the claw session ends when
+                // this is a direct-CLI process (daemon/MCP end at exit).
+                const audit = makeAdapterAudit({
                     cmd,
+                    kwargs,
                     agentId,
+                    source: opts.agentId ? 'mcp' : (isDaemonMode() ? 'daemon' : 'cli'),
                 });
-                page = binding.page;
-                const observation = traceMode === 'off'
-                    ? null
-                    : new ObservationSession({
-                        scope: {
-                            session,
-                            target: page.getActivePage?.(),
-                            site: cmd.site,
-                            command: fullName(cmd),
-                            adapterSourcePath: resolveAdapterSourcePath(internal),
-                        },
-                    });
-                if (observation) {
-                    observation.record({
-                        stream: 'action',
-                        name: 'command',
-                        phase: 'start',
-                        data: { args: kwargs },
-                    });
-                    await page.startNetworkCapture?.().catch(() => false);
-                }
-                const preNavUrl = resolvePreNav(cmd);
-                if (preNavUrl && await shouldRunPreNav(cmd, page, siteSession, preNavUrl)) {
-                    observation?.record({
-                        stream: 'action',
-                        name: 'pre_navigate',
-                        phase: 'start',
-                        data: { url: preNavUrl },
-                    });
-                    // Navigate directly — the extension's handleNavigate already has a fast-path
-                    // that skips navigation if the tab is already at the target URL.
-                    // This avoids an extra exec round-trip (getCurrentUrl) on first command and
-                    // lets the extension create the automation window with the target URL directly
-                    // instead of about:blank.
-                    try {
-                        await page.goto(preNavUrl);
-                        observation?.record({
-                            stream: 'action',
-                            name: 'pre_navigate',
-                            phase: 'end',
-                            data: { url: preNavUrl },
-                        });
-                    }
-                    catch (err) {
-                        observation?.record({
-                            stream: 'action',
-                            name: 'pre_navigate',
-                            phase: 'error',
-                            data: { url: preNavUrl, error: err instanceof Error ? err.message : String(err) },
-                        });
-                        const wrapped = new CommandExecutionError(`Pre-navigation to ${preNavUrl} failed: ${err instanceof Error ? err.message : err}`, 'Check that the site is reachable and the browser extension is running.');
-                        if (observation && (traceMode === 'on' || traceMode === 'retain-on-failure')) {
-                            observation.record({
-                                stream: 'error',
-                                message: wrapped.message,
-                                stack: wrapped.stack,
-                                code: wrapped.code,
-                                hint: wrapped.hint,
-                            });
-                            await collectObservationEvidence(observation, page).catch(() => { });
-                            exportTraceArtifact(observation, 'failure', wrapped, opts.onTraceExport);
-                        }
-                        throw wrapped;
-                    }
-                }
+                let binding;
+                let auditError;
                 try {
-                    const browserTimeout = userTimeoutSec !== null
-                        ? userTimeoutSec + RUNTIME_TIMEOUT_PADDING_SECONDS
-                        : DEFAULT_BROWSER_COMMAND_TIMEOUT;
-                    const result = await runWithTimeout(runCommand(cmd, page, kwargs, debug), {
-                        timeout: browserTimeout,
-                        label: fullName(cmd),
+                    binding = await bindAdapterPageToSpace({
+                        page,
+                        browser,
+                        cdpEndpoint,
+                        cmd,
+                        agentId,
                     });
-                    observation?.record({
-                        stream: 'action',
-                        name: 'command',
-                        phase: 'end',
-                    });
-                    if (observation && traceMode === 'on') {
-                        await collectObservationEvidence(observation, page).catch(() => { });
-                        exportTraceArtifact(observation, 'success', undefined, opts.onTraceExport);
-                    }
-                    // bug #7: the adapter command may have navigated the bound
-                    // space tab — sync the ledger URL to the browser's actual
-                    // URL (best-effort, only when this command ran inside a
-                    // space; failure only warns and never affects the result).
-                    await syncBoundTabUrl(binding, page).catch(() => { });
-                    // Adapter commands are one-shot — release the current tab lease immediately
-                    // instead of waiting for the 30s idle timeout. The automation container
-                    // window stays open for reuse.
-                    if (!keepTab)
-                        await page.closeWindow?.().catch(() => { });
-                    return result;
-                }
-                catch (err) {
+                    page = binding.page;
+                    const auditPage = audit.wrapPage(page);
+                    const observation = traceMode === 'off'
+                        ? null
+                        : new ObservationSession({
+                            scope: {
+                                session,
+                                target: page.getActivePage?.(),
+                                site: cmd.site,
+                                command: fullName(cmd),
+                                adapterSourcePath: resolveAdapterSourcePath(internal),
+                            },
+                        });
                     if (observation) {
                         observation.record({
                             stream: 'action',
                             name: 'command',
-                            phase: 'error',
-                            data: { error: err instanceof Error ? err.message : String(err) },
+                            phase: 'start',
+                            data: { args: kwargs },
                         });
-                        observation.record({
-                            stream: 'error',
-                            message: err instanceof Error ? err.message : String(err),
-                            stack: err instanceof Error ? err.stack : undefined,
+                        await page.startNetworkCapture?.().catch(() => false);
+                    }
+                    const preNavUrl = resolvePreNav(cmd);
+                    if (preNavUrl && await shouldRunPreNav(cmd, page, siteSession, preNavUrl)) {
+                        observation?.record({
+                            stream: 'action',
+                            name: 'pre_navigate',
+                            phase: 'start',
+                            data: { url: preNavUrl },
                         });
-                        if (traceMode === 'on' || traceMode === 'retain-on-failure') {
-                            await collectObservationEvidence(observation, page).catch(() => { });
-                            exportTraceArtifact(observation, 'failure', err, opts.onTraceExport);
+                        // Navigate directly — the extension's handleNavigate already has a fast-path
+                        // that skips navigation if the tab is already at the target URL.
+                        // This avoids an extra exec round-trip (getCurrentUrl) on first command and
+                        // lets the extension create the automation window with the target URL directly
+                        // instead of about:blank.
+                        try {
+                            await page.goto(preNavUrl);
+                            observation?.record({
+                                stream: 'action',
+                                name: 'pre_navigate',
+                                phase: 'end',
+                                data: { url: preNavUrl },
+                            });
+                        }
+                        catch (err) {
+                            observation?.record({
+                                stream: 'action',
+                                name: 'pre_navigate',
+                                phase: 'error',
+                                data: { url: preNavUrl, error: err instanceof Error ? err.message : String(err) },
+                            });
+                            const wrapped = new CommandExecutionError(`Pre-navigation to ${preNavUrl} failed: ${err instanceof Error ? err.message : err}`, 'Check that the site is reachable and the browser extension is running.');
+                            if (observation && (traceMode === 'on' || traceMode === 'retain-on-failure')) {
+                                observation.record({
+                                    stream: 'error',
+                                    message: wrapped.message,
+                                    stack: wrapped.stack,
+                                    code: wrapped.code,
+                                    hint: wrapped.hint,
+                                });
+                                await collectObservationEvidence(observation, page).catch(() => { });
+                                exportTraceArtifact(observation, 'failure', wrapped, opts.onTraceExport);
+                            }
+                            throw wrapped;
                         }
                     }
-                    // bug #7 (catch path): even when the adapter command FAILED
-                    // it may already have navigated the bound space tab — sync
-                    // the ledger URL to the browser's actual URL so exact-reuse
-                    // matching sees the true URL instead of the stale ledger
-                    // value (which caused duplicate tabs on a retry). Strictly
-                    // best-effort: syncBoundTabUrl never throws (failure only
-                    // warns), and must never mask the original error — the
-                    // .catch below is belt-and-braces only.
-                    await syncBoundTabUrl(binding, page).catch(() => { });
-                    // Release the tab lease on failure too — without this, the lease lingers
-                    // until the extension's idle timer fires (unreliable on Windows where
-                    // MV3 service workers may be suspended before setTimeout triggers).
-                    if (!keepTab)
-                        await page.closeWindow?.().catch(() => { });
+                    try {
+                        const browserTimeout = userTimeoutSec !== null
+                            ? userTimeoutSec + RUNTIME_TIMEOUT_PADDING_SECONDS
+                            : DEFAULT_BROWSER_COMMAND_TIMEOUT;
+                        const result = await runWithTimeout(runCommand(cmd, auditPage, kwargs, debug), {
+                            timeout: browserTimeout,
+                            label: fullName(cmd),
+                        });
+                        observation?.record({
+                            stream: 'action',
+                            name: 'command',
+                            phase: 'end',
+                        });
+                        if (observation && traceMode === 'on') {
+                            await collectObservationEvidence(observation, page).catch(() => { });
+                            exportTraceArtifact(observation, 'success', undefined, opts.onTraceExport);
+                        }
+                        // bug #7: the adapter command may have navigated the bound
+                        // space tab — sync the ledger URL to the browser's actual
+                        // URL (best-effort, only when this command ran inside a
+                        // space; failure only warns and never affects the result).
+                        await syncBoundTabUrl(binding, page).catch(() => { });
+                        // Adapter commands are one-shot — release the current tab lease immediately
+                        // instead of waiting for the 30s idle timeout. The automation container
+                        // window stays open for reuse.
+                        if (!keepTab)
+                            await page.closeWindow?.().catch(() => { });
+                        return result;
+                    }
+                    catch (err) {
+                        if (observation) {
+                            observation.record({
+                                stream: 'action',
+                                name: 'command',
+                                phase: 'error',
+                                data: { error: err instanceof Error ? err.message : String(err) },
+                            });
+                            observation.record({
+                                stream: 'error',
+                                message: err instanceof Error ? err.message : String(err),
+                                stack: err instanceof Error ? err.stack : undefined,
+                            });
+                            if (traceMode === 'on' || traceMode === 'retain-on-failure') {
+                                await collectObservationEvidence(observation, page).catch(() => { });
+                                exportTraceArtifact(observation, 'failure', err, opts.onTraceExport);
+                            }
+                        }
+                        // bug #7 (catch path): even when the adapter command FAILED
+                        // it may already have navigated the bound space tab — sync
+                        // the ledger URL to the browser's actual URL so exact-reuse
+                        // matching sees the true URL instead of the stale ledger
+                        // value (which caused duplicate tabs on a retry). Strictly
+                        // best-effort: syncBoundTabUrl never throws (failure only
+                        // warns), and must never mask the original error — the
+                        // .catch below is belt-and-braces only.
+                        await syncBoundTabUrl(binding, page).catch(() => { });
+                        // Release the tab lease on failure too — without this, the lease lingers
+                        // until the extension's idle timer fires (unreliable on Windows where
+                        // MV3 service workers may be suspended before setTimeout triggers).
+                        if (!keepTab)
+                            await page.closeWindow?.().catch(() => { });
+                        throw err;
+                    }
+                }
+                catch (err) {
+                    auditError = err;
                     throw err;
+                }
+                finally {
+                    await audit.finish({ error: auditError, page, binding });
+                    // Direct-CLI processes die right after the command: end the
+                    // claw session now (fire-and-forget — a pending fetch keeps
+                    // the event loop alive). Daemon/MCP processes keep their
+                    // session until process exit; MCP callers pass opts.agentId.
+                    if (!isDaemonMode() && !opts.agentId)
+                        audit.end();
                 }
             }, { session, cdpEndpoint, windowMode, surface: 'adapter', siteSession });
         }

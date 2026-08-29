@@ -505,6 +505,9 @@ export async function executeTool(
     clawHarnessReporter.reportDispatch({
       ...(pageCtx.identity !== undefined && {
         owner: ownerOf(pageCtx.identity),
+        // F17 fix: real agent identity (HUB_AGENT_ID / MCP client) instead of
+        // the legacy hardcoded 'hub' — the cockpit groups tasks by agent_id.
+        agentId: pageCtx.identity.agentId,
         ...(pageCtx.identity.displayName !== undefined && {
           agentLabel: pageCtx.identity.displayName,
         }),

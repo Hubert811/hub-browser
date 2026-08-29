@@ -853,6 +853,12 @@ Examples:
                 if (page?.close) {
                     try { await page.close(); } catch {}
                 }
+                // F17: this short-lived process's claw working-period session
+                // ends here (bounded wait inside; no-op when nothing started).
+                try {
+                    const { clawHarnessReporter } = await import('../browser-mcp/src/tools/claw-reporter.ts');
+                    await clawHarnessReporter.endAllSessions('closed');
+                } catch {}
                 process.exit(process.exitCode || 0);
             }
         };
@@ -992,6 +998,12 @@ Examples:
                 if (bridge?.close) {
                     try { await bridge.close(); } catch {}
                 }
+                // F17: end this short-lived process's claw working-period
+                // session (no-op when nothing was reported).
+                try {
+                    const { clawHarnessReporter } = await import('../browser-mcp/src/tools/claw-reporter.ts');
+                    await clawHarnessReporter.endAllSessions('closed');
+                } catch {}
                 process.exit(process.exitCode || 0);
             }
         };

@@ -202,6 +202,14 @@ if (process.env.HUB_MCP === 'true' || process.argv.includes('--mcp')) {
     .catch((err) => {
       process.stderr.write(`[hub-mcp] space restore skipped: ${err?.message ?? String(err)}\n`);
     });
+  // F17 backstop: end claw sessions left Live by processes that died before
+  // their exit hook (kill -9 / crash). Stale-only; fire-and-forget.
+  void (async () => {
+    try {
+      const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
+      await clawHarnessReporter.sweepStaleSessions();
+    } catch { /* best-effort */ }
+  })();
   // Keep the process alive while the stdio transport is connected.
   process.stdin.resume();
 
@@ -218,13 +226,16 @@ if (process.env.HUB_MCP === 'true' || process.argv.includes('--mcp')) {
     if (sessionClosing) return;
     sessionClosing = true;
     try {
+      // F17: end every claw working-period session this process started.
+      // Deliberately OUTSIDE the sessionOwner gate below — that gate encodes
+      // the space-ownership semantics (stable HUB_AGENT_ID spaces span
+      // sessions by design); the claw session is an audit-timeline grouping
+      // and dies with the process regardless of identity stability.
+      try {
+        const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
+        await clawHarnessReporter.endAllSessions('closed');
+      } catch { /* best-effort; claw orphan cleanup is the backstop */ }
       if (sessionOwner) {
-        // P2-3: end the claw-server harness session too — closes its tab
-        // ownership windows so replay attribution settles at session end.
-        try {
-          const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
-          await clawHarnessReporter.endSession(sessionOwner);
-        } catch { /* best-effort; claw orphan cleanup is the backstop */ }
         const keep = process.env.HUB_SESSION_END_SPACES === 'keep';
         // A hung CDP close must never keep the exit pending — bounded wait,
         // ledger eviction inside closeSpace has already persisted by then or
@@ -359,10 +370,26 @@ if (process.env.HUB_DAEMON === 'true') {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(async () => {
       process.stderr.write('[hub-daemon] idle timeout, exiting\n');
+      // F17: close every claw working-period session this daemon started so
+      // the cockpit timeline shows honest durations (bounded wait inside).
+      try {
+        const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
+        await clawHarnessReporter.endAllSessions('closed');
+      } catch { /* best-effort; claw orphan cleanup is the backstop */ }
       try { await factory?.close(); } catch {}
       process.exit(0);
     }, IDLE_TIMEOUT_MS);
   }
+  // Same sweep when the daemon is asked to terminate (kill -9 still relies on
+  // the browser-side reconcile-on-start orphan cleanup).
+  process.on('SIGTERM', async () => {
+    try {
+      const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
+      await clawHarnessReporter.endAllSessions('closed');
+    } catch { /* best-effort */ }
+    try { await factory?.close(); } catch {}
+    process.exit(143);
+  });
 
   // ── /command executor ────────────────────────────────────────────
   // The daemon is a shared process: every request executes inside an explicit
@@ -529,6 +556,16 @@ if (process.env.HUB_DAEMON === 'true') {
     // Phase 3 A: restore agent-owned space tabs as soon as the browser connects.
     // Fire-and-forget so daemon startup never waits on CDP or restore failures.
     void ensureSpacesRestored();
+    // F17 backstop: end claw sessions left Live by previous processes that
+    // died before their exit hook (kill -9 / crash). Stale-only; a live
+    // concurrent process's session is protected by the last-activity check.
+    void (async () => {
+      try {
+        const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
+        const ended = await clawHarnessReporter.sweepStaleSessions();
+        if (ended > 0) process.stderr.write(`[hub-daemon] claw orphan sweep ended ${ended} stale session(s)\n`);
+      } catch { /* best-effort */ }
+    })();
   });
 
 } else {
