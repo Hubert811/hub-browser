@@ -71,6 +71,9 @@ export class NetworkCollector {
    * (MAX_ENTRIES × 1MiB only if every entry is a max-size POST — in practice
    * request bodies are tiny and the 500-entry ring bounds the tail). */
   private static readonly MAX_REQUEST_BODY = 1024 * 1024;
+  /** Response bodies above this live in the O5 sidecar store (see the
+   * module-level `responseBodies` docs) instead of only as a preview. */
+  private static readonly PREVIEW_LIMIT = 8192;
   private entries: Array<Record<string, unknown>> = [];
   private pending = new Map<string, number>();
   private unsub: (() => void)[] = [];
@@ -95,6 +98,9 @@ export class NetworkCollector {
           url: params.request.url,
           method: params.request.method,
           timestamp: Date.now(),
+          // O5: sidecar-store key for this response body (internal only —
+          // read() resolves it before anything crosses the page boundary).
+          requestId: params.requestId,
         };
         // C1 fix: keep the request body (POST payloads are the adapter
         // contract — without them, replaying a query API is guesswork).
@@ -118,7 +124,10 @@ export class NetworkCollector {
         if (this.entries.length > NetworkCollector.MAX_ENTRIES) {
           // Drop the oldest entry and reindex the pending map so response
           // events still land on the right entry.
-          this.entries.shift();
+          const evicted = this.entries.shift();
+          if (typeof evicted?.requestId === 'string') {
+            storeDelete(storeKey(this.sessionId, evicted.requestId));
+          }
           for (const [k, v] of this.pending) {
             if (v <= 0) this.pending.delete(k);
             else this.pending.set(k, v - 1);
@@ -160,8 +169,8 @@ export class NetworkCollector {
       if (typeof r?.body === 'string') {
         const entry = this.entries[idx];
         entry.responsePreview = r.base64Encoded
-          ? `base64:${r.body.slice(0, 8192)}`
-          : r.body.slice(0, 8192);
+          ? `base64:${r.body.slice(0, NetworkCollector.PREVIEW_LIMIT)}`
+          : r.body.slice(0, NetworkCollector.PREVIEW_LIMIT);
         // Same honesty contract as requestBody above: the preview is capped
         // at 8KiB, so surface the truncation + full size. Without these the
         // downstream marker chain (bodyTruncated -> body_truncated -> detail
@@ -170,9 +179,14 @@ export class NetworkCollector {
         // parsing it concludes the response is corrupt when it was merely
         // truncated (observed on QuickBI olap responses: 8192-byte body cut
         // mid-SQL, JSON.parse failing with Unterminated string).
-        if (r.body.length > 8192) {
+        if (r.body.length > NetworkCollector.PREVIEW_LIMIT) {
           entry.responseBodyTruncated = true;
           entry.responseBodyFullSize = r.body.length;
+          // O5: CDP just handed us the COMPLETE body — keep it in the
+          // sidecar store so read() can resolve the whole response for
+          // `--detail` and shape inference. Bodies within the preview
+          // budget need no store copy: the preview already IS the body.
+          storePut(storeKey(this.sessionId, params.requestId), r.body, r.base64Encoded === true);
         }
       }
     } catch { /* body unavailable */ }
@@ -180,7 +194,29 @@ export class NetworkCollector {
   }
 
   read(): Array<Record<string, unknown>> {
-    return [...this.entries];
+    return this.entries.map((entry) => {
+      const rid = entry.requestId;
+      if (typeof rid !== 'string') return entry;
+      const stored = responseBodies.get(storeKey(this.sessionId, rid));
+      if (stored === undefined) return entry;
+      // O5 resolution: swap the 8KiB preview for the stored full body. When
+      // the stored copy covers the whole response, the preview-era
+      // truncation markers no longer apply (the body is complete); a >1MiB
+      // body keeps them (the stored copy is capped).
+      const resolved: Record<string, unknown> = {
+        ...entry,
+        responsePreview: stored.base64Encoded ? `base64:${stored.body}` : stored.body,
+        responseBodySource: 'store',
+      };
+      const fullSize = typeof entry.responseBodyFullSize === 'number'
+        ? entry.responseBodyFullSize
+        : stored.body.length;
+      if (stored.body.length >= fullSize) {
+        delete resolved.responseBodyTruncated;
+        delete resolved.responseBodyFullSize;
+      }
+      return resolved;
+    });
   }
 
   async stop(): Promise<void> {
@@ -191,5 +227,59 @@ export class NetworkCollector {
     this.entries = [];
     this.pending.clear();
     this.capturing = false;
+    // stop() wipes the entry ring — release this session's store slices so
+    // the budget does not pin bodies nothing references anymore.
+    const prefix = `${this.sessionId}:`;
+    for (const key of [...responseBodies.keys()]) {
+      if (key.startsWith(prefix)) storeDelete(key);
+    }
+  }
+}
+
+/**
+ * O5 — sidecar store for full response bodies. CDP delivers the COMPLETE
+ * body at loadingFinished; the 8KiB preview was a memory-budget choice, not
+ * a data limit, and adapters kept hitting it (QuickBI olap responses are
+ * 10-100KB, observed cut mid-JSON). The store keeps bodies above the
+ * preview budget whole so `network --detail` hands out parseable JSON and
+ * shape inference sees the full structure. Bounded three ways: a per-entry
+ * 1MiB cap (same as request bodies and the JS interceptor channel), a
+ * process-wide byte budget (default 32MB, HUB_NETWORK_BODY_STORE_BYTES to
+ * override) shared by every collector in this process — a daemon with
+ * several capturing tabs must not multiply the budget — and oldest-first
+ * eviction once over budget. Bodies evicted from the budget (or orphaned by
+ * a stopped collector) fall back to the 8KiB preview with the honest
+ * truncation markers: exactly the pre-O5 behavior, never worse.
+ */
+const STORE_MAX_ENTRY = 1024 * 1024;
+const STORE_BUDGET_DEFAULT = 32 * 1024 * 1024;
+const responseBodies = new Map<string, { body: string; base64Encoded: boolean }>();
+let responseBodiesBytes = 0;
+
+function storeBudget(): number {
+  const raw = Number(process.env.HUB_NETWORK_BODY_STORE_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : STORE_BUDGET_DEFAULT;
+}
+
+function storeKey(sessionId: string, requestId: string): string {
+  return `${sessionId}:${requestId}`;
+}
+
+function storePut(key: string, body: string, base64Encoded: boolean): void {
+  const stored = body.length > STORE_MAX_ENTRY ? body.slice(0, STORE_MAX_ENTRY) : body;
+  responseBodies.set(key, { body: stored, base64Encoded });
+  responseBodiesBytes += stored.length;
+  while (responseBodiesBytes > storeBudget()) {
+    const oldest = responseBodies.keys().next().value;
+    if (oldest === undefined) break;
+    storeDelete(oldest);
+  }
+}
+
+function storeDelete(key: string): void {
+  const entry = responseBodies.get(key);
+  if (entry !== undefined) {
+    responseBodiesBytes -= entry.body.length;
+    responseBodies.delete(key);
   }
 }

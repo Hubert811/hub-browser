@@ -112,6 +112,9 @@ export async function captureNetworkItems(page) {
                     size: fullSize,
                     ct: e.responseContentType || '',
                     body,
+                    // O5: 'store' marks a body resolved from the collector's
+                    // full-response sidecar store; absence = preview-only.
+                    ...(e.responseBodySource === 'store' ? { bodySource: 'store' } : {}),
                     // C1: request body captured by the collector — the other
                     // half of an API's contract (response bodies alone are
                     // not enough to replay a POST).
@@ -193,6 +196,10 @@ export async function runNetworkQuery(page, opts = {}) {
         size: it.size,
         ct: it.ct,
         body: it.body,
+        // O5: full bodies from the sidecar store persist into the cache so
+        // `--detail` (a separate process reading the cache file) sees them
+        // whole; body_source records the provenance.
+        ...(it.bodySource === 'store' ? { body_source: 'store' } : {}),
         ...(typeof it.requestBody === 'string' ? { requestBody: it.requestBody } : {}),
         ...(it.requestBodyTruncated === true ? { requestBodyTruncated: true } : {}),
         ...(typeof it.timestamp === 'number' ? { timestamp: it.timestamp } : {}),
@@ -239,7 +246,7 @@ export async function runNetworkQuery(page, opts = {}) {
     const truncatedCount = visible.filter((s) => s.entry.body_truncated).length;
     if (truncatedCount > 0) {
         envelope.body_truncated_count = truncatedCount;
-        envelope.body_truncated_hint = 'Some bodies exceeded the capture limit; their `shape` reflects only the captured prefix.';
+        envelope.body_truncated_hint = 'Some bodies exceeded the capture store cap (1MiB/entry, 32MB total); their `shape` and `body` reflect only the stored prefix.';
     }
     if (opts.raw) {
         envelope.entries = visible.map((s) => ({
@@ -316,6 +323,9 @@ export function runNetworkDetail(session, key, opts = {}) {
         ...(typeof entry.timestamp === 'number' ? { timestamp: toIsoTimestamp(entry.timestamp) } : {}),
         shape: inferShape(entry.body),
         body: outputBody,
+        // O5: provenance — 'store' bodies were resolved from the capture
+        // sidecar store and are complete (unless also marked truncated).
+        ...(entry.body_source === 'store' ? { body_source: 'store' } : {}),
         ...(requestBody !== null ? { requestBody } : {}),
         ...(entry.requestBodyTruncated === true ? { requestBodyTruncated: true } : {}),
     };
