@@ -65,6 +65,32 @@ const RUNTIME = join(PROJECT_ROOT, RUNTIME_BASE);
 const DAEMON_PORT = parseInt(process.env.HUB_DAEMON_PORT ?? '9300', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.HUB_DAEMON_IDLE_TIMEOUT ?? '300000', 10); // 5 min
 
+// Bug #26 (round 2): every agent consumes hub output through a PIPE, and
+// process.exit() right after process.stdout.write drops >64KB still queued.
+// This is the exit every forwarded command takes (sendCommand below) and
+// --llm-txt's — the paths cli.js's flushAndExit never covered. Round-2 probes
+// ruled out both queue probes on Bun: writableLength reports 0 with ~450KB
+// queued, and write('', cb) fires immediately WITHOUT draining (65536 bytes
+// delivered through a pipe). What works on both runtimes: await the callback
+// of the data write itself — it fires only after the chunk is flushed. The
+// 2s deadline race bounds a wedged pipe consumer.
+async function writeAllAndExit(code, writes) {
+  const deadline = Date.now() + 2000;
+  try {
+    await Promise.race([
+      Promise.all(
+        writes
+          .filter(([, chunk]) => chunk != null && chunk !== '')
+          .map(([stream, chunk]) => new Promise((resolve) => { stream.write(chunk, resolve); })),
+      ),
+      new Promise((r) => setTimeout(r, deadline - Date.now())),
+    ]);
+  } catch {
+    /* best-effort */
+  }
+  process.exit(code);
+}
+
 // ─── P2-9: agent self-description (hub --llm-txt) ────────────────
 // Prints the agent guide straight from the installed build: the bundled
 // hub-browser SKILL.md (single source — the very file the skills system
@@ -110,8 +136,7 @@ if (process.argv.includes('--llm-txt')) {
   if (skillPath) {
     parts.push(fs.readFileSync(skillPath, 'utf-8').trimEnd(), '');
   }
-  process.stdout.write(parts.join('\n') + '\n');
-  process.exit(0);
+  await writeAllAndExit(0, [[process.stdout, parts.join('\n') + '\n']]);
 }
 
 // ─── MCP mode (hub --mcp | HUB_MCP=true) ───────────────────────────
@@ -613,9 +638,10 @@ if (process.env.HUB_DAEMON === 'true') {
       }),
     });
     const result = await res.json();
-    if (result.stdout) process.stdout.write(result.stdout);
-    if (result.stderr) process.stderr.write(result.stderr);
-    process.exit(result.exitCode || 0);
+    await writeAllAndExit(result.exitCode || 0, [
+      [process.stdout, result.stdout],
+      [process.stderr, result.stderr],
+    ]);
   }
 
   async function spawnDaemon() {

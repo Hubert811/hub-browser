@@ -67,26 +67,25 @@ function emitNetworkError(code, message, extra = {}) {
     process.exitCode = NETWORK_ERROR_EXIT[code] ?? EXIT_CODES.GENERIC_ERROR;
 }
 /**
- * Bug #26: console.log on a pipe is asynchronous — >64KB of buffered output
- * is silently dropped when process.exit() runs right after the write. TTYs
- * and regular files are synchronous writes, so only piped consumers (the
- * default for agents) lost data mid-JSON. Drain stdout/stderr before exiting.
+ * Bug #26: process.exit() discards stdout/stderr still queued for the pipe —
+ * agents consume CLI output through pipes, and >64KB of buffered output is
+ * silently dropped mid-JSON. TTYs and regular files are synchronous writes,
+ * so only piped consumers lose data.
+ *
+ * Round 2 probes (2026-08-31) ruled out BOTH queue probes on Bun:
+ * writableLength reports 0 with ~450KB still queued, and write('', cb) fires
+ * its callback immediately without draining (65536 bytes delivered). The only
+ * drain both runtimes honor for writes whose callbacks we no longer hold is
+ * NATURAL process exit — a pending stdio write holds the event loop open
+ * until flushed. The unref'd hard exit bounds the case where lingering CDP
+ * handles would otherwise wedge the CLI; by then output has had 2s to reach
+ * the kernel pipe buffer.
  */
 async function flushAndExit(code) {
-    const deadline = Date.now() + 2000;
-    const drained = (stream) => new Promise((resolve) => {
-        if (stream.writableLength === 0)
-            return resolve();
-        const done = () => { stream.off('close', done); resolve(); };
-        stream.on('close', done);
-        void stream.write('', () => done());
-    });
-    try {
-        await Promise.race([Promise.all([drained(process.stdout), drained(process.stderr)]),
-            new Promise((r) => setTimeout(r, deadline - Date.now()))]);
-    }
-    catch { /* best-effort */ }
-    process.exit(code);
+    if (typeof code === 'number')
+        process.exitCode = code;
+    const hardExit = setTimeout(() => process.exit(code), 2000);
+    hardExit.unref?.();
 }
 const SITEMAP_HINT = 'Site sitemap available. For navigation context, use the hub-browser-sitemap skill; treat browser state as truth if it disagrees.';
 function siteNameCandidatesFromUrl(url, registry = getRegistry()) {
@@ -2411,7 +2410,8 @@ Examples:
         .argument('<type>', 'selector, text, time, xhr, or download')
         .argument('[value]', 'CSS selector, text string, seconds, XHR URL regex, or download filename/URL pattern')
         .option('--timeout <ms>', 'Timeout in milliseconds', '10000')
-        .description('Wait for selector, text, time, matching XHR, or browser download (e.g. wait selector ".loaded", wait text "Success", wait time 3, wait xhr "/api/search", wait download receipt.pdf)')
+        .option('--since <duration>', 'xhr only: count entries from the last duration (e.g. 30s) instead of only entries newer than this wait — revives the click → wait xhr idiom, whose request typically lands before the wait starts')
+        .description('Wait for selector, text, time, matching XHR, or browser download (e.g. wait selector ".loaded", wait text "Success", wait time 3, wait xhr "/api/search" --since 30s, wait download receipt.pdf)')
         .action(browserAction(async (page, type, value, opts) => {
         const timeout = parseInt(opts.timeout, 10);
         if (type === 'time') {
@@ -2464,18 +2464,35 @@ Examples:
                 catch { /* non-fatal */ }
             }
             await captureNetworkItems(page);
-            // Bug #25: entries already in the ring when the wait starts are
-            // stale — the standard "click, wait xhr, read payload" idiom would
-            // otherwise latch onto the previous action's request, zero-ms
-            // "success", and hand the agent the wrong payload. Only entries
-            // timestamped at/after this moment count as the awaited XHR.
+            // Bug #25: the freshness gate. Default is strict — only entries
+            // newer than this wait — so a bare wait cannot latch onto a
+            // previous action's request and hand back the wrong payload.
+            // But the standard "click, wait xhr, read payload" idiom fires
+            // its request ~250ms into the click and it lands in the ring
+            // BEFORE the wait starts (daemon commands serialize), so the
+            // strict gate rejects the very request the agent wants.
+            // `--since 30s` widens the gate to a relative window — the
+            // caller asserts which entries are "theirs".
+            let sinceMs = null;
+            if (opts.since !== undefined) {
+                sinceMs = parseDurationMs(opts.since, 'since');
+                if (sinceMs && typeof sinceMs === 'object') {
+                    emitNetworkError('invalid_since', sinceMs.error);
+                    return;
+                }
+                if (sinceMs === null) {
+                    emitNetworkError('invalid_since', `since must be a duration like 30s, 2m, got "${opts.since}"`);
+                    return;
+                }
+            }
             const startTs = Date.now();
+            const anchorTs = sinceMs ? startTs - sinceMs : startTs;
             const deadline = startTs + timeout;
             const pollMs = 400;
             let matched = null;
             while (Date.now() < deadline && !matched) {
                 const items = await captureNetworkItems(page);
-                matched = items.find((e) => e.timestamp >= startTs && re.test(e.url)) ?? null;
+                matched = items.find((e) => e.timestamp >= anchorTs && re.test(e.url)) ?? null;
                 if (!matched)
                     await new Promise((r) => setTimeout(r, pollMs));
             }
@@ -2483,8 +2500,10 @@ Examples:
                 console.log(JSON.stringify({
                     error: {
                         code: 'xhr_not_seen',
-                        message: `No captured XHR matched /${value}/ within ${timeout}ms (requests observed before this wait began are not counted)`,
-                        hint: 'Check the pattern against `browser network` output; the endpoint may not have fired yet, or capture is disabled.',
+                        message: `No captured XHR matched /${value}/ within ${timeout}ms${sinceMs ? ` in the last ${opts.since}` : ' (requests observed before this wait began are not counted)'}`,
+                        hint: sinceMs
+                            ? 'The request may be older than the --since window, or it fired before capture started. Widen --since or check `browser network --since` output.'
+                            : 'Check the pattern against `browser network` output; the endpoint may not have fired yet, or capture is disabled. For the click → wait idiom, pass --since 30s — the request usually lands before this wait starts.',
                     },
                 }, null, 2));
                 process.exitCode = EXIT_CODES.GENERIC_ERROR;

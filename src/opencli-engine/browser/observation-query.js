@@ -17,7 +17,7 @@ import { assignKeys } from './network-key.js';
 import { DEFAULT_TTL_MS, findEntry, loadNetworkCache, saveNetworkCache } from './network-cache.js';
 import { shapeMatchesFilter } from './shape-filter.js';
 import { buildFindJs, buildSemanticFindJs, isFindError } from './find.js';
-import { analyzeSite } from './analyze.js';
+import { analyzeSite, previewNetworkBody } from './analyze.js';
 import { getRegistry } from '../registry.js';
 import { NETWORK_INTERCEPTOR_JS } from './network-interceptor.js';
 import { log } from '../logger.js';
@@ -448,15 +448,16 @@ export async function runSiteAnalysis(page, url, opts = {}) {
     }
     const networkEntries = rawItems.map((e) => ({
         url: e.url,
+        method: e.method || 'GET',
         status: e.status,
         contentType: e.ct,
-        // Bug #28: 2000 chars cut every large API response mid-JSON, so the
-        // scorer never saw the object shape (business keys/rows) and buried
-        // the main endpoint under small dictionaries. 64KiB covers virtually
-        // all API responses whole; bigger ones keep api-shaped credit.
-        bodyPreview: typeof e.body === 'string'
-            ? e.body.slice(0, 65536)
-            : (e.body ? JSON.stringify(e.body).slice(0, 65536) : null),
+        // Bug #28 (round 2): the ring hands us PARSED bodies (O5 sidecar
+        // store) — previewNetworkBody serializes structure-preserving
+        // (arrays capped at 3 items, long strings clipped) so the scorer
+        // still sees business keys inside the 64KiB budget. The round-1
+        // stringify-then-slice cut 87KB envelopes mid-JSON and buried the
+        // main data API under small dictionaries.
+        bodyPreview: previewNetworkBody(e.body),
     }));
     const probeJs = `(function(){
         return {

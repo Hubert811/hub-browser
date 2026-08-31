@@ -282,26 +282,82 @@ export function scoreEndpointEvidence(entry) {
         sample_paths: samplePaths,
     };
 }
+const PREVIEW_BUDGET = 65536;
+/**
+ * Bug #28 (round 2): the capture ring hands analyze PARSED bodies — the O5
+ * sidecar store resolves whole responses, so `e.body` is already an object.
+ * Round 1's `JSON.stringify(e.body).slice(0, 65536)` serialized an 87KB API
+ * envelope and then cut it mid-JSON: the preview stopped parsing, the scorer
+ * never saw the 37 business keys / nested rows, and the main data API scored
+ * 0.55 maybe_data under small dictionaries. Serialize structure-preserving
+ * instead: arrays keep their first 3 items, long strings clip at 500 chars —
+ * key shape survives within the budget and the preview still parses.
+ */
+export function previewNetworkBody(body) {
+    if (body === null || body === undefined)
+        return null;
+    if (typeof body === 'string')
+        return body.slice(0, PREVIEW_BUDGET);
+    try {
+        const json = JSON.stringify(body, structurePreviewReplacer);
+        return json.length > PREVIEW_BUDGET ? json.slice(0, PREVIEW_BUDGET) : json;
+    }
+    catch {
+        return null;
+    }
+}
+function structurePreviewReplacer(_key, value) {
+    if (Array.isArray(value))
+        return value.length > 3 ? [...value.slice(0, 3), `…${value.length - 3} more`] : value;
+    if (typeof value === 'string' && value.length > 500)
+        return `${value.slice(0, 500)}…`;
+    return value;
+}
+/**
+ * Bug #28 (round 2): dedup by raw URL was defeated by per-request correlation
+ * params — the ESP ring carried `menu/menus?traceId=…` twice, wasting 2 of the
+ * 8 api_candidates slots (4 of 8 across two endpoints). Normalize the key:
+ * strip volatile query params, sort the survivors, and prefix the HTTP method
+ * when the entry carries one (same path, different verb = different endpoint).
+ */
+const VOLATILE_PARAM_RE = /^(?:traceid|requestid|nonce|_|t|timestamp)$/i;
+export function networkDedupKey(url, method) {
+    if (typeof url !== 'string' || url === '')
+        return `${method ?? ''}|`;
+    let u;
+    try {
+        u = new URL(url);
+    }
+    catch {
+        return `${method ?? ''}|${url}`;
+    }
+    const kept = [...u.searchParams.entries()]
+        .filter(([k]) => !VOLATILE_PARAM_RE.test(k))
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const qs = kept.map(([k, v]) => `${k}=${v}`).join('&');
+    return `${method ?? ''}|${u.origin}${u.pathname}${qs ? `?${qs}` : ''}`;
+}
 export function scoreNetworkEvidence(signals) {
-    // Bug #28: dedup by URL — SPAs routinely fire the same dictionary/config
-    // endpoint several times during boot, and the old no-dedup list padded
-    // api_candidates with repeats (one recon showed the same status dictionary
-    // three times) while crowding out the real data API.
-    const byUrl = new Map();
+    // Bug #28: dedup by normalized URL — SPAs routinely fire the same
+    // dictionary/config endpoint several times during boot, and per-request
+    // trace params make every call look unique. The old no-dedup list padded
+    // api_candidates with repeats while crowding out the real data API.
+    const byKey = new Map();
     for (const entry of signals.networkEntries) {
         const evidence = scoreEndpointEvidence(entry);
-        const existing = byUrl.get(entry.url);
+        const key = networkDedupKey(entry.url, entry.method);
+        const existing = byKey.get(key);
         if (!existing) {
-            byUrl.set(entry.url, { ...evidence, repeats: 1 });
+            byKey.set(key, { ...evidence, repeats: 1 });
         }
         else {
             existing.repeats += 1;
             if (evidence.real_data_score > existing.real_data_score) {
-                byUrl.set(entry.url, { ...evidence, repeats: existing.repeats });
+                byKey.set(key, { ...evidence, repeats: existing.repeats });
             }
         }
     }
-    return [...byUrl.values()]
+    return [...byKey.values()]
         .filter((evidence) => evidence.verdict !== 'noise' || evidence.real_data_score > 0)
         .sort((a, b) => b.real_data_score - a.real_data_score)
         .slice(0, 8);
