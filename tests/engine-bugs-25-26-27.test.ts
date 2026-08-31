@@ -31,6 +31,7 @@ import { compactSnapshotText } from '../src/opencli/snapshotFormatter.js';
 
 const CLI_SRC = readFileSync(new URL('../src/opencli-engine/cli.js', import.meta.url), 'utf-8');
 const HUB_MJS_SRC = readFileSync(new URL('../bin/hub.mjs', import.meta.url), 'utf-8');
+const OBS_QUERY_SRC = readFileSync(new URL('../src/opencli-engine/browser/observation-query.js', import.meta.url), 'utf-8');
 
 // Extract a top-level function body from formatted source (inner braces stay
 // indented; only the function's own closing brace sits at column 0).
@@ -47,21 +48,28 @@ function extractFunction(source, name) {
 
 describe('wait xhr freshness (bug #25)', () => {
     it('the wait-xhr match loop gates entries on the anchor timestamp', () => {
-        // The stale-match loop: entries already in the ring when the wait
-        // begins must not satisfy it (bare-wait honesty).
-        const anchor = CLI_SRC.indexOf('const startTs = Date.now()');
-        expect(anchor).toBeGreaterThan(0);
-        const waitBlock = CLI_SRC.slice(anchor, CLI_SRC.indexOf('pollMs = 400', anchor));
-        expect(waitBlock).toContain('deadline = startTs + timeout');
-        const matchLine = CLI_SRC.match(/items\.find\(\(e\) =>[^\n]+\?\? null/);
-        expect(matchLine?.[0]).toContain('e.timestamp >= anchorTs');
+        // Bug #34 moved the anchor + poll + timestamp filter into
+        // observation-query.js's waitForNetworkEntry so adapters driving the
+        // page API run the same code the CLI exercises. The stale-match
+        // contract: entries already in the ring when the wait begins must
+        // not satisfy it (bare-wait honesty).
+        expect(OBS_QUERY_SRC).toContain('export async function waitForNetworkEntry');
+        const helper = extractFunction(OBS_QUERY_SRC, 'waitForNetworkEntry');
+        expect(helper).toContain('const anchorTs = opts.sinceMs != null ? startTs - opts.sinceMs : startTs');
+        expect(helper).toContain('Number(e.timestamp ?? 0) >= anchorTs');
+        expect(helper).toContain('while (Date.now() < deadline && !matched)');
+    });
+
+    it('the CLI wait command routes through the shared primitive, no private loop', () => {
+        // Round 3 (bug #34): the CLI must not keep a second copy of the loop.
+        expect(CLI_SRC).toContain('await waitForNetworkEntry(page, value, {');
+        expect(CLI_SRC).not.toContain('const anchorTs = sinceMs ? startTs - sinceMs : startTs');
     });
 
     it('the strict default gate is widened by --since, not replaced', () => {
         // Round 2: the click → wait idiom's request lands BEFORE the wait
         // starts, so the strict gate rejected the very request the agent
         // awaited. --since shifts the anchor back by a relative window.
-        expect(CLI_SRC).toContain('anchorTs = sinceMs ? startTs - sinceMs : startTs');
         expect(CLI_SRC).toContain("option('--since <duration>'");
         // Bare waits keep the honest stale message.
         expect(CLI_SRC).toContain('requests observed before this wait began are not counted');

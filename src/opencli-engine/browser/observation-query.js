@@ -139,6 +139,72 @@ export async function captureNetworkItems(page) {
     }
 }
 
+// ── network: wait primitive (bug #34) ───────────────────────────────────────
+
+/**
+ * Wait for a captured request whose URL matches `pattern` (regex source or
+ * RegExp), with the same freshness semantics the CLI `wait xhr --since`
+ * command exposes:
+ *
+ * - default: only entries whose timestamp is >= the moment this call starts,
+ *   so a bare wait cannot latch onto a previous action's request and hand
+ *   back the wrong payload
+ * - `sinceMs`: widen the gate to a relative window — the caller asserts
+ *   which entries are "theirs". This revives the click → wait idiom, whose
+ *   request typically lands before the wait starts (daemon commands
+ *   serialize, so "start listening, then click" is structurally impossible).
+ *
+ * Bug #34: this loop used to live only inside the CLI command. Adapters
+ * driving the page API had to reinvent it per-site — fetch/XHR monkey-patches
+ * with private rings and timestamps (clis/instagram, the adapter standard's
+ * installRequestCapture) — each a fresh copy of the same anchor + poll +
+ * timestamp filter. One implementation now serves the CLI, adapters, and any
+ * future MCP wait tool.
+ *
+ * `ensureCapture` (default true) starts the page's network capture first —
+ * the CDP collector when the page supports it, the in-page interceptor
+ * otherwise — and drains the interceptor ring BEFORE anchoring, so stale
+ * entries cannot sneak in through the fallback path (the CDP ring is
+ * non-destructive; the anchor gate handles it). Pass false when the caller
+ * already owns the capture channel.
+ *
+ * Returns the normalized matched entry (same shape `captureNetworkItems`
+ * produces: url/method/status/ct/body/requestBody/timestamp) or null after
+ * `timeoutMs` (default 10s) without a match. Throws on an invalid regex.
+ */
+export async function waitForNetworkEntry(page, pattern, opts = {}) {
+    let re;
+    try {
+        re = pattern instanceof RegExp ? pattern : new RegExp(pattern);
+    }
+    catch (err) {
+        throw new Error(`Invalid regex "${String(pattern)}": ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (opts.ensureCapture !== false) {
+        const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
+        if (!hasSessionCapture) {
+            try {
+                await page.evaluate(NETWORK_INTERCEPTOR_JS);
+            }
+            catch { /* non-fatal */ }
+        }
+        await captureNetworkItems(page);
+    }
+    const timeoutMs = opts.timeoutMs ?? 10000;
+    const pollMs = opts.pollMs ?? 400;
+    const startTs = Date.now();
+    const anchorTs = opts.sinceMs != null ? startTs - opts.sinceMs : startTs;
+    const deadline = startTs + timeoutMs;
+    let matched = null;
+    while (Date.now() < deadline && !matched) {
+        const items = await captureNetworkItems(page);
+        matched = items.find((e) => Number(e.timestamp ?? 0) >= anchorTs && re.test(e.url ?? '')) ?? null;
+        if (!matched)
+            await new Promise((r) => setTimeout(r, pollMs));
+    }
+    return matched;
+}
+
 /** Drop static-resource / telemetry noise so agents see only API-shaped traffic. */
 export function filterNetworkItems(items) {
     return items.filter((r) => {

@@ -13,6 +13,7 @@
     "./browser/cdp": "./browser/index.js",
     "./browser/page": "./browser/index.js",
     "./browser/utils": "./browser/utils.js",
+    "./browser/observation-query": "./browser/observation-query.js",
     "./download": "./download/index.js",
     "./download/article-download": "./download/article-download.js",
     "./download/media-download": "./download/media-download.js",

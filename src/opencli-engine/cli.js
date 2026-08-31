@@ -43,6 +43,7 @@ import {
     selectFreshByTimestamp,
     timestampFromRaw,
     toIsoTimestamp,
+    waitForNetworkEntry,
 } from './browser/observation-query.js';
 import { registerAuthCommands } from './commands/auth.js';
 import { log } from './logger.js';
@@ -2447,23 +2448,14 @@ Examples:
                 process.exitCode = EXIT_CODES.USAGE_ERROR;
                 return;
             }
-            let re;
             try {
-                re = new RegExp(value);
+                new RegExp(value);
             }
             catch (err) {
                 console.error(`Invalid regex "${value}": ${err instanceof Error ? err.message : String(err)}`);
                 process.exitCode = EXIT_CODES.USAGE_ERROR;
                 return;
             }
-            const hasSessionCapture = await page.startNetworkCapture?.() ?? false;
-            if (!hasSessionCapture) {
-                try {
-                    await page.evaluate(NETWORK_INTERCEPTOR_JS);
-                }
-                catch { /* non-fatal */ }
-            }
-            await captureNetworkItems(page);
             // Bug #25: the freshness gate. Default is strict — only entries
             // newer than this wait — so a bare wait cannot latch onto a
             // previous action's request and hand back the wrong payload.
@@ -2473,6 +2465,9 @@ Examples:
             // strict gate rejects the very request the agent wants.
             // `--since 30s` widens the gate to a relative window — the
             // caller asserts which entries are "theirs".
+            // Bug #34: the anchor + poll + timestamp-filter loop lives in
+            // observation-query.js's waitForNetworkEntry so adapters driving
+            // the page API share the exact implementation the CLI exercises.
             let sinceMs = null;
             if (opts.since !== undefined) {
                 sinceMs = parseDurationMs(opts.since, 'since');
@@ -2485,17 +2480,10 @@ Examples:
                     return;
                 }
             }
-            const startTs = Date.now();
-            const anchorTs = sinceMs ? startTs - sinceMs : startTs;
-            const deadline = startTs + timeout;
-            const pollMs = 400;
-            let matched = null;
-            while (Date.now() < deadline && !matched) {
-                const items = await captureNetworkItems(page);
-                matched = items.find((e) => e.timestamp >= anchorTs && re.test(e.url)) ?? null;
-                if (!matched)
-                    await new Promise((r) => setTimeout(r, pollMs));
-            }
+            const matched = await waitForNetworkEntry(page, value, {
+                ...(sinceMs ? { sinceMs } : {}),
+                timeoutMs: timeout,
+            });
             if (!matched) {
                 console.log(JSON.stringify({
                     error: {

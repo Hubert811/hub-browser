@@ -575,3 +575,49 @@ await capture.stop();
 ```
 
 **通用性**：需要请求体做真实值断言/重放的适配器；iframe 套内容站点。
+
+---
+
+### 20. `waitForNetworkEntry(page, pattern, opts?)` — 引擎级 XHR 等待原语（bug #34）
+
+**适用场景**：需要"等某条请求落地"的适配器——**优先用这个，别再手写轮询**。CLI 的 `wait xhr --since` 走的就是这同一个函数：手测验证（CLI）和适配器实现（page API）跑同一条通道。
+
+**前端背景**：bug #34（第九战复查）——锚点+轮询+时间戳筛选这套逻辑曾只活在 cli.js 命令里，每个要 payload 的适配器各自重发明（instagram 的 fetch/XHR monkey-patch、§19 的 waitFirst）。现在引擎把它抽成 `observation-query.js` 的共享原语。
+
+**签名**：
+
+```typescript
+import { waitForNetworkEntry } from '@jackwener/opencli/browser/observation-query';
+
+waitForNetworkEntry(page, pattern, opts?: {
+  sinceMs?: number       // 相对窗口：放宽新鲜度门（click → wait 惯用法必需）
+  timeoutMs?: number     // 默认 10000
+  pollMs?: number        // 默认 400
+  ensureCapture?: boolean // 默认 true：自动起 CDP 采集（幂等）；自装了 fetch 补丁的传 false
+}): Promise<NormalizedEntry | null>
+// NormalizedEntry: { url, method, status, ct, body(已 JSON.parse), requestBody, timestamp, ... }
+// 无匹配返回 null；regex 非法抛 Error
+```
+
+**语义（与 CLI `--since` 严格对齐）**：
+
+- **默认严格门**：只认 `timestamp >= 本次调用开始时刻` 的条目——裸等待不会捡到上一步动作的旧请求
+- **`sinceMs` 相对窗口**：click → wait 惯用法必需。请求在 click 后 ~250ms 落地、早于 wait 开始（daemon 命令串行），严格门会拒掉你要的那条。`sinceMs: 30_000` = "最近 30s 内的都算我的"
+
+**调用示例**：
+
+```javascript
+import { waitForNetworkEntry } from '@jackwener/opencli/browser/observation-query';
+
+await clickButtonByText(page, '查询');
+// 请求在 click 里已发出、此刻已在采集环里——用相对窗口接住它
+const req = await waitForNetworkEntry(page, '/olap/', { sinceMs: 30_000, timeoutMs: 25000 });
+if (!req) throw new CommandExecutionError('查询请求未触发');
+// req.requestBody: POST 表单体（重放分页用）；req.body: 已解析的响应 JSON（真实值断言用）
+```
+
+**注意**：
+
+- 主 frame 的请求体捕获走 CDP 采集（含 `requestBody`）；**portal iframe 内的请求** CDP 不可靠，仍用 §19 的 `installRequestCapture`（补丁主通道）——两者是互补关系，不是替代
+- 自装了 fetch/XHR 补丁的适配器传 `ensureCapture: false`，避免拦截器安装二次包裹你的补丁
+- 匹配的是 URL 正则（与 CLI `wait xhr` 一致），不是子串
