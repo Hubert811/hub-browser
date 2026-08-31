@@ -1,6 +1,6 @@
 {
   "name": "@hub/browser",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "type": "module",
   "bin": {
     "hub": "bin/hub.mjs"
