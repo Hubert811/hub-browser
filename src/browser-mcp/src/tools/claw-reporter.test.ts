@@ -180,13 +180,16 @@ describe('P2-3 claw harness reporter — startup orphan sweep', () => {
   })
 
   interface SessionSpec {
-    status?: string
+    endedAt?: number
     lastDispatchAt?: number[]
     httpStatus?: number
   }
 
   /** Mock fetch that answers GET /sessions/{id} from a spec map and accepts
-   * the sweep's POST /end. */
+   * the sweep's POST /end. Shapes mirror the REAL API: `status` is
+   * browser-reconciled (a DB-live harness session reports 'done' because
+   * harness sessions never enter the server's live map) and `endedAt` is
+   * absent while the session has no end event — the sweep keys on endedAt. */
   function withSweepMock(sessions: Record<string, SessionSpec>) {
     const requests: Array<{ method: string; url: string; body: unknown }> = []
     const original = globalThis.fetch
@@ -209,7 +212,10 @@ describe('P2-3 claw harness reporter — startup orphan sweep', () => {
           ok: true,
           status: 200,
           json: async () => ({
-            session: { status: spec.status ?? 'live' },
+            session: {
+              status: 'done',
+              ...(spec.endedAt !== undefined && { endedAt: spec.endedAt }),
+            },
             dispatches: (spec.lastDispatchAt ?? []).map((t) => ({ createdAt: t })),
           }),
         } as unknown as Response
@@ -239,9 +245,9 @@ describe('P2-3 claw harness reporter — startup orphan sweep', () => {
       { owner: 'd', sessionId: 'ZERODISPATCH0000000000000DD', startedAt: now - 3 * HOUR },
     ])
     const mock = withSweepMock({
-      STALELIVE0000000000000000AA: { status: 'live', lastDispatchAt: [now - 2 * HOUR] },
-      RECENTLIVE000000000000000BB: { status: 'live', lastDispatchAt: [now - 5 * 60_000] },
-      ALREADYDONE00000000000000CC: { status: 'done' },
+      STALELIVE0000000000000000AA: { lastDispatchAt: [now - 2 * HOUR] },
+      RECENTLIVE000000000000000BB: { lastDispatchAt: [now - 5 * 60_000] },
+      ALREADYDONE00000000000000CC: { endedAt: now - HOUR },
       // Zero-dispatch orphan: the detail route 404s (dispatch_count filter),
       // but the session is still Live in the DB — the sweep must end it.
       ZERODISPATCH0000000000000DD: { httpStatus: 404 },
@@ -266,7 +272,7 @@ describe('P2-3 claw harness reporter — startup orphan sweep', () => {
     // Long-lived daemon session: started 3 days ago, dispatch 10 minutes ago.
     writeLedger([{ owner: 'a', sessionId: 'LONGRUN000000000000000000EE', startedAt: now - 72 * HOUR }])
     const mock = withSweepMock({
-      LONGRUN000000000000000000EE: { status: 'live', lastDispatchAt: [now - 10 * 60_000] },
+      LONGRUN000000000000000000EE: { lastDispatchAt: [now - 10 * 60_000] },
     })
     const r = reporter()
     try {
@@ -297,6 +303,44 @@ describe('P2-3 claw harness reporter — startup orphan sweep', () => {
       expect(mock.requests.some((req) => req.method === 'POST')).toBe(false)
     } finally {
       mock.restore()
+    }
+  })
+
+  test('a session recorded while the sweep is in flight is not clobbered', async () => {
+    // Race regression: the sweep's ledger write must merge with concurrent
+    // writers, not overwrite — otherwise a session started mid-sweep loses its
+    // ledger entry and becomes invisible to future sweeps.
+    writeLedger([{ owner: 'a', sessionId: 'STALEGATE00000000000000HH', startedAt: now - 3 * HOUR }])
+    let releaseGet: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { releaseGet = resolve })
+    const original = globalThis.fetch
+    globalThis.fetch = (async (input: unknown, init?: { method?: string; body?: string }) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET') === 'GET' && url.includes('/api/v1/sessions/')) {
+        await gate // hold the sweep's detail lookup until the race is set up
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            session: { status: 'done' }, // no endedAt: live in the DB
+            dispatches: [{ createdAt: now - 2 * HOUR }],
+          }),
+        } as unknown as Response
+      }
+      return { ok: true, status: 200 } as Response
+    }) as typeof fetch
+    const r = reporter()
+    try {
+      const sweepDone = r.sweepStaleSessions(now)
+      // While the sweep's GET is parked, this process starts a session —
+      // reportDispatch records the ledger entry synchronously.
+      r.reportDispatch({ owner: 'b', agentId: 'b', toolName: 't', durationMs: 1, createdAt: 1, isError: false })
+      releaseGet!()
+      expect(await sweepDone).toBe(1) // the stale entry was ended
+      const ids = readLedger().map((e) => e.sessionId)
+      expect(ids).toEqual([r.sessionIdFor('b')]) // the in-flight entry survived
+    } finally {
+      globalThis.fetch = original
     }
   })
 
@@ -485,9 +529,13 @@ describe('P2-3 claw harness reporter — lazy session + claim sequencing', () =>
 describe('P2-3 claw harness reporter — failure isolation', () => {
   beforeEach(() => {
     process.env.HUB_CLAW_REPORT = 'on'
+    // reportDispatch records sessions in the ledger synchronously — without
+    // this override the tests would pollute the real ~/.hub/state ledger.
+    process.env.HUB_CLAW_SESSIONS_FILE = `/tmp/hub-claw-sessions-fail-${process.pid}-${Math.random().toString(36).slice(2)}.json`
   })
   afterEach(() => {
     delete process.env.HUB_CLAW_REPORT
+    delete process.env.HUB_CLAW_SESSIONS_FILE
   })
 
   test('connection refusal self-disables and stops issuing requests', async () => {

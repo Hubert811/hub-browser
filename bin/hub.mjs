@@ -564,6 +564,13 @@ if (process.env.HUB_DAEMON === 'true') {
         const { clawHarnessReporter } = await import(`${RUNTIME}/browser-mcp/src/tools/claw-reporter.js`);
         const ended = await clawHarnessReporter.sweepStaleSessions();
         if (ended > 0) process.stderr.write(`[hub-daemon] claw orphan sweep ended ${ended} stale session(s)\n`);
+        // Keep sweeping every 60s (official parity: the server's own
+        // session_sweep_interval) — a startup-only sweep would leave a
+        // kill -9 orphan Live for as long as a busy daemon never restarts.
+        const sweepTimer = setInterval(() => {
+          void clawHarnessReporter.sweepStaleSessions().catch(() => {});
+        }, 60_000);
+        sweepTimer.unref?.();
       } catch { /* best-effort */ }
     })();
   });

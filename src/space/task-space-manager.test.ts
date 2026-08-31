@@ -1150,6 +1150,111 @@ describe('restore idempotency — Phase 3 A (auto-restore at daemon/MCP start)',
   })
 })
 
+describe('F16 — restore zombie-renderer health gate', () => {
+  it('a tab whose probe fails is never adopted: the ref re-opens by URL instead', async () => {
+    const fake = createFakeGateway()
+    const probeCalls: number[] = []
+    fake.gateway.probeTab = async (target) => {
+      probeCalls.push(typeof target === 'number' ? target : Number(target))
+      return false // every live tab is a zombie
+    }
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'work')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
+    const zombiePageId = fake.tabs[0].pageId
+
+    expect(await manager.restore()).toBe(1) // re-opened, not re-attached
+    const tabs = await manager.listTabs(space.id)
+    expect(tabs).toHaveLength(1)
+    expect(tabs[0].pageId).not.toBe(zombiePageId) // points at the fresh tab
+    // The zombie itself is left alone (never closed by restore)…
+    expect(fake.tabs.some((t) => t.pageId === zombiePageId)).toBe(true)
+    // …and the fresh duplicate is the recovery path.
+    expect(fake.opened).toEqual(['https://a.example', 'https://a.example'])
+  })
+
+  it('a healthy tab is adopted normally when the probe answers true', async () => {
+    const fake = createFakeGateway()
+    fake.gateway.probeTab = async () => true
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'work')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
+    expect(await manager.restore()).toBe(1) // re-attached the live tab
+    expect(fake.opened).toEqual(['https://a.example']) // no duplicate open
+    expect((await manager.listTabs(space.id)).map((t) => t.url)).toEqual([
+      'https://a.example',
+    ])
+  })
+
+  it('the probe runs at most once per tab across match strategies', async () => {
+    const fake = createFakeGateway()
+    const probeCalls: number[] = []
+    fake.gateway.probeTab = async (target) => {
+      probeCalls.push(typeof target === 'number' ? target : Number(target))
+      return false
+    }
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'work')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
+    await manager.restore()
+    // The same zombie is considered by targetId, pageId and url strategies —
+    // the cache must collapse that to one probe.
+    expect(probeCalls).toHaveLength(1)
+  })
+
+  it('a tab that is still loading skips the probe entirely (busy ≠ dead)', async () => {
+    const fake = createFakeGateway()
+    let probed = 0
+    fake.gateway.probeTab = async () => {
+      probed++
+      return false // would wrongly reject — but must not be consulted
+    }
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'work')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
+    fake.tabs[0].isLoading = true
+    expect(await manager.restore()).toBe(1) // adopted by targetId
+    expect(probed).toBe(0)
+    expect(fake.opened).toEqual(['https://a.example']) // no duplicate
+  })
+
+  it('a previously-restored tab that turns zombie is pruned from the ledger', async () => {
+    const fake = createFakeGateway()
+    let healthy = true
+    fake.gateway.probeTab = async () => healthy
+    const manager = new TaskSpaceManager({
+      storagePath: tempLedger(),
+      gateway: fake.gateway,
+      persist: false,
+    })
+    const space = await manager.create('agent-a', 'work')
+    await manager.openTab('agent-a', space.id, 'https://a.example')
+    await manager.restore() // adopted while healthy
+
+    healthy = false // renderer hangs later
+    await manager.restore() // zombie: not adoptable → restored-ref pruned
+    expect(await manager.listTabs(space.id)).toEqual([])
+    // The tab still exists in the browser — restore never destroys tabs.
+    expect(fake.tabs.some((t) => t.url === 'https://a.example')).toBe(true)
+  })
+})
+
 describe('recycleSpaceTabs — TabFreshness 整组回收原语', () => {
   it('closes every tab and reopens each URL with a new pageId, preserving URLs and the space record', async () => {
     const fake = createFakeGateway()

@@ -73,6 +73,9 @@ export interface TabLike {
   url?: string
   title?: string
   isActive?: boolean
+  /** True while the tab is still loading — busy-but-healthy, must not fail
+   * the F16 restore health probe. */
+  isLoading?: boolean
 }
 
 /** One tab attributed to a space (ledger). */
@@ -214,6 +217,14 @@ export interface SpaceTabGateway {
   ): Promise<string | number | undefined>
   closeTab(target: number | string): Promise<void>
   listTabs(): Promise<TabLike[]>
+  /**
+   * F16 — bounded health probe for one live tab. A tab whose renderer hung
+   * (zombie) still lists in the browser but never answers JS; restore()
+   * refuses to adopt such targets so later commands fall back to the
+   * reopen-by-URL path instead of hanging to their own timeouts. Optional —
+   * callers must tolerate absence (legacy behavior: adopt without probing).
+   */
+  probeTab?(target: number | string): Promise<boolean>
   /**
    * Best-effort activation: make the given tab the agent's active tab
    * (e.g. UnifiedPage.selectTab). Optional — callers must tolerate absence.
@@ -539,6 +550,8 @@ type PageLike = {
   closeTab?(target: number | string): Promise<void>
   tabs?(): Promise<unknown[]>
   selectTab?(target: number | string): Promise<void>
+  /** F16 — bounded health probe (zombie-renderer detection) for one tab. */
+  probeTab?(target: number | string): Promise<boolean>
   // D5 — optional tab-group surface (UnifiedPage). Pages that cannot group
   // tabs omit these; the gateway then omits the corresponding methods.
   tabGroupList?(): Promise<unknown[]>
@@ -606,6 +619,11 @@ export function gatewayFromPage(page: PageLike): SpaceTabGateway {
       await page.closeTab(target)
     },
     listTabs: async () => ((await page.tabs?.()) ?? []) as TabLike[],
+    ...(page.probeTab
+      ? {
+          probeTab: async (target: number | string) => page.probeTab!(target),
+        }
+      : {}),
     ...(page.selectTab
       ? {
           activate: async (target: number | string) => {
@@ -646,6 +664,11 @@ export function gatewayFromProvider(provider: ProviderLike): SpaceTabGateway {
     listTabs: async () => {
       const page = await provider.connect()
       return ((await page.tabs?.()) ?? []) as TabLike[]
+    },
+    probeTab: async (target: number | string) => {
+      const page = await provider.connect()
+      if (!page.probeTab) return true
+      return page.probeTab(target)
     },
     activate: async (target) => {
       const page = await provider.connect()
@@ -1667,6 +1690,24 @@ export class TaskSpaceManager {
     }
     const used = new Set<number>()
     let reconciled = 0
+    // F16 — zombie-renderer gate. A live tab whose renderer hung still lists
+    // in the browser but never answers JS; adopting it as restored makes
+    // every later command on the space hang to its own timeout. Probe once
+    // per tab (cached across refs and strategies); tabs still loading skip
+    // the probe (busy ≠ dead); a gateway without probeTab, or an untrusted
+    // live list, keeps the legacy adopt-blind behavior.
+    const probeCache = new Map<number, boolean>()
+    const adoptable = async (tab: TabLike): Promise<boolean> => {
+      if (!liveOk || tab.isLoading === true || !gw.probeTab) return true
+      if (!probeCache.has(tab.pageId)) {
+        try {
+          probeCache.set(tab.pageId, await gw.probeTab(tab.pageId))
+        } catch {
+          probeCache.set(tab.pageId, false)
+        }
+      }
+      return probeCache.get(tab.pageId)!
+    }
     const spaces = Object.values(this.state.spaces)
       .filter((s) => s.ownership === 'agent')
       .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
@@ -1689,7 +1730,7 @@ export class TaskSpaceManager {
               (t) => t.targetId === ref.targetId && !used.has(t.pageId),
             )
           : undefined
-        if (byTarget) {
+        if (byTarget && (await adoptable(byTarget))) {
           used.add(byTarget.pageId)
           next.push({
             pageId: byTarget.pageId,
@@ -1713,7 +1754,8 @@ export class TaskSpaceManager {
           liveById &&
           liveById.url &&
           ref.url &&
-          this.sameRestoreUrl(liveById.url) === this.sameRestoreUrl(ref.url)
+          this.sameRestoreUrl(liveById.url) === this.sameRestoreUrl(ref.url) &&
+          (await adoptable(liveById))
         ) {
           used.add(liveById.pageId)
           next.push({
@@ -1738,7 +1780,7 @@ export class TaskSpaceManager {
             ref.url &&
             this.sameRestoreUrl(t.url) === this.sameRestoreUrl(ref.url),
         )
-        if (byUrl) {
+        if (byUrl && (await adoptable(byUrl))) {
           used.add(byUrl.pageId)
           next.push({
             pageId: byUrl.pageId,

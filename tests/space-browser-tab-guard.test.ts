@@ -332,7 +332,7 @@ describe('hub browser tab guard (Phase 3 B — bugs #4/#5 + D3)', () => {
     // Same URL in both spaces; agent-a's scoped list must show only its tab.
     process.env.HUB_AGENT_ID = 'agent-a'
     const listed = JSON.parse(
-      await run(['browser', '--session', 'alice-work', 'tab', 'list']),
+      await run(['browser', '--session', 'alice-work', 'tab', 'list', '-f', 'json']),
     ) as Array<{ pageId: number; url: string }>
     expect(listed).toHaveLength(1)
     expect(listed[0].pageId).toBe(100)
@@ -340,7 +340,7 @@ describe('hub browser tab guard (Phase 3 B — bugs #4/#5 + D3)', () => {
 
     process.env.HUB_AGENT_ID = 'agent-b'
     const listedB = JSON.parse(
-      await run(['browser', '--session', 'bob-work', 'tab', 'list']),
+      await run(['browser', '--session', 'bob-work', 'tab', 'list', '-f', 'json']),
     ) as Array<{ pageId: number; url: string }>
     expect(listedB).toHaveLength(1)
     expect(listedB[0].pageId).toBe(101)
@@ -355,7 +355,7 @@ describe('hub browser tab guard (Phase 3 B — bugs #4/#5 + D3)', () => {
     delete process.env.HUB_AGENT_ID
 
     // No current space → tab list is empty (no legacy unfiltered listing)
-    const listed = JSON.parse(await run(['browser', '--session', 'legacy', 'tab', 'list'])) as unknown[]
+    const listed = JSON.parse(await run(['browser', '--session', 'legacy', 'tab', 'list', '-f', 'json'])) as unknown[]
     expect(listed).toHaveLength(0)
 
     // No current space → select is rejected

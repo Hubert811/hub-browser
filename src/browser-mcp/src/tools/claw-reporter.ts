@@ -300,13 +300,14 @@ export class ClawHarnessReporter {
     await this.endSessionIds([...this.startedSessions], kind)
   }
 
-  /** Startup orphan sweep: sessions left Live by processes that died before
-   * their exit hook ran (kill -9, crash). The official server's own idle
-   * sweeper only covers sessions in its in-memory map — harness sessions are
-   * not in it, so hub cleans its own via the ledger. A session is ended only
-   * when its last dispatch is older than SWEEP_STALE_MS (a live concurrent
-   * process with recent activity is never touched); unknown or already-ended
-   * sessions are dropped from the ledger. */
+  /** Orphan sweep (daemon startup + periodic): sessions left Live by processes
+   * that died before their exit hook ran (kill -9, crash). The official
+   * server's own idle sweeper only covers sessions in its in-memory map —
+   * harness sessions are not in it, so hub cleans its own via the ledger. A
+   * session is ended only when its last dispatch is older than SWEEP_STALE_MS
+   * (a live concurrent process with recent activity is never touched); unknown
+   * or already-ended sessions are dropped from the ledger. Liveness keys on
+   * `endedAt` — see fetchSessionDetail for why `status` cannot be trusted. */
   async sweepStaleSessions(now: number = Date.now()): Promise<number> {
     if (this.explicitlyDisabled) return 0
     if (!this.isEnabled(now)) return 0
@@ -341,7 +342,7 @@ export class ClawHarnessReporter {
         if (endedOk) ended += 1
         continue
       }
-      if (detail.status !== 'live') continue // already terminal: drop
+      if (detail.endedAt !== null) continue // ended in the DB: terminal, drop
       const lastActivity = Math.max(entry.startedAt, ...detail.lastDispatchAt)
       if (now - lastActivity < SWEEP_STALE_MS) {
         kept.push(entry) // recently active: maybe a live process, leave it
@@ -356,16 +357,28 @@ export class ClawHarnessReporter {
         .catch(() => false)
       if (endedOk) ended += 1
     }
-    writeSessionLedger(kept)
+    // Merge, don't overwrite: a session can be recorded while this async sweep
+    // is in flight (reportDispatch writes the ledger synchronously on session
+    // start) — a wholesale rewrite of `kept` would clobber its entry and hide
+    // it from future sweeps. Remove exactly the swept-but-dropped ids.
+    const swept = new Set(entries.map((e) => e.sessionId))
+    const keep = new Set(kept.map((e) => e.sessionId))
+    writeSessionLedger(
+      readSessionLedger().filter((e) => !swept.has(e.sessionId) || keep.has(e.sessionId)),
+    )
     return ended
   }
 
   /** Session detail for the sweep: undefined = unknown session (404), null =
-   * lookup failed (server down). `lastDispatchAt` is empty when the session
-   * recorded no dispatches. */
+   * lookup failed (server down). `endedAt` is null while the session has no
+   * end event in the DB — the API's `status` field is browser-reconciled (a
+   * DB-live harness session reports "done" because harness sessions never
+   * enter the server's in-memory live map), so `endedAt` is the only reliable
+   * terminal signal. `lastDispatchAt` is empty when the session recorded no
+   * dispatches. */
   private async fetchSessionDetail(
     sessionId: string,
-  ): Promise<{ status: string; lastDispatchAt: number[] } | null | undefined> {
+  ): Promise<{ endedAt: number | null; lastDispatchAt: number[] } | null | undefined> {
     try {
       const response = await fetch(
         `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}`,
@@ -374,12 +387,12 @@ export class ClawHarnessReporter {
       if (response.status === 404) return undefined
       if (!response.ok) return null
       const body = (await response.json()) as {
-        session?: { status?: unknown }
+        session?: { endedAt?: unknown }
         dispatches?: Array<{ createdAt?: unknown }>
       }
       const dispatches = Array.isArray(body.dispatches) ? body.dispatches : []
       return {
-        status: typeof body.session?.status === 'string' ? body.session.status : 'live',
+        endedAt: typeof body.session?.endedAt === 'number' ? body.session.endedAt : null,
         lastDispatchAt: dispatches
           .map((d) => (typeof d.createdAt === 'number' ? d.createdAt : 0))
           .filter((t) => t > 0),

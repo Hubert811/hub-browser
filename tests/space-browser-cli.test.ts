@@ -178,7 +178,7 @@ describe('hub browser ↔ space integration (Phase 3 B)', () => {
     expect(openJson.page).toBe('target-100')
 
     // browser tab list → scoped to the current space
-    const listed = await run(['browser', '--session', 'work', 'tab', 'list'])
+    const listed = await run(['browser', '--session', 'work', 'tab', 'list', '-f', 'json'])
     const listJson = JSON.parse(listed) as Array<{ pageId: number; url: string }>
     expect(listJson).toHaveLength(1)
     expect(listJson[0].pageId).toBe(100)
@@ -303,7 +303,7 @@ describe('hub browser ↔ space integration (Phase 3 B)', () => {
     expect(browser.tabs[0].url).toBe('https://start.example')
 
     // browser tab list → empty (no legacy unfiltered listing)
-    const listed = JSON.parse(await run(['browser', '--session', 'work', 'tab', 'list'])) as unknown[]
+    const listed = JSON.parse(await run(['browser', '--session', 'work', 'tab', 'list', '-f', 'json'])) as unknown[]
     expect(listed).toHaveLength(0)
 
     // browser tab select → rejected

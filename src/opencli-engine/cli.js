@@ -870,14 +870,14 @@ Examples:
      * below are thin wrappers over them.
      */
     async function runForkBrowserTool(toolName, args, page) {
-        const { BROWSER_TOOLS, PAGE_INFO_TOOLS, OBSERVATION_TOOLS, DISCOVERY_TOOLS } = await import('../browser-mcp/src/tools/registry.ts');
+        const { BROWSER_TOOLS, PAGE_INFO_TOOLS, OBSERVATION_TOOLS, DISCOVERY_TOOLS, PROBE_TOOLS } = await import('../browser-mcp/src/tools/registry.ts');
         const { executeTool } = await import('../browser-mcp/src/tools/framework.ts');
         // P2-6: the fork surface is every page-operating tool family — the
         // pinned 17 BROWSER_TOOLS contract plus the families toolified from
         // CLI direct implementations (batch 1: frames/extract; batch 2:
-        // network/console; batch 3: find/analyze). Space / audit / adapter
-        // families stay out: they are not page-scoped.
-        const def = [...BROWSER_TOOLS, ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS].find((t) => t.name === toolName);
+        // network/console; batch 3: find/analyze; probe: inspect). Space /
+        // audit / adapter families stay out: they are not page-scoped.
+        const def = [...BROWSER_TOOLS, ...PAGE_INFO_TOOLS, ...OBSERVATION_TOOLS, ...DISCOVERY_TOOLS, ...PROBE_TOOLS].find((t) => t.name === toolName);
         if (!def)
             throw new Error(`Fork browser tool "${toolName}" is not registered`);
         // P1-4 (CLI face): fork-wrapped commands pass the SAME executeTool
@@ -1023,7 +1023,8 @@ Examples:
         .description('Tab management — list, create, and close tabs in the browser session');
     browserTab.command('list')
         .description('List tabs in the browser session with target IDs')
-        .action(browserAction(async (page) => {
+        .option('-f, --format <fmt>', 'Output format: table, json, yaml, md, csv', 'table')
+        .action(browserAction(async (page, opts) => {
         let tabs = await page.tabs();
         // Phase 3 B: with a current space the listing is scoped to that
         // space's tabs (legacy unfiltered behavior without one).
@@ -1033,7 +1034,13 @@ Examples:
         // (browserAction owns the page lifecycle).
         const { gatewayFromPage } = await import('../space/task-space-manager.ts');
         tabs = await scopeTabsToCurrentSpace(tabs, gatewayFromPage(page));
-        console.log(JSON.stringify(tabs, null, 2));
+        renderOutput(tabs, {
+            fmt: opts.format,
+            fmtExplicit: !!opts.format,
+            columns: ['pageId', 'targetId', 'title', 'url', 'isActive'],
+            title: 'browser/tab/list',
+            source: 'hub browser <session> tab list',
+        });
     }));
     browserTab.command('new')
         .argument('[url]', 'Optional URL to open in the new tab')
@@ -1360,6 +1367,31 @@ Examples:
         const url = await page.getCurrentUrl?.() ?? '';
         console.log(`URL: ${url}\n`);
         console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
+    }));
+    // F15 (probe): CLI twin of the MCP `inspect` tool — deep-probe one
+    // snapshot ref (classes, attributes, ancestor path, verified-unique
+    // candidate selectors). Same shared tool definition via executeTool, so
+    // the call is guarded and audited like every other dispatch.
+    addBrowserTabOption(browser.command('inspect')
+        .argument('<ref>', 'Element ref from the last snapshot, e.g. e12')
+        .option('--json', 'Output the structured detail object instead of text')
+        .description('Deep-probe the element behind one snapshot ref (classes, attributes, path, candidate selectors)'))
+        .action(browserAction(async (page, ref, opts) => {
+        let result = await runForkBrowserTool('inspect', { ...forkToolArgsFor(page), ref: String(ref) }, page);
+        // Observer refs are in-memory per process: an unknown ref means the
+        // ref was minted by a process that is gone (direct CLI run, daemon
+        // restart). Snapshot numbering is deterministic on a stable DOM, so a
+        // fresh snapshot re-mints the same numbers — retry exactly once.
+        const errText = () => result.content?.find?.((c) => c.type === 'text')?.text ?? '';
+        if (result.isError && errText().includes('Unknown ref')) {
+            await page.snapshot({ viewportExpand: 2000, source: 'ax' });
+            result = await runForkBrowserTool('inspect', { ...forkToolArgsFor(page), ref: String(ref) }, page);
+        }
+        if (opts.json === true) {
+            printForkToolResult(result, { json: true });
+            return;
+        }
+        printForkToolResult(result);
     }));
     addBrowserTabOption(browser.command('frames').description('List cross-origin iframe targets in snapshot order'))
         .action(browserAction(async (page) => {

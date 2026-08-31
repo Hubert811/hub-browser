@@ -116,13 +116,16 @@ private _ctxEventSub2: (() => void) | null = null;
   async evaluate<T = unknown>(js: string): Promise<T>;
   async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>, ...args: unknown[]): Promise<unknown> {
-    const { buildEvaluateExpression } = await import('./opencli/utils.js');
+    const { buildEvaluateExpression, hasTopLevelAwait } = await import('./opencli/utils.js');
     const expression = buildEvaluateExpression(input as string, args);
     const { session } = await this._browserSession.pages.getSession(this.pageId);
     const result = await session.Runtime.evaluate({
       expression,
       returnByValue: true,
       awaitPromise: true,
+      // Top-level await is a SyntaxError outside modules; replMode lets the
+      // evaluation accept it (DevTools-console mechanism).
+      ...(hasTopLevelAwait(expression) && { replMode: true }),
     });
     if (result.exceptionDetails) {
       throw new Error('Evaluate: ' + (result.exceptionDetails.exception?.description ?? ''));
@@ -271,6 +274,32 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
 
   async selectTab(target: number | string): Promise<void> {
     return serialOp(this._browserSession, () => this._selectTabInner(target))
+  }
+
+  /** F16 — bounded health probe for one tab. A tab whose renderer is hung
+   * (zombie) still lists in the browser but never answers JS; every later
+   * command on it would hang to its own timeout. Restore probes candidate
+   * tabs through this instead of adopting them blind: the race fails fast
+   * (PROBE_TIMEOUT) and the caller falls back to the reopen-by-URL path. */
+  async probeTab(target: number | string): Promise<boolean> {
+    try {
+      const pages = await this._browserSession.pages.list();
+      const tab = (pages as Array<{ pageId?: number; targetId?: string }>).find(
+        (p) => (typeof target === 'number'
+          ? p.pageId === target
+          : p.targetId === String(target)),
+      );
+      if (!tab || typeof tab.pageId !== 'number') return false;
+      const { session } = await this._browserSession.pages.getSession(tab.pageId);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('probe timeout')), 3_000);
+        timer.unref?.();
+        session.Runtime.evaluate({ expression: '1' }).then(() => resolve(), reject);
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async _selectTabInner(target: number | string): Promise<void> {
@@ -818,13 +847,14 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
        grantUniveralAccess: false,
      });
      if (world.executionContextId !== undefined) {
-       const { buildEvaluateExpression } = await import('./opencli/utils.js');
+       const { buildEvaluateExpression, hasTopLevelAwait } = await import('./opencli/utils.js');
        const expression = buildEvaluateExpression(js, []);
        const result = await target.session.Runtime.evaluate({
          expression,
          contextId: world.executionContextId,
          returnByValue: true,
          awaitPromise: true,
+         ...(hasTopLevelAwait(expression) && { replMode: true }),
        });
        if (result.exceptionDetails) {
          throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
@@ -842,7 +872,7 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
    }
    await this.ensureRuntimeEnabled();
    const ctxId = this._executionContexts.get(frame.frameId);
-   const { buildEvaluateExpression } = await import('./opencli/utils.js');
+   const { buildEvaluateExpression, hasTopLevelAwait } = await import('./opencli/utils.js');
    const expression = buildEvaluateExpression(js, []);
    // 优先用 executionContextId（支持跨域 OOPIF）
    if (ctxId !== undefined) {
@@ -852,6 +882,7 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
        contextId: ctxId,
        returnByValue: true,
        awaitPromise: true,
+       ...(hasTopLevelAwait(expression) && { replMode: true }),
      });
      if (result.exceptionDetails) throw new Error('Frame eval: ' + (result.exceptionDetails.exception?.description ?? ''));
    return result.result?.value;

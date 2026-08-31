@@ -366,7 +366,7 @@ describe('bug 1 — CLI read paths carry the browser gateway (D5 v2: drag-ins si
     }
     ;(globalThis as any).__HubBrowserBridgeOverride = TabGroupBridge
 
-    const listed = await run(['browser', '--session', 'smoke', 'tab', 'list'])
+    const listed = await run(['browser', '--session', 'smoke', 'tab', 'list', '-f', 'json'])
     const tabs = JSON.parse(listed) as Array<{ pageId: number; url: string }>
     // D5 v2: the dragged-in tab is NOT claimed, so the agent-scoped list
     // (filterTabsForAgent) keeps showing only the ledger tab.
