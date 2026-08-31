@@ -214,6 +214,62 @@ export async function clisTreeSignature(clisDir) {
     }
 }
 /**
+ * #35: ESM caches modules by URL, so a re-discovery that imports a changed
+ * adapter from its ORIGINAL path gets the old module namespace back — the
+ * mtime-signature refresh (#11) only ever worked for new files (new URL =
+ * fresh module); edits to existing files were a silent no-op. Query-busting
+ * the entry cannot fix this (the entry's './lib' imports resolve back to
+ * clean URLs, so the dependency chain stays cached), and neither runtime
+ * exposes a module-cache invalidation API (checked: bun 1.3.x has none).
+ * The portable fix is URL identity itself: copy the tree to a fresh
+ * generation path and import from there — every module in the graph,
+ * entry and libs alike, re-evaluates.
+ *
+ * The mirror lives under <root>/ so bare-specifier imports
+ * ('@jackwener/opencli/registry') still resolve through the
+ * <root>/node_modules shim to the SHARED engine instance — registry
+ * identity is what makes re-registration (Map.set overwrite) actually
+ * swap the handlers.
+ *
+ * Reload semantics: any change in the tree re-evaluates ALL user adapters
+ * (module-level state resets — adapters must treat their state as
+ * disposable). One live generation is kept: only the daemon imports from
+ * the mirror (a second daemon cannot bind the port), so older generations
+ * are garbage and get pruned on rebuild. Returns null when the source dir
+ * is absent or the copy fails, so the caller can fall back to the legacy
+ * behavior (new files only).
+ */
+let mirrorGeneration = 0;
+export async function buildFreshCliMirror(clisDir = USER_CLIS_DIR, mirrorRoot = path.join(hubUserRoot(), '.adapter-reload')) {
+    try {
+        await fs.promises.access(clisDir);
+    }
+    catch {
+        return null;
+    }
+    mirrorGeneration += 1;
+    const genDir = path.join(mirrorRoot, `${Date.now().toString(36)}-${mirrorGeneration.toString(36)}`);
+    try {
+        await fs.promises.rm(mirrorRoot, { recursive: true, force: true });
+        await fs.promises.mkdir(genDir, { recursive: true });
+        const entries = await fs.promises.readdir(clisDir, { withFileTypes: true });
+        await Promise.all(entries
+            .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+            .map(async (entry) => {
+            await fs.promises.cp(path.join(clisDir, entry.name), path.join(genDir, entry.name), { recursive: true, dereference: true, force: true });
+        }));
+        return genDir;
+    }
+    catch (err) {
+        log.warn(`Adapter reload mirror failed: ${getErrorMessage(err)}`);
+        try {
+            await fs.promises.rm(genDir, { recursive: true, force: true });
+        }
+        catch { /* best-effort */ }
+        return null;
+    }
+}
+/**
  * Discover and register CLI commands.
  * Uses pre-compiled manifest when available for instant startup.
  */

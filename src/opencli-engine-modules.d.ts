@@ -42,6 +42,8 @@ declare module '*opencli-engine/discovery.js' {
   export function ensureUserAdapters(): Promise<void>
   export function discoverClis(...dirs: string[]): Promise<void>
   export function discoverPlugins(): Promise<void>
+  /** #35: fresh-path copy of the user clis tree so re-discovery re-evaluates edited modules. */
+  export function buildFreshCliMirror(clisDir?: string, mirrorRoot?: string): Promise<string | null>
   export const USER_CLIS_DIR: string
 }
 

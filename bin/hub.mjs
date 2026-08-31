@@ -300,7 +300,7 @@ if (process.env.HUB_DAEMON === 'true') {
   const { UnifiedBrowserFactory } = await import(`${RUNTIME}/factory.js`);
   const { createProgram } = await import(`${RUNTIME}/opencli-engine/cli.js`);
   const { rewriteBrowserArgv, escapeLeadingDashPositional } = await import(`${RUNTIME}/opencli-engine/cli-argv-preprocess.js`);
-  const { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdapters, hubUserRoot, clisTreeSignature } = await import(`${RUNTIME}/opencli-engine/discovery.js`);
+  const { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdapters, hubUserRoot, clisTreeSignature, buildFreshCliMirror } = await import(`${RUNTIME}/opencli-engine/discovery.js`);
   const { emitHook } = await import(`${RUNTIME}/opencli-engine/hooks.js`);
   const { createCommandContext, runWithCommandContext } = await import(`${RUNTIME}/command-context.js`);
 
@@ -382,9 +382,19 @@ if (process.env.HUB_DAEMON === 'true') {
     try {
       const sig = await clisTreeSignature(USER_CLIS);
       if (sig !== userClisSig) {
-        await discoverClis(USER_CLIS);
+        // #35: ESM caches by URL, so re-importing an edited adapter from its
+        // original path hands back the OLD module namespace. Import this
+        // generation from a fresh mirror path instead — a new URL re-evaluates
+        // the whole adapter graph (entry + its './lib' chain). Without the
+        // mirror, only genuinely new files would become visible.
+        const mirrorDir = await buildFreshCliMirror(USER_CLIS);
+        await discoverClis(mirrorDir ?? USER_CLIS);
         userClisSig = sig;
-        process.stderr.write('[hub-daemon] user adapters changed, re-discovered\n');
+        if (mirrorDir) {
+          process.stderr.write('[hub-daemon] user adapters changed, re-discovered\n');
+        } else {
+          process.stderr.write('[hub-daemon] user adapters changed, re-discovered (reload mirror unavailable — edits to existing adapters still need a daemon restart)\n');
+        }
       }
     } catch (err) {
       process.stderr.write('[hub-daemon] adapter refresh check failed: ' + (err?.message ?? String(err)) + '\n');
