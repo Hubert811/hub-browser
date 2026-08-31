@@ -387,15 +387,36 @@ export function buildSemanticFindJs(opts) {
         'label',
         '[contenteditable="true"]',
       ].join(',');
+      // Bug #24 (2026-08-31, receivables report dogfooding): a text-only
+      // query ("find --text 销售报表门户") matched 0 elements even though the
+      // text lives in a visible <h1 title=…> — the interactive candidate set
+      // never considers plain text carriers. When the criteria carry no
+      // role/testid (a pure text/name/label search), scan every element so
+      // headings, table cells, and label divs are findable; role- or
+      // testid-constrained queries keep the interactive set (their targets
+      // are interactive by definition, and '*' over a 16k-element DOM is
+      // wasted work).
+      const CANDIDATES = !CRITERIA.role && !CRITERIA.testid ? '*' : CANDIDATE_SEL;
+      const BROAD = CANDIDATES === '*';
       // Main document first (stable ordering), then same-origin child frames
       // in traversal order — nth/entry order matches the CSS branch.
-      let candidates = Array.from(document.querySelectorAll(CANDIDATE_SEL));
+      let candidates = Array.from(document.querySelectorAll(CANDIDATES));
       for (let d = 1; d < docs.length; d++) {
         try {
-          candidates = candidates.concat(Array.from(docs[d].querySelectorAll(CANDIDATE_SEL)));
+          candidates = candidates.concat(Array.from(docs[d].querySelectorAll(CANDIDATES)));
         } catch (_) {}
       }
-      const matchesList = candidates.filter(matches);
+      let matchesList = candidates.filter(matches);
+      // Bug #24 companion: textContent is subtree-inclusive, so with the
+      // broad set every ancestor of a hit "contains" the needle too and the
+      // result floods with wrapper divs. Keep only the deepest holders: drop
+      // an element when some other match lies inside it.
+      if (BROAD && CRITERIA.text && matchesList.length > 1) {
+        const keep = matchesList.filter((el) =>
+          !matchesList.some((other) => other !== el && el.contains(other)),
+        );
+        if (keep.length > 0) matchesList = keep;
+      }
 
       if (matchesList.length === 0) {
         return {
