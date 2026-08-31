@@ -11,73 +11,109 @@
  * drives a real page, feeds the resulting signals here, and prints the verdict.
  */
 /**
- * WAF vendors we can reliably detect from cookies + response body markers
- * alone. Signals are orthogonal per vendor — so when two vendors match
- * simultaneously (rare), we keep all evidence and report the higher-signal
- * vendor first.
+ * WAF vendors we can reliably detect from cookies + response body markers.
+ *
+ * Bug #28 (2026-08-31, ZKH ESP recon): cookie signals split into strong
+ * (challenge markers — a JS/cookie challenge was actually solved) and weak
+ * (edge infra cookies set passively on every response routed through the
+ * vendor). Weak-only matches must NOT claim detection: the ESP site carries
+ * a passive `acw_tc`, and the old code's "Node-side fetch will return the
+ * slider HTML" implication pushed the agent off a working COOKIE_API
+ * strategy toward a 7-8x more expensive one.
  */
 const WAF_SIGNATURES = [
     {
         vendor: 'aliyun_waf',
-        cookiePatterns: [/^acw_sc__v2$/, /^acw_tc$/, /^ssxmod_itna/],
+        strongCookiePatterns: [/^acw_sc__v2$/, /^ssxmod_itna/],
+        weakCookiePatterns: [/^acw_tc$/],
         bodyPatterns: [/arg1\s*=\s*['"][0-9A-F]{30,}/, /\/ntc_captcha\//i],
-        implication: 'Direct Node-side fetch/curl will return the slider HTML. Validate the endpoint in browser context first; HTML COOKIE adapters still finish with Node-side fetch + page.getCookies.',
+        implication: 'Aliyun WAF challenge markers seen — direct Node-side fetch/curl will return the slider HTML. Validate the endpoint in browser context first; HTML COOKIE adapters still finish with Node-side fetch + page.getCookies.',
+        weakImplication: 'Aliyun edge cookie acw_tc present without challenge markers — it is set passively on every response routed through Aliyun and does not imply a slider challenge. Node-side fetch usually works.',
     },
     {
         vendor: 'cloudflare',
-        cookiePatterns: [/^__cf_bm$/, /^cf_clearance$/, /^__cfduid$/],
+        strongCookiePatterns: [/^cf_clearance$/],
+        weakCookiePatterns: [/^__cf_bm$/, /^__cfduid$/],
         bodyPatterns: [/Cloudflare Ray ID/i, /Checking your browser before accessing/i, /cf-chl-/i],
         implication: 'Cloudflare bot check. Start from a real browser session; probe in browser context first. HTML COOKIE adapters still finish with Node-side fetch + page.getCookies.',
+        weakImplication: 'Cloudflare bot-score cookie (__cf_bm) present without challenge markers — set on most Cloudflare-proxied sites; does not imply an active challenge.',
     },
     {
         vendor: 'akamai',
-        cookiePatterns: [/^_abck$/, /^bm_sz$/, /^bm_sv$/],
+        strongCookiePatterns: [],
+        weakCookiePatterns: [/^_abck$/, /^bm_sz$/, /^bm_sv$/],
         bodyPatterns: [/akamai/i],
-        implication: 'Akamai Bot Manager. Probe in browser context first; keep final HTML COOKIE adapters on Node-side fetch + page.getCookies.',
+        implication: 'Akamai Bot Manager challenge. Probe in browser context first; keep final HTML COOKIE adapters on Node-side fetch + page.getCookies.',
+        weakImplication: 'Akamai cookies (_abck/bm_sz) present without challenge markers — Akamai sets them on every response when Bot Manager is enabled; challenge state lives in the value, not the presence.',
     },
     {
         vendor: 'geetest',
-        cookiePatterns: [],
+        strongCookiePatterns: [],
+        weakCookiePatterns: [],
         bodyPatterns: [/geetest/i, /gt_captcha/i],
         implication: 'Geetest slider/puzzle captcha. Agent cannot bypass programmatically — requires UI strategy or human-in-loop.',
+        weakImplication: '',
     },
 ];
 export function detectAntiBot(signals) {
-    const evidence = [];
-    let match = null;
+    const strong = [];
+    const weak = [];
     for (const sig of WAF_SIGNATURES) {
-        const hits = [];
-        for (const pat of sig.cookiePatterns) {
+        const strongHits = [];
+        const weakHits = [];
+        for (const pat of sig.strongCookiePatterns) {
             const hit = signals.cookieNames.find((c) => pat.test(c));
             if (hit)
-                hits.push(`cookie:${hit}`);
+                strongHits.push(`cookie:${hit}`);
+        }
+        for (const pat of sig.weakCookiePatterns) {
+            const hit = signals.cookieNames.find((c) => pat.test(c));
+            if (hit)
+                weakHits.push(`cookie:${hit}`);
         }
         for (const pat of sig.bodyPatterns) {
             for (const entry of signals.networkEntries) {
                 if (entry.bodyPreview && pat.test(entry.bodyPreview)) {
-                    hits.push(`body:${entry.url}`);
+                    strongHits.push(`body:${entry.url}`);
                     break;
                 }
             }
         }
-        if (hits.length > 0 && !match) {
-            match = sig;
-            evidence.push(...hits);
+        if (strongHits.length > 0) {
+            strong.push({ sig, evidence: strongHits });
+        }
+        else if (weakHits.length > 0) {
+            weak.push({ sig, evidence: weakHits });
         }
     }
-    if (!match) {
+    if (strong.length > 0) {
+        const evidence = strong.flatMap((s) => s.evidence);
+        return {
+            detected: true,
+            vendor: strong[0].sig.vendor,
+            evidence,
+            implication: strong[0].sig.implication,
+        };
+    }
+    if (weak.length > 0) {
+        const weakSignals = weak.map(({ sig, evidence }) => ({
+            vendor: sig.vendor,
+            evidence,
+            implication: sig.weakImplication,
+        }));
         return {
             detected: false,
             vendor: null,
             evidence: [],
-            implication: 'No known anti-bot signatures. Try Node-side COOKIE fetch first; if endpoint validation is blocked, retry from browser context.',
+            weak_signals: weakSignals,
+            implication: `No anti-bot challenge markers — only passive edge cookies (${weak.flatMap((w) => w.evidence).join(', ')}). Node-side fetch usually works; validate the endpoint before switching strategy. If blocked, retry from browser context.`,
         };
     }
     return {
-        detected: true,
-        vendor: match.vendor,
-        evidence,
-        implication: match.implication,
+        detected: false,
+        vendor: null,
+        evidence: [],
+        implication: 'No known anti-bot signatures. Try Node-side COOKIE fetch first; if endpoint validation is blocked, retry from browser context.',
     };
 }
 const NOISE_URL_RE = /(?:analytics|beacon|collect|telemetry|tracking|sentry|doubleclick|google-analytics|googletagmanager|adservice|\/ads?(?:[/?#]|$)|metrics?|pixel|personalization|experiment|\/events?(?:[/?#]|$))/i;
@@ -182,6 +218,14 @@ export function scoreEndpointEvidence(entry) {
             score -= 0.25;
             reasons.push('html body');
         }
+        else if (/^[[{]/.test(body)) {
+            // Bug #28: JSON-shaped but unparseable = a truncated preview of a
+            // LARGE JSON response (small dictionaries always parse whole).
+            // Scoring it as opaque text systematically buried the main data
+            // API under small config/dictionary endpoints.
+            score += 0.2;
+            reasons.push('truncated json body (api-shaped)');
+        }
         else if (body.trim().length > 20) {
             score += 0.05;
             reasons.push('non-empty text body');
@@ -239,8 +283,25 @@ export function scoreEndpointEvidence(entry) {
     };
 }
 export function scoreNetworkEvidence(signals) {
-    return signals.networkEntries
-        .map(scoreEndpointEvidence)
+    // Bug #28: dedup by URL — SPAs routinely fire the same dictionary/config
+    // endpoint several times during boot, and the old no-dedup list padded
+    // api_candidates with repeats (one recon showed the same status dictionary
+    // three times) while crowding out the real data API.
+    const byUrl = new Map();
+    for (const entry of signals.networkEntries) {
+        const evidence = scoreEndpointEvidence(entry);
+        const existing = byUrl.get(entry.url);
+        if (!existing) {
+            byUrl.set(entry.url, { ...evidence, repeats: 1 });
+        }
+        else {
+            existing.repeats += 1;
+            if (evidence.real_data_score > existing.real_data_score) {
+                byUrl.set(entry.url, { ...evidence, repeats: existing.repeats });
+            }
+        }
+    }
+    return [...byUrl.values()]
         .filter((evidence) => evidence.verdict !== 'noise' || evidence.real_data_score > 0)
         .sort((a, b) => b.real_data_score - a.real_data_score)
         .slice(0, 8);
@@ -309,10 +370,13 @@ export function classifyPattern(signals) {
 /**
  * Find existing adapters that target the same site.
  *
- * Keep the hostname match simple — agents extend naming conventions
- * differently per site, so we match on the registered `domain` field and fall
- * back to site-name containment. Returning `null` is fine; agents can always
- * read site-memory docs.
+ * Bug #28 (2026-08-31, ZKH ESP recon): matching must be host-anchored. The
+ * old `domain.endsWith(apex)` matched ANY adapter sharing the registrable
+ * domain — esp.zkh360.com got "nearest_adapter: quickbi, reuse
+ * strategy/cookie config" even though quickbi.zkh360.com is a completely
+ * different application that just happens to sit on the same company apex.
+ * Same host or a subdomain of the adapter's registered domain counts; a
+ * sibling subdomain does not.
  */
 export function findNearestAdapter(finalUrl, registry) {
     let host;
@@ -324,17 +388,18 @@ export function findNearestAdapter(finalUrl, registry) {
     }
     // Strip leading www.; 'www' as a site identifier is never what an adapter uses.
     const cleanedHost = host.replace(/^www\./, '');
-    // Extract apex (xx.com) and registrable parts for fuzzy match.
+    // Extract apex (xx.com) and registrable parts for reporting only.
     const parts = cleanedHost.split('.');
-    const apex = parts.slice(-2).join('.');
     const siteKey = parts.length > 1 ? parts[parts.length - 2] : cleanedHost;
     const hits = new Map();
     for (const cmd of registry.values()) {
-        const domain = cmd.domain?.toLowerCase();
-        const siteMatches = (domain && (cleanedHost.endsWith(domain) || domain.endsWith(apex))) ||
-            cmd.site.toLowerCase() === siteKey?.toLowerCase() ||
+        const domain = cmd.domain?.toLowerCase()
+            ?.replace(/^https?:\/\//, '')
+            ?.replace(/^www\./, '');
+        const hostMatch = !!domain && (cleanedHost === domain || cleanedHost.endsWith(`.${domain}`));
+        const siteMatch = cmd.site.toLowerCase() === siteKey?.toLowerCase() ||
             cleanedHost.includes(cmd.site.toLowerCase());
-        if (siteMatches) {
+        if (hostMatch || siteMatch) {
             const list = hits.get(cmd.site) ?? [];
             list.push(cmd);
             hits.set(cmd.site, list);
@@ -354,7 +419,7 @@ export function findNearestAdapter(finalUrl, registry) {
     return {
         site: best[0],
         example_commands: best[1].slice(0, 5).map((c) => `${c.site} ${c.name}`),
-        reason: `${best[1].length} existing adapter${best[1].length === 1 ? '' : 's'} target this site — reuse strategy/cookie config`,
+        reason: `${best[1].length} existing adapter${best[1].length === 1 ? '' : 's'} target this host — reuse strategy/cookie config`,
     };
 }
 /**

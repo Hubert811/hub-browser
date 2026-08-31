@@ -35,7 +35,7 @@ import {
 } from './target-resolver.js';
 import { TargetError, type TargetErrorCode } from './target-errors.js';
 import { CliError } from './errors.js';
-import { formatSnapshot } from './snapshotFormatter.js';
+import { formatSnapshot, compactSnapshotText } from './snapshotFormatter.js';
 import { installVisualRefOverlayJs, removeVisualRefOverlayJs } from './visual-refs.js';
 
 export interface ResolveSuccess {
@@ -1366,6 +1366,9 @@ export abstract class BasePage implements IPage {
       } catch {
         // Non-fatal: diff is best-effort
       }
+      // Bug #27: compact was declared on SnapshotOptions but never threaded
+      // here — silently produced the full view on the default DOM path.
+      if (opts.compact && typeof result === 'string') return compactSnapshotText(result);
       return result;
     } catch (err) {
       // Log snapshot failure for debugging, then fallback to basic accessibility tree

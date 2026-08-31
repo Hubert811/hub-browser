@@ -438,14 +438,25 @@ export async function runSiteAnalysis(page, url, opts = {}) {
     await captureNetworkItems(page);
     // Best-effort: give the page another beat so XHR after DOMContentLoaded lands.
     await page.wait(1);
-    const rawItems = await captureNetworkItems(page);
+    let rawItems = await captureNetworkItems(page);
+    // Bug #28: slow SPAs fire their main data API after auth/router settle —
+    // one bounded re-poll when nothing data-shaped has landed yet, instead of
+    // reporting dictionary endpoints as the whole API surface.
+    if (!rawItems.some((e) => /json/i.test(e.ct) && e.body)) {
+        await page.wait(2);
+        rawItems = await captureNetworkItems(page);
+    }
     const networkEntries = rawItems.map((e) => ({
         url: e.url,
         status: e.status,
         contentType: e.ct,
+        // Bug #28: 2000 chars cut every large API response mid-JSON, so the
+        // scorer never saw the object shape (business keys/rows) and buried
+        // the main endpoint under small dictionaries. 64KiB covers virtually
+        // all API responses whole; bigger ones keep api-shaped credit.
         bodyPreview: typeof e.body === 'string'
-            ? e.body.slice(0, 2000)
-            : (e.body ? JSON.stringify(e.body).slice(0, 2000) : null),
+            ? e.body.slice(0, 65536)
+            : (e.body ? JSON.stringify(e.body).slice(0, 65536) : null),
     }));
     const probeJs = `(function(){
         return {

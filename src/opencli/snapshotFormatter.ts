@@ -194,6 +194,29 @@ interface Entry {
   isLandmark: boolean;
 }
 
+/**
+ * Bug #27: collapse a rendered snapshot (DOM or AX) line-by-line — strip
+ * `[...]` annotations (refs, cursor hints, attribute dumps), collapse runs of
+ * whitespace, keep one node per line. This is the cheap assertion view the
+ * adapter standard mandates (`page.snapshot({compact:true})`); refs minted by
+ * the underlying capture stay valid in the Observer — they are only absent
+ * from this text projection.
+ */
+export function compactSnapshotText(text: string): string {
+  if (!text || typeof text !== 'string') return '';
+  return text
+    .split('\n')
+    .map((line) => line
+      .replace(/\s*\[.*?\]\s*/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      // AX value lines read `textbox "label" [ref=eN]: "value"` — stripping
+      // the bracket leaves a stray space before the value colon.
+      .replace(/\s+:/g, ':'))
+    .filter(Boolean)
+    .join('\n');
+}
+
 export function formatSnapshot(raw: string, opts: SnapshotOptions = {}): string {
   if (!raw || typeof raw !== 'string') return '';
 

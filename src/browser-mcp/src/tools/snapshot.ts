@@ -15,6 +15,12 @@ export const snapshot = defineTool({
       .describe(
         'Snapshot backend: ax (default — accessibility tree with [ref=eN]) or dom (DOM-structure view of the page).',
       ),
+    compact: z
+      .boolean()
+      .optional()
+      .describe(
+        'Bug #27: compact the snapshot text — strip [ref=eN] annotations and collapse whitespace (cheap assertion view; refs minted by the capture stay valid for `act`).',
+      ),
   }).strict(),
   annotations: { title: 'Snapshot accessibility tree', readOnlyHint: true },
   handler: async (args, ctx) => {
@@ -22,7 +28,12 @@ export const snapshot = defineTool({
     // P2-5 — source:'dom' routes UnifiedPage.snapshot to the DOM backend;
     // the default (ax) call passes no opts, preserving the legacy path.
     const text = (await page.snapshot(
-      args.source === 'dom' ? { source: 'dom' } : undefined,
+      args.source === 'dom' || args.compact
+        ? {
+            ...(args.source === 'dom' && { source: 'dom' as const }),
+            ...(args.compact && { compact: true }),
+          }
+        : undefined,
     )) as string
     const origin = await pageUrl(page, args.page)
     const formatted = await formatSnapshotResult(text, origin)

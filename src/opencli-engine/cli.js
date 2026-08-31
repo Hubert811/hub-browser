@@ -66,6 +66,28 @@ function emitNetworkError(code, message, extra = {}) {
     console.log(JSON.stringify({ error: { code, message, ...extra } }, null, 2));
     process.exitCode = NETWORK_ERROR_EXIT[code] ?? EXIT_CODES.GENERIC_ERROR;
 }
+/**
+ * Bug #26: console.log on a pipe is asynchronous — >64KB of buffered output
+ * is silently dropped when process.exit() runs right after the write. TTYs
+ * and regular files are synchronous writes, so only piped consumers (the
+ * default for agents) lost data mid-JSON. Drain stdout/stderr before exiting.
+ */
+async function flushAndExit(code) {
+    const deadline = Date.now() + 2000;
+    const drained = (stream) => new Promise((resolve) => {
+        if (stream.writableLength === 0)
+            return resolve();
+        const done = () => { stream.off('close', done); resolve(); };
+        stream.on('close', done);
+        void stream.write('', () => done());
+    });
+    try {
+        await Promise.race([Promise.all([drained(process.stdout), drained(process.stderr)]),
+            new Promise((r) => setTimeout(r, deadline - Date.now()))]);
+    }
+    catch { /* best-effort */ }
+    process.exit(code);
+}
 const SITEMAP_HINT = 'Site sitemap available. For navigation context, use the hub-browser-sitemap skill; treat browser state as truth if it disagrees.';
 function siteNameCandidatesFromUrl(url, registry = getRegistry()) {
     let host;
@@ -859,7 +881,7 @@ Examples:
                     const { clawHarnessReporter } = await import('../browser-mcp/src/tools/claw-reporter.ts');
                     await clawHarnessReporter.endAllSessions('closed');
                 } catch {}
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         };
     }
@@ -1004,7 +1026,7 @@ Examples:
                     const { clawHarnessReporter } = await import('../browser-mcp/src/tools/claw-reporter.ts');
                     await clawHarnessReporter.endAllSessions('closed');
                 } catch {}
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         };
     }
@@ -1303,6 +1325,7 @@ Examples:
     // ── Inspect ──
     addBrowserTabOption(browser.command('state').description('Page state: URL, title, interactive elements with [N] indices')
         .option('--source <source>', 'Snapshot backend: dom (default) or ax prototype', 'dom')
+        .option('--compact', 'Compact the snapshot text (strip [N] ref/attr annotations, collapse whitespace)', false)
         .option('--compare-sources', 'Print DOM vs AX snapshot metrics for observation promotion decisions', false))
         .action(browserAction(async (page, opts) => {
         if (opts.compareSources === true) {
@@ -1327,7 +1350,7 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source });
+        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source, compact: !!opts.compact });
         const url = await page.getCurrentUrl?.() ?? '';
         console.log(`URL: ${url}\n`);
         console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
@@ -1339,6 +1362,7 @@ Examples:
     // DOM-backend default for the opencli-compatible [N]-index surface.
     addBrowserTabOption(browser.command('snapshot').description('AX-tree snapshot with [ref=eN] (same as MCP snapshot; = state --source ax)')
         .option('--source <source>', 'Snapshot backend: ax (default) or dom', 'ax')
+        .option('--compact', 'Compact the snapshot text (strip [ref=eN] annotations, collapse whitespace)', false)
         .option('--compare-sources', 'Print DOM vs AX snapshot metrics for observation promotion decisions', false))
         .action(browserAction(async (page, opts) => {
         if (opts.compareSources === true) {
@@ -1363,7 +1387,7 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source });
+        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source, compact: !!opts.compact });
         const url = await page.getCurrentUrl?.() ?? '';
         console.log(`URL: ${url}\n`);
         console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
@@ -2440,12 +2464,18 @@ Examples:
                 catch { /* non-fatal */ }
             }
             await captureNetworkItems(page);
-            const deadline = Date.now() + timeout;
+            // Bug #25: entries already in the ring when the wait starts are
+            // stale — the standard "click, wait xhr, read payload" idiom would
+            // otherwise latch onto the previous action's request, zero-ms
+            // "success", and hand the agent the wrong payload. Only entries
+            // timestamped at/after this moment count as the awaited XHR.
+            const startTs = Date.now();
+            const deadline = startTs + timeout;
             const pollMs = 400;
             let matched = null;
             while (Date.now() < deadline && !matched) {
                 const items = await captureNetworkItems(page);
-                matched = items.find((e) => re.test(e.url)) ?? null;
+                matched = items.find((e) => e.timestamp >= startTs && re.test(e.url)) ?? null;
                 if (!matched)
                     await new Promise((r) => setTimeout(r, pollMs));
             }
@@ -2453,7 +2483,7 @@ Examples:
                 console.log(JSON.stringify({
                     error: {
                         code: 'xhr_not_seen',
-                        message: `No captured XHR matched /${value}/ within ${timeout}ms`,
+                        message: `No captured XHR matched /${value}/ within ${timeout}ms (requests observed before this wait began are not counted)`,
                         hint: 'Check the pattern against `browser network` output; the endpoint may not have fired yet, or capture is disabled.',
                     },
                 }, null, 2));
@@ -4010,7 +4040,7 @@ cli({
             if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         }
     });
@@ -4039,7 +4069,7 @@ cli({
             if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         }
     });
@@ -4070,7 +4100,7 @@ cli({
             if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         }
     });
@@ -4106,7 +4136,7 @@ cli({
             if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         }
     });
@@ -4172,7 +4202,7 @@ cli({
             if (isDaemonMode()) return;
             if (cleanup) {
                 try { await cleanup(); } catch { /* best-effort */ }
-                process.exit(process.exitCode || 0);
+                await flushAndExit(process.exitCode || 0);
             }
         }
     });

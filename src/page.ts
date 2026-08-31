@@ -7,6 +7,7 @@ import type { ProtocolApi } from '@browseros/cdp-protocol/protocol-api';
 import type { CdpBackend } from '@browseros/browser-core';
 import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, SnapshotOptions } from './opencli/types.js';
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
+import { compactSnapshotText } from './opencli/snapshotFormatter.js';
 
 /**
  * B1 fix — observation collectors must outlive UnifiedPage instances.
@@ -698,7 +699,11 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
   const result = await this._browserSession.observe(this.pageId).snapshot();
    // 2b.1: compound 后处理
    const compound = await this.collectCompoundInfo();
-   return this.mergeCompoundIntoSnapshot(result.text, compound);
+   const text = this.mergeCompoundIntoSnapshot(result.text, compound);
+   // Bug #27: compact was declared on SnapshotOptions but this path ignored
+   // it entirely. Refs minted by the Observer stay valid (resolveRef reads the
+   // ref map, not this text) — compact only shapes the returned projection.
+   return opts?.compact ? compactSnapshotText(text) : text;
  }
 
   async diff(): Promise<unknown> {
