@@ -624,4 +624,31 @@ describe('P2-3 claw harness reporter — failure isolation', () => {
       mock.restore()
     }
   })
+
+  test('bug #36: waitForDrain terminates when failed entries stay queued forever', async () => {
+    // drain() deliberately keeps failed entries queued for retry, so after a
+    // connection failure the queue NEVER empties. waitForDrain must still
+    // terminate: endSessionIds's Promise.race abandons it, and an unbounded
+    // poll would keep scheduling 10ms timers indefinitely — pinning the
+    // direct-CLI event loop so the process never exits (`browser verify`
+    // killed every browser adapter subprocess at its 30s timeout).
+    const mock = withMockFetch(() => ({ ok: false, status: 503 }))
+    const r = reporter()
+    try {
+      r.reportDispatch({ owner: 'cli:local', toolName: 'probe cookie', durationMs: 5, createdAt: 1, isError: false })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      // The failed POST left its entry queued (retry-by-design), so the drain
+      // condition below is permanently false.
+      expect(mock.requests.length).toBeGreaterThan(0)
+
+      const t0 = Date.now()
+      await (r as unknown as { waitForDrain(): Promise<void> }).waitForDrain()
+      const elapsed = Date.now() - t0
+      // Pre-fix this never resolves (test hangs at the 5s default timeout);
+      // post-fix it returns at the DRAIN_WAIT_MS deadline.
+      expect(elapsed).toBeLessThan(4_000)
+    } finally {
+      mock.restore()
+    }
+  })
 })

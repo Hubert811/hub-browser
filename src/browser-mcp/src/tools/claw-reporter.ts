@@ -435,8 +435,15 @@ export class ClawHarnessReporter {
     }
   }
 
+  /** Bounded drain wait. drain() deliberately leaves failed entries queued
+   * for retry, so the queue can stay non-empty forever — an unbounded poll
+   * here would keep scheduling timers indefinitely after endSessionIds's
+   * Promise.race abandons it, pinning the direct-CLI event loop and the
+   * process never exits (bug #36: `browser verify` killed every browser
+   * adapter subprocess at its 30s execFileSync timeout). */
   private async waitForDrain(): Promise<void> {
-    while (this.queue.length > 0 || this.draining) {
+    const deadline = Date.now() + DRAIN_WAIT_MS
+    while ((this.queue.length > 0 || this.draining) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
   }
