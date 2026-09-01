@@ -300,12 +300,17 @@ if (process.env.HUB_DAEMON === 'true') {
   const { UnifiedBrowserFactory } = await import(`${RUNTIME}/factory.js`);
   const { createProgram } = await import(`${RUNTIME}/opencli-engine/cli.js`);
   const { rewriteBrowserArgv, escapeLeadingDashPositional } = await import(`${RUNTIME}/opencli-engine/cli-argv-preprocess.js`);
-  const { discoverClis, discoverPlugins, ensureUserCliCompatShims, ensureUserAdapters, hubUserRoot, clisTreeSignature, buildFreshCliMirror } = await import(`${RUNTIME}/opencli-engine/discovery.js`);
+  const { createUserSourceReloader, hubUserRoot } = await import(`${RUNTIME}/opencli-engine/discovery.js`);
   const { emitHook } = await import(`${RUNTIME}/opencli-engine/hooks.js`);
   const { createCommandContext, runWithCommandContext } = await import(`${RUNTIME}/command-context.js`);
 
   const BUILTIN_CLIS = join(PROJECT_ROOT, 'clis');
   const USER_CLIS = join(hubUserRoot(), 'clis');
+  // #35 follow-ups: the shared discovery/refresh unit (same one the MCP face
+  // uses) — user clis AND plugins reload through fresh mirror paths, with
+  // the hook map restored to the post-builtin snapshot so re-evaluated
+  // modules don't accumulate stale-generation hook handlers.
+  const reloader = createUserSourceReloader(BUILTIN_CLIS);
 
   let factory = null;
   let idleTimer = null;
@@ -353,47 +358,35 @@ if (process.env.HUB_DAEMON === 'true') {
   }
 
   // Run adapter discovery once (mirrors main.js startup sequence)
-  let userClisSig = '';
   async function ensureDiscovery() {
     if (discoveryDone) return;
     discoveryDone = true;
     try {
-      const [, ,] = await Promise.all([
-        ensureUserCliCompatShims(),
-        ensureUserAdapters(),
-        discoverClis(BUILTIN_CLIS),
-      ]);
-      await discoverClis(USER_CLIS);
-      await discoverPlugins();
-      userClisSig = await clisTreeSignature(USER_CLIS);
+      await reloader.discoverAll();
     } catch (err) {
       process.stderr.write('[hub-daemon] discovery error: ' + (err?.message ?? String(err)) + '\n');
     }
   }
 
-  // #11: the registry is cached in daemon memory, so an adapter written AFTER
-  // daemon startup was invisible until a restart. Cheap mtime-signature check
-  // before every forwarded /command: when the user clis tree changed, re-run
-  // its discovery (registerCommand is overwrite semantics, so re-registration
-  // is idempotent). Builtin clis stay startup-scoped — they only change with
-  // the package itself.
+  // #11 + #35: the registry is cached in daemon memory, so sources written or
+  // edited AFTER daemon startup need a pre-command check. Any change in the
+  // user clis OR plugins tree re-imports both from a fresh mirror path — a
+  // new URL re-evaluates the whole module graph, which re-importing from the
+  // original path cannot do (ESM caches by URL). Builtin clis stay
+  // startup-scoped — they only change with the package itself.
   async function refreshUserAdaptersIfChanged() {
     if (!discoveryDone) return;
     try {
-      const sig = await clisTreeSignature(USER_CLIS);
-      if (sig !== userClisSig) {
-        // #35: ESM caches by URL, so re-importing an edited adapter from its
-        // original path hands back the OLD module namespace. Import this
-        // generation from a fresh mirror path instead — a new URL re-evaluates
-        // the whole adapter graph (entry + its './lib' chain). Without the
-        // mirror, only genuinely new files would become visible.
-        const mirrorDir = await buildFreshCliMirror(USER_CLIS);
-        await discoverClis(mirrorDir ?? USER_CLIS);
-        userClisSig = sig;
-        if (mirrorDir) {
-          process.stderr.write('[hub-daemon] user adapters changed, re-discovered\n');
+      const result = await reloader.refreshIfChanged();
+      if (result.changed) {
+        const what = [
+          result.clisChanged && 'clis',
+          result.pluginsChanged && 'plugins',
+        ].filter(Boolean).join('+');
+        if (result.mirrorDegraded) {
+          process.stderr.write(`[hub-daemon] user sources changed (${what}), re-discovered (reload mirror unavailable — edits to existing adapters still need a daemon restart)\n`);
         } else {
-          process.stderr.write('[hub-daemon] user adapters changed, re-discovered (reload mirror unavailable — edits to existing adapters still need a daemon restart)\n');
+          process.stderr.write(`[hub-daemon] user sources changed (${what}), re-discovered\n`);
         }
       }
     } catch (err) {

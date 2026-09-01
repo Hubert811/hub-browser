@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Strategy, registerCommand } from './registry.js';
 import { getErrorMessage } from './errors.js';
 import { log } from './logger.js';
+import { snapshotHooks, restoreHooks } from './hooks.js';
 import { findPackageRoot, getCliManifestPath } from './package-paths.js';
 /**
  * Single user-data root (方案 C): `~/.hub` by default, overridable via
@@ -164,8 +165,8 @@ export async function migrateLegacyUserClis(legacyDir = LEGACY_USER_CLIS_DIR, de
  * package baseline (upstream-synced cache + autofix output + user overrides).
  * Built-in adapters are loaded directly from the installed package.
  */
-export async function ensureUserAdapters() {
-    await fs.promises.mkdir(USER_CLIS_DIR, { recursive: true });
+export async function ensureUserAdapters(clisDir = USER_CLIS_DIR) {
+    await fs.promises.mkdir(clisDir, { recursive: true });
 }
 /**
  * Change signature of a clis tree: every .js file's mtimeMs, sorted by path.
@@ -268,6 +269,90 @@ export async function buildFreshCliMirror(clisDir = USER_CLIS_DIR, mirrorRoot = 
         catch { /* best-effort */ }
         return null;
     }
+}
+/**
+ * #35 follow-ups — one shared discovery/refresh unit for the two long-lived
+ * faces (daemon, MCP server), so they can't drift apart again:
+ *  - the MCP face previously discovered once per process with no refresh at
+ *    all: an adapter written or edited while the server ran was invisible;
+ *  - plugins were startup-scoped in both faces (#11 only covered clis);
+ *  - a mirror reload re-evaluates modules, which register NEW hook function
+ *    objects (addHook dedupes by identity) — without restoring the
+ *    post-builtin hook snapshot, stale-generation handlers accumulate.
+ *
+ * Reload unit semantics: a change in EITHER tree reloads BOTH trees. A
+ * partial reload would restore the hook snapshot while leaving the unchanged
+ * tree's modules un-re-imported — its handlers would be wiped with nothing
+ * left to re-register them. Absent trees are vacuously "mirrored" (nothing
+ * to reload), so an empty plugins dir never trips the degradation path.
+ *
+ * The factory takes explicit dirs so tests can point it at temp trees; the
+ * daemon and MCP server construct theirs with the real user dirs.
+ */
+export function createUserSourceReloader(builtinClisDir, opts = {}) {
+    const clisDir = opts.clisDir ?? USER_CLIS_DIR;
+    const pluginsDir = opts.pluginsDir ?? PLUGINS_DIR;
+    const clisMirrorRoot = path.join(path.dirname(clisDir), '.adapter-reload');
+    const pluginsMirrorRoot = path.join(path.dirname(pluginsDir), '.plugin-reload');
+    let discovered = false;
+    let lastClisSig = null;
+    let lastPluginsSig = null;
+    let baseHooksSnapshot = null;
+    let refreshInFlight = null;
+    async function discoverAll() {
+        await Promise.all([
+            ensureUserCliCompatShims(path.dirname(clisDir)),
+            ensureUserAdapters(clisDir),
+            discoverClis(builtinClisDir),
+        ]);
+        // Reload boundary: everything discovered so far never re-evaluates,
+        // so its hooks are the restore point for every refresh below.
+        baseHooksSnapshot = snapshotHooks();
+        await discoverClis(clisDir);
+        await discoverPlugins(pluginsDir);
+        lastClisSig = await clisTreeSignature(clisDir);
+        lastPluginsSig = await clisTreeSignature(pluginsDir);
+        discovered = true;
+    }
+    async function mirrorOrDirect(dir, mirrorRoot) {
+        const exists = await fs.promises.access(dir).then(() => true, () => false);
+        if (!exists)
+            return { target: dir, mirrored: true };
+        const mirror = await buildFreshCliMirror(dir, mirrorRoot);
+        return { target: mirror ?? dir, mirrored: mirror !== null };
+    }
+    async function doRefresh() {
+        if (!discovered)
+            return { changed: false };
+        const clisSig = await clisTreeSignature(clisDir);
+        const pluginsSig = await clisTreeSignature(pluginsDir);
+        const clisChanged = clisSig !== lastClisSig;
+        const pluginsChanged = pluginsSig !== lastPluginsSig;
+        if (!clisChanged && !pluginsChanged)
+            return { changed: false };
+        if (baseHooksSnapshot)
+            restoreHooks(baseHooksSnapshot);
+        const clis = await mirrorOrDirect(clisDir, clisMirrorRoot);
+        await discoverClis(clis.target);
+        const plugins = await mirrorOrDirect(pluginsDir, pluginsMirrorRoot);
+        await discoverPlugins(plugins.target);
+        lastClisSig = clisSig;
+        lastPluginsSig = pluginsSig;
+        return {
+            changed: true,
+            clisChanged,
+            pluginsChanged,
+            mirrorDegraded: !(clis.mirrored && plugins.mirrored),
+        };
+    }
+    /** Serialized: concurrent callers (e.g. parallel MCP tool calls) share one refresh — two racing rebuilds would clobber the mirror generation dir. */
+    function refreshIfChanged() {
+        refreshInFlight ??= doRefresh().finally(() => {
+            refreshInFlight = null;
+        });
+        return refreshInFlight;
+    }
+    return { discoverAll, refreshIfChanged };
 }
 /**
  * Discover and register CLI commands.
@@ -374,16 +459,16 @@ async function discoverClisFromFs(dir) {
  * Each subdirectory is treated as a plugin (site = directory name).
  * Files inside are scanned flat (no nested site subdirs).
  */
-export async function discoverPlugins() {
+export async function discoverPlugins(pluginsDir = PLUGINS_DIR) {
     try {
-        await fs.promises.access(PLUGINS_DIR);
+        await fs.promises.access(pluginsDir);
     }
     catch {
         return;
     }
-    const entries = await fs.promises.readdir(PLUGINS_DIR, { withFileTypes: true });
+    const entries = await fs.promises.readdir(pluginsDir, { withFileTypes: true });
     await Promise.all(entries.map(async (entry) => {
-        const pluginDir = path.join(PLUGINS_DIR, entry.name);
+        const pluginDir = path.join(pluginsDir, entry.name);
         if (!(await isDiscoverablePluginDir(entry, pluginDir)))
             return;
         await discoverPluginDir(pluginDir, entry.name);

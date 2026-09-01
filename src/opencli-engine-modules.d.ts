@@ -39,12 +39,26 @@ declare module '*opencli-engine/registry.js' {
 
 declare module '*opencli-engine/discovery.js' {
   export function ensureUserCliCompatShims(baseDir?: string): Promise<void>
-  export function ensureUserAdapters(): Promise<void>
+  export function ensureUserAdapters(clisDir?: string): Promise<void>
   export function discoverClis(...dirs: string[]): Promise<void>
-  export function discoverPlugins(): Promise<void>
-  /** #35: fresh-path copy of the user clis tree so re-discovery re-evaluates edited modules. */
+  export function discoverPlugins(pluginsDir?: string): Promise<void>
+  /** #35: fresh-path copy of a source tree so re-discovery re-evaluates edited modules. */
   export function buildFreshCliMirror(clisDir?: string, mirrorRoot?: string): Promise<string | null>
+  /** #35 follow-ups: shared discovery/refresh unit for the long-lived faces (daemon, MCP server). */
+  export function createUserSourceReloader(
+    builtinClisDir: string,
+    opts?: { clisDir?: string; pluginsDir?: string },
+  ): {
+    discoverAll(): Promise<void>
+    refreshIfChanged(): Promise<{
+      changed: boolean
+      clisChanged?: boolean
+      pluginsChanged?: boolean
+      mirrorDegraded?: boolean
+    }>
+  }
   export const USER_CLIS_DIR: string
+  export const PLUGINS_DIR: string
 }
 
 declare module '*opencli-engine/validate.js' {

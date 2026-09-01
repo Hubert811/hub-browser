@@ -56,3 +56,21 @@ export async function emitHook(name, ctx, result) {
 export function clearAllHooks() {
     _hooks.clear();
 }
+/**
+ * Immutable copy of the hook map. The user-source reloader snapshots this at
+ * the reload boundary (right after builtin discovery) — see discovery.js.
+ */
+export function snapshotHooks() {
+    return new Map([..._hooks].map(([name, list]) => [name, [...list]]));
+}
+/**
+ * Replace the hook map with a snapshot. Re-evaluated modules register NEW
+ * function objects (addHook dedupes by identity), so without this restore a
+ * mirror reload would keep stale-generation handlers firing forever.
+ */
+export function restoreHooks(snapshot) {
+    _hooks.clear();
+    for (const [name, list] of snapshot) {
+        _hooks.set(name, [...list]);
+    }
+}

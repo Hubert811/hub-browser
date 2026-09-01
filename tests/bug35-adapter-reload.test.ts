@@ -115,13 +115,15 @@ describe('adapter reload (bug #35)', () => {
         }
     });
 
-    it('hub.mjs refresh imports from the mirror with a legacy fallback', () => {
+    it('hub.mjs refresh runs the shared reloader with a legacy fallback', () => {
+        // #35 follow-ups: the daemon delegates to createUserSourceReloader
+        // (shared with the MCP face) instead of wiring the mirror inline.
+        expect(HUB_MJS_SRC).toContain('createUserSourceReloader(BUILTIN_CLIS)');
         const refresh = HUB_MJS_SRC.slice(
             HUB_MJS_SRC.indexOf('async function refreshUserAdaptersIfChanged'),
             HUB_MJS_SRC.indexOf('function resetIdleTimer'),
         );
-        expect(refresh).toContain('buildFreshCliMirror(USER_CLIS)');
-        expect(refresh).toContain('discoverClis(mirrorDir ?? USER_CLIS)');
+        expect(refresh).toContain('reloader.refreshIfChanged()');
         // The fallback must be honest about what it cannot do.
         expect(refresh).toContain('edits to existing adapters still need a daemon restart');
     });

@@ -29,10 +29,7 @@ import { defineTool, errorResult, textResult } from './framework'
 import { executeCommand, prepareCommandArgs } from '../../../opencli-engine/execution.js'
 import { getRegistry } from '../../../opencli-engine/registry.js'
 import {
-  discoverClis,
-  ensureUserAdapters,
-  ensureUserCliCompatShims,
-  discoverPlugins,
+  createUserSourceReloader,
   USER_CLIS_DIR,
 } from '../../../opencli-engine/discovery.js'
 import { findPackageRoot } from '../../../opencli-engine/package-paths.js'
@@ -44,23 +41,19 @@ const MAX_RESULT_JSON = 128_000
 let discoveryPromise: Promise<void> | undefined
 
 /** Shared discovery warm-up (also used by the analyze discovery tool). */
+const adapterReloader = createUserSourceReloader(`${findPackageRoot(fileURLToPath(import.meta.url))}/clis`)
+
 export function ensureAdapterDiscovery(): Promise<void> {
-  discoveryPromise ??= (async () => {
-    const builtinClis = `${findPackageRoot(fileURLToPath(import.meta.url))}/clis`
-    await Promise.all([
-      ensureUserCliCompatShims(),
-      ensureUserAdapters(),
-      discoverClis(builtinClis),
-    ])
-    await discoverClis(USER_CLIS_DIR)
-    await discoverPlugins()
-  })().catch((err) => {
+  discoveryPromise ??= adapterReloader.discoverAll().catch((err) => {
     // Reset so a later call can retry (e.g. transient fs issues); discovery
     // failures are not fatal — tools below degrade to empty-registry hints.
     discoveryPromise = undefined
     throw err
   })
-  return discoveryPromise
+  // #35 follow-ups: this is a long-lived process — pick up user adapter AND
+  // plugin edits with the same mirror reload the daemon uses, before this
+  // tool call executes.
+  return discoveryPromise.then(() => adapterReloader.refreshIfChanged()).then(() => undefined)
 }
 
 /** Canonical commands of one site (alias keys excluded), sorted by name. */

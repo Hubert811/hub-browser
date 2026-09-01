@@ -12,7 +12,6 @@
 import { getRegistry, fullName, } from './registry.js';
 import { pathToFileURL } from 'node:url';
 import * as crypto from 'node:crypto';
-import * as fs from 'node:fs';
 import { executePipeline } from './pipeline/index.js';
 import { adapterLoadError, ArgumentError, CommandExecutionError, attachTraceReceipt, getErrorMessage } from './errors.js';
 import { shouldUseBrowserSession } from './capabilityRouting.js';
@@ -25,11 +24,7 @@ import { ObservationSession, exportObservationSession } from './observation/inde
 import { resolveAdapterSourcePath } from './adapter-source.js';
 import { makeAdapterAudit } from './adapter-audit.js';
 import { isDaemonMode } from './runtime-globals.js';
-import { hubUserRoot } from './discovery.js';
 const _loadedModules = new Map();
-/** Track mtime of loaded user adapter files for hot-reload. */
-const _moduleMtimes = new Map();
-const _userClisDir = `${hubUserRoot()}/clis/`;
 function normalizeTraceMode(raw) {
     if (raw === undefined || raw === null || raw === '' || raw === 'off')
         return 'off';
@@ -82,29 +77,15 @@ export function coerceAndValidateArgs(cmdArgs, kwargs) {
 async function runCommand(cmd, page, kwargs, debug) {
     const internal = cmd;
     if (internal._lazy && internal._modulePath) {
+        // Lazy manifest registration (builtin clis): importing the module
+        // self-registers the real command. User-adapter reload deliberately
+        // does NOT happen here — #35 moved it to the discovery layer, where a
+        // fresh mirror path re-evaluates the whole graph; an in-band
+        // query-bust only refreshed the entry file and left its './lib'
+        // chain cached (mixed old/new state).
         const modulePath = internal._modulePath;
-        // Hot-reload: if a user adapter's file has changed on disk, invalidate cache
-        const isUserAdapter = modulePath.startsWith(_userClisDir);
-        if (isUserAdapter && _loadedModules.has(modulePath)) {
-            try {
-                const stat = fs.statSync(modulePath);
-                const prevMtime = _moduleMtimes.get(modulePath);
-                if (prevMtime !== undefined && stat.mtimeMs !== prevMtime) {
-                    _loadedModules.delete(modulePath);
-                    _moduleMtimes.delete(modulePath);
-                }
-            }
-            catch { /* file may have been deleted; let import below handle it */ }
-        }
         if (!_loadedModules.has(modulePath)) {
-            const url = pathToFileURL(modulePath).href;
-            const importUrl = _moduleMtimes.has(modulePath) ? `${url}?t=${Date.now()}` : url;
-            const loadPromise = import(importUrl).then(() => {
-                try {
-                    _moduleMtimes.set(modulePath, fs.statSync(modulePath).mtimeMs);
-                }
-                catch { }
-            }, (err) => {
+            const loadPromise = import(pathToFileURL(modulePath).href).catch((err) => {
                 _loadedModules.delete(modulePath);
                 throw adapterLoadError(`Failed to load adapter module ${modulePath}: ${getErrorMessage(err)}`, 'Check that the adapter file exists and has no syntax errors.');
             });
