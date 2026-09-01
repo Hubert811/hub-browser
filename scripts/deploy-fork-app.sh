@@ -36,6 +36,10 @@ fi
 
 # 2. swap in the fork server
 cp "$FORK_BIN" "$R/bin/browseros-claw-server"
+# cp over an existing file inherits the target's xattrs — a browser OTA leaves
+# com.apple.quarantine on the bundled binary, and an ad-hoc signed Mach-O with
+# quarantine gets SIGKILLed by taskgated on exec (proven 2026-09-01 crash report).
+xattr -d com.apple.quarantine "$R/bin/browseros-claw-server" 2>/dev/null || true
 echo "[deploy-fork-app] bundled server -> fork $($FORK_BIN --version)"
 
 # 3. refresh the hub distribution (rm+cp: bun binary may be replaced in place)
