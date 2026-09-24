@@ -8,6 +8,7 @@ import type { CdpBackend } from '@browseros/browser-core';
 import type { BrowserEvaluateFunction, BrowserCookie, ScreenshotOptions, SnapshotOptions } from './opencli/types.js';
 import { ConsoleCollector, NetworkCollector } from './event-bridge.js';
 import { compactSnapshotText } from './opencli/snapshotFormatter.js';
+import { COMPOUND_EXTRAS_JS } from './opencli/compound.js';
 
 /**
  * B1 fix — observation collectors must outlive UnifiedPage instances.
@@ -328,14 +329,14 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
 
   async newTab(
     url?: string,
-    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+    opts?: { background?: boolean; windowId?: number },
   ): Promise<string | undefined> {
     return serialOp(this._browserSession, () => this._newTabInner(url, opts))
   }
 
   private async _newTabInner(
     url?: string,
-    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+    opts?: { background?: boolean; windowId?: number },
   ): Promise<string | undefined> {
     const previousPageId = this.pageId;
     const newPageId = await this._browserSession.pages.newPage(url ?? 'about:blank', opts);
@@ -435,17 +436,6 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     await this.cdp('Browser.closeTabGroup', { groupId });
   }
 
-  /** D5 (2026-08-03): move existing tabs into a tab group (space → group wiring). */
-  async addTabsToGroup(pages: number[], groupId: string): Promise<void> {
-    const allPages = await this._browserSession.pages.list();
-    const tabIds = pages.map(pid => {
-      const info = allPages.find((p: any) => p.pageId === pid);
-      if (!info) throw new Error(`Page ${pid} not found`);
-      return info.tabId;
-    });
-    await this.cdp('Browser.addTabsToGroup', { groupId, tabIds });
-  }
-
 
   // ── Window ──
   async windowList(): Promise<unknown[]> {
@@ -453,8 +443,18 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
     return (result as any)?.windows ?? [];
   }
 
-  async windowCreate(): Promise<unknown> {
-    const result = await this.cdp('Browser.createWindow');
+  /**
+   * Create a window. `opts.url` MUST be forwarded: Chromium's createWindow
+   * always brings exactly one tab, and the whole point of passing the URL is
+   * that the space's first tab is that tab — dropping it left the tab on the
+   * new-tab page while the ledger recorded the requested URL (a real
+   * ledger/reality divergence found by driving the daemon's MCP face).
+   */
+  async windowCreate(opts?: { url?: string }): Promise<unknown> {
+    const result = await this.cdp(
+      'Browser.createWindow',
+      opts?.url ? { url: opts.url } : {},
+    );
     return (result as any)?.window;
   }
 
@@ -464,6 +464,24 @@ async goto(url: string, options?: { waitUntil?: 'load' | 'none'; settleMs?: numb
 
   async windowActivate(windowId: number): Promise<void> {
     await this.cdp('Browser.activateWindow', { windowId });
+  }
+
+  /**
+   * P7-H2 — move a tab into another window (`Browser.moveTab`). The pageId is
+   * resolved to its live targetId first; an unknown page is a no-op (the ledger
+   * stays authoritative either way).
+   */
+  async moveTab(target: number | string, windowId: number): Promise<void> {
+    const tabs = (await this.tabs()) as Array<{
+      pageId?: number
+      targetId?: string
+    }>
+    const targetId =
+      typeof target === 'string'
+        ? target
+        : tabs.find((t) => t.pageId === target)?.targetId
+    if (!targetId) return
+    await this.cdp('Browser.moveTab', { targetId, windowId })
   }
 
   /** Bind the page object to a specific tab by targetId. */
@@ -696,10 +714,18 @@ override async snapshot(opts?: SnapshotOptions): Promise<unknown> {
       // Fall through to AX observer-based snapshot below
     }
   }
-  const result = await this._browserSession.observe(this.pageId).snapshot();
-   // 2b.1: compound 后处理
-   const compound = await this.collectCompoundInfo();
-   const text = this.mergeCompoundIntoSnapshot(result.text, compound);
+  // P7-B S2/S1: `root`/`scope` shape the AX capture; every other caller keeps
+  // the legacy no-args call so the observer's default full-page path is untouched.
+  const observeOpts = {
+    ...(opts?.root !== undefined ? { root: opts.root } : {}),
+    ...(opts?.scope !== undefined ? { scope: opts.scope } : {}),
+  };
+  const result = await this._browserSession
+    .observe(this.pageId)
+    .snapshot({ ...observeOpts, unitProbeExtraJs: COMPOUND_EXTRAS_JS });
+  // C2: compound semantics ride on the DOM-unit probe (one callFunctionOn per
+  // ref instead of a second sweep); only the rendering lives here.
+  const text = this.mergeCompoundIntoSnapshot(result.text, result.units);
    // Bug #27: compact was declared on SnapshotOptions but this path ignored
    // it entirely. Refs minted by the Observer stay valid (resolveRef reads the
    // ref map, not this text) — compact only shapes the returned projection.
@@ -1020,8 +1046,11 @@ private async collectCompoundInfo(): Promise<Map<string, any>> {
   return map;
 }
  
- private mergeCompoundIntoSnapshot(text: string, compound: Map<string, any>): string {
-   if (compound.size === 0) return text;
+ private mergeCompoundIntoSnapshot(text: string, compound: Map<string, any> | undefined): string {
+   // `SnapshotResult.units` is optional: the observer only populates it when
+   // the DOM probe produced something (and a stubbed/legacy observer may omit
+   // it entirely). Absent units means "no compound payload", not a crash.
+   if (!compound || compound.size === 0) return text;
    return text.replace(/\[ref=(e\d+)\]/g, (match, ref) => {
      const info = compound.get(ref);
      if (!info) return match;

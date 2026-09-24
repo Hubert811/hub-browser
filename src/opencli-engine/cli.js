@@ -1246,15 +1246,25 @@ Examples:
         console.log(JSON.stringify(windows, null, 2));
     }));
     addBrowserTabOption(browserWindow.command('create')
-        .description('Create a new browser window'))
+        .description('Create a new browser window (requires a current space; its first tab is claimed by it)'))
         .action(browserAction(async (page) => {
+        // P7-H H5 — same precondition as `tabs new`: a created window must be
+        // attributable, otherwise nothing could ever close it again.
+        const { manager, space } = await currentSpaceForBrowser(page);
+        if (!space) throw await noSpaceErrorForBrowser();
         const win = await page.windowCreate();
+        const tabs = (await page.tabs()) || [];
+        const fresh = tabs.find((t) => t && t.windowId === win?.windowId);
+        if (fresh && typeof fresh.pageId === 'number') {
+            await manager.recordTabForCurrentSpace(space.owner, fresh.pageId, 'about:blank', fresh.targetId).catch(() => { });
+        }
         console.log(JSON.stringify(win, null, 2));
     }));
     addBrowserTabOption(browserWindow.command('close')
         .argument('<windowId>', 'Window ID')
         .description('Close a browser window'))
         .action(browserAction(async (page, windowId) => {
+        await assertWindowInCurrentSpace(page, parseInt(windowId, 10));
         await page.windowClose(parseInt(windowId, 10));
         console.log(JSON.stringify({ closed: windowId }, null, 2));
     }));
@@ -1262,6 +1272,7 @@ Examples:
         .argument('<windowId>', 'Window ID')
         .description('Activate (bring to front) a browser window'))
         .action(browserAction(async (page, windowId) => {
+        await assertWindowInCurrentSpace(page, parseInt(windowId, 10));
         await page.windowActivate(parseInt(windowId, 10));
         console.log(JSON.stringify({ activated: windowId }, null, 2));
     }));
@@ -1350,7 +1361,7 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source, compact: !!opts.compact });
+        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source, compact: !!opts.compact, ...(opts.root ? { root: String(opts.root) } : {}), ...(opts.scope ? { scope: String(opts.scope) } : {}) });
         const url = await page.getCurrentUrl?.() ?? '';
         console.log(`URL: ${url}\n`);
         console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
@@ -1363,6 +1374,8 @@ Examples:
     addBrowserTabOption(browser.command('snapshot').description('AX-tree snapshot with [ref=eN] (same as MCP snapshot; = state --source ax)')
         .option('--source <source>', 'Snapshot backend: ax (default) or dom', 'ax')
         .option('--compact', 'Compact the snapshot text (strip [ref=eN] annotations, collapse whitespace)', false)
+        .option('--root <ref>', 'Focus on the subtree rooted at this ref (AX backend only; refs outside it go stale)')
+        .option('--scope <scope>', 'AX capture scope: viewport (default) or full_page', 'viewport')
         .option('--compare-sources', 'Print DOM vs AX snapshot metrics for observation promotion decisions', false))
         .action(browserAction(async (page, opts) => {
         if (opts.compareSources === true) {
@@ -1387,7 +1400,7 @@ Examples:
             process.exitCode = EXIT_CODES.USAGE_ERROR;
             return;
         }
-        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source, compact: !!opts.compact });
+        const snapshot = await page.snapshot({ viewportExpand: 2000, source: source, compact: !!opts.compact, ...(opts.root ? { root: String(opts.root) } : {}), ...(opts.scope ? { scope: String(opts.scope) } : {}) });
         const url = await page.getCurrentUrl?.() ?? '';
         console.log(`URL: ${url}\n`);
         console.log(typeof snapshot === 'string' ? snapshot : JSON.stringify(snapshot, null, 2));
@@ -3672,7 +3685,16 @@ cli({
         };
     };
     async function loadSpaceManager(opts = {}) {
-        const { TaskSpaceManager, defaultStoragePath } = await import('../space/task-space-manager.ts');
+        const { TaskSpaceManager, defaultStoragePath, processSpaceManager } = await import('../space/task-space-manager.ts');
+        // M1 (space-ledger-architecture.md, L1): inside a host that OWNS the
+        // ledger — the daemon, which runs this CLI in-process for /command —
+        // every consumer shares that one manager. Building a second manager
+        // here would make the daemon a two-writer process: its own memory would
+        // go stale against a `/command`-created space, and the event bus the
+        // SSE feed depends on would never see it. A standalone `hub space ...`
+        // invocation owns nothing, so it still builds its own.
+        const authority = processSpaceManager();
+        if (authority) return authority;
         return new TaskSpaceManager({
             storagePath: process.env.HUB_SPACES_FILE || defaultStoragePath(),
             ...(opts.gateway ? { gateway: opts.gateway } : {}),
@@ -3793,10 +3815,6 @@ cli({
     // D3 (2026-08-03): without a current space the group is closed — `open`,
     //   `tab select/close/new` are rejected with no-space, `tab list` is empty.
     async function currentSpaceForBrowser(gateway) {
-        // bug 1 (D5 CLI read paths): pass the browser gateway through so the
-        // manager's lazy tab-group reconcile (syncWithTabGroups) runs before
-        // answering. No gateway (browser unreachable) → reconcile is a no-op
-        // and behavior is unchanged.
         const manager = await loadSpaceManager(gateway ? { gateway } : {});
         const space = await manager.currentSpace(LOCAL_SPACE_IDENTITY().agentId);
         return { manager, space };
@@ -3877,34 +3895,68 @@ cli({
     }
     /** P1-1 real-run hole (2026-08-22): `group update/close` address a group
      *  by groupId only, so the pages-based gate never fired — any agent could
-     *  rename or close another space's whole group live. Space-level policy
-     *  (same as assertTabInCurrentSpace, NOT assertPagesControllable): a group
-     *  is the current space's visual projection (D5), so every member page
-     *  must belong to the CURRENT space — same local agent's other spaces are
-     *  still off-limits (real-run repro: one agent, two spaces, live rename
-     *  of the other space's group sailed through the agent-level check).
-     *  Unknown/empty groups fall through to the CDP call's native error. */
+     *  rename or close another space's whole group live (P1-4: one real run
+     *  killed 3 of the user's tabs).
+     *  P7-F / D-P9 (ownership-based): a tab group is no longer a space's
+     *  projection, so the rule is no longer "the group is the current space's"
+     *  — it is "EVERY member tab of the group belongs to the current space".
+     *  A group holding user tabs or another space's tabs is refused, and so is
+     *  an empty/unknown group (nothing proves it is ours). Foreign tab URLs are
+     *  never echoed — counts only. Mirrors the MCP guard in framework.ts
+     *  (assertTabGroupControllable) and the window guard below. */
     async function assertGroupInCurrentSpace(page, groupId) {
         const { manager, space } = await currentSpaceForBrowser();
         if (!space) throw await noSpaceErrorForBrowser();
-        const groups = await page.tabGroupList();
-        const group = (groups || []).find((g) => g && g.groupId === String(groupId));
-        if (!group || !Array.isArray(group.tabIds) || group.tabIds.length === 0) return;
-        const tabs = await page.tabs();
-        const pageIds = group.tabIds
-            .map((tabId) => (tabs || []).find((t) => t && t.tabId === tabId)?.pageId)
+        const { SpaceGuardError } = await import('../space/task-space-manager.ts');
+        const groups = (await page.tabGroupList()) || [];
+        const group = groups.find((g) => g && g.groupId === String(groupId));
+        const memberTabIds = group && Array.isArray(group.tabIds) ? group.tabIds : [];
+        if (memberTabIds.length === 0) {
+            throw new SpaceGuardError('group-not-in-space', `tab group ${groupId} has no tab of your current space`, { spaceId: space.id, hint: 'only a group whose tabs all belong to your current space can be updated or closed' });
+        }
+        const tabs = (await page.tabs()) || [];
+        const pageIds = memberTabIds
+            .map((tabId) => tabs.find((t) => t && t.tabId === tabId)?.pageId)
             .filter((id) => typeof id === 'number');
-        if (pageIds.length === 0) return;
+        let foreign = 0;
+        let firstForeign;
         for (const pageId of pageIds) {
             const sid = await manager.spaceIdForPage(pageId);
             if (sid !== space.id) {
-                const { SpaceGuardError } = await import('../space/task-space-manager.ts');
-                throw new SpaceGuardError(
-                    'page-not-in-space',
-                    `group ${groupId} is not in your space (page ${pageId} belongs to ${sid ?? 'no space'})`,
-                    { hint: 'operate on your own space\u0027s group, or hub space switch first' },
-                );
+                foreign++;
+                if (firstForeign === undefined) firstForeign = pageId;
             }
+        }
+        const unresolved = memberTabIds.length - pageIds.length;
+        if (foreign > 0 || unresolved > 0) {
+            throw new SpaceGuardError('group-not-in-space', `tab group ${groupId} is not yours (${foreign} of its ${memberTabIds.length} tab(s) are outside your current space${unresolved > 0 ? `, ${unresolved} unresolved` : ''})`, { spaceId: space.id, ...(firstForeign !== undefined ? { pageId: firstForeign } : {}), hint: 'group your own space tabs instead (hub browser group create), or hub space switch first' });
+        }
+    }
+    /** P7-H H5 — a window is the agent's only when EVERY tab in it belongs to
+     *  the current space. The window the user works in holds user tabs, so it can
+     *  never be closed/activated from the CLI; a window with no ledger tab at all
+     *  is refused too (nothing proves it is ours). Mirrors the MCP guard in
+     *  framework.ts assertWindowControllable. Foreign tab URLs are never echoed. */
+    async function assertWindowInCurrentSpace(page, windowId) {
+        const { manager, space } = await currentSpaceForBrowser(page);
+        if (!space) throw await noSpaceErrorForBrowser();
+        const { SpaceGuardError } = await import('../space/task-space-manager.ts');
+        const tabs = (await page.tabs()) || [];
+        const inWindow = tabs.filter((t) => t && t.windowId === windowId && typeof t.pageId === 'number');
+        if (inWindow.length === 0) {
+            throw new SpaceGuardError('window-not-in-space', `window ${windowId} holds no tab of your current space`, { spaceId: space.id, hint: 'only a window whose tabs all belong to your current space can be closed or activated' });
+        }
+        let foreign = 0;
+        let firstForeign;
+        for (const tab of inWindow) {
+            const sid = await manager.spaceIdForPage(tab.pageId);
+            if (sid !== space.id) {
+                foreign++;
+                if (firstForeign === undefined) firstForeign = tab.pageId;
+            }
+        }
+        if (foreign > 0) {
+            throw new SpaceGuardError('window-not-in-space', `window ${windowId} is not yours (${foreign} of its ${inWindow.length} tab(s) are outside your current space)`, { spaceId: space.id, ...(firstForeign !== undefined ? { pageId: firstForeign } : {}), hint: 'close your own tabs instead, or open your own window (hub browser window create) first' });
         }
     }
     /** Close a tab through the current space's ledger when it belongs to the space. */
@@ -4081,7 +4133,7 @@ cli({
         }
     });
     spaceCmd.command('close')
-        .description('Close a task space (closes all its tabs by default; user-held spaces must be claimed first)')
+        .description('LEGACY (prefer `space finish`): close a task space, closing all its tabs by default. --keep only drops the ledger entry and leaves every tab open (a detach, not a finish). User-held spaces must be claimed first.')
         .argument('<id>', 'Space id')
         .option('--keep', 'Keep the browser tabs open; close only the space ledger', false)
         .option('--json', 'Print a JSON envelope', false)
@@ -4098,6 +4150,45 @@ cli({
                 return;
             }
             console.log(`closed space ${id}${opts.keep ? ' (ledger only, tabs kept open)' : ''}`);
+        }
+        catch (err) { printSpaceError(err); }
+        finally {
+            // bug #9: a direct-connect BrowserBridge keeps the event loop alive;
+            // tear it down and exit like the `browser` commands do. Daemon mode
+            // must never exit (the daemon process stays resident).
+            if (isDaemonMode()) return;
+            if (cleanup) {
+                try { await cleanup(); } catch { /* best-effort */ }
+                await flushAndExit(process.exitCode || 0);
+            }
+        }
+    });
+    spaceCmd.command('finish')
+        .description('Finish a task space with a REQUIRED retention policy (the preferred way to end a task; MCP parity with space.finish). --keep all keeps every managed tab; --keep p1,p3 keeps only those durable labels. Everything else the space manages is closed, and tabs the ledger does not know (the user\'s) are NEVER touched. The space leaves the ledger only when nothing remains to keep.')
+        .argument('<id>', 'Space id')
+        .requiredOption('--keep <policy>', 'Retention policy: "all", or a comma-separated list of durable labels (e.g. p1,p3)')
+        .option('--json', 'Print a JSON envelope', false)
+        .action(async (id, opts) => {
+        let cleanup;
+        try {
+            const gw = await spaceGatewayFromBrowser();
+            const gateway = gw?.gateway;
+            cleanup = gw?.cleanup;
+            const manager = await loadSpaceManager({ gateway });
+            // Same parsing as the MCP tool: the literal 'all', else a list of
+            // durable labels. An empty list is legal (keep nothing).
+            const raw = String(opts.keep ?? '').trim();
+            const keep = raw === 'all'
+                ? 'all'
+                : raw.split(',').map((label) => label.trim()).filter(Boolean);
+            const receipt = await manager.finishSpace(LOCAL_SPACE_IDENTITY().agentId, id, keep, gateway);
+            if (opts.json) {
+                console.log(JSON.stringify(receipt, null, 2));
+                return;
+            }
+            console.log(receipt.closedSpace
+                ? `finished space ${id} (closed; kept ${receipt.keptLabels.length}, closed ${receipt.closedLabels.length}, preserved ${receipt.preservedUnmanagedCount} not ours)`
+                : `finished space ${id} (kept ${receipt.keptLabels.join(', ') || 'none'}; closed ${receipt.closedLabels.length}, preserved ${receipt.preservedUnmanagedCount} not ours)`);
         }
         catch (err) { printSpaceError(err); }
         finally {

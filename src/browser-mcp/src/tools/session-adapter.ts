@@ -22,7 +22,6 @@ import type { ToolContext, UnifiedPageProvider } from './framework'
 export interface SessionToolContext {
   session: BrowserSession
   defaultWindowId?: number
-  defaultTabGroupId?: string
   signal?: AbortSignal
   /** Phase 3 — optional identity + shared TaskSpaceManager (same semantics as ToolContext). */
   identity?: SpaceIdentity
@@ -93,7 +92,6 @@ export async function contextFromSession(
     page,
     pageFor,
     defaultWindowId: ctx.defaultWindowId,
-    defaultTabGroupId: ctx.defaultTabGroupId,
     signal: ctx.signal,
     identity: ctx.identity,
     spaces: ctx.spaces,

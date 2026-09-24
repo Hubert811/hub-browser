@@ -95,7 +95,6 @@ describe('createBrowserMcpServer', () => {
         version: '1.2.3',
         browser: provider,
         defaultWindowId: 7,
-        defaultTabGroupId: 'group-a',
         instructions: 'custom browser instructions',
         registration: {
           source: 'unit-test',

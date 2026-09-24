@@ -42,7 +42,6 @@ export interface ToolContext {
   /** Resolves a UnifiedPage bound to a specific page id on the same CDP connection. */
   pageFor(pageId: number): Promise<UnifiedPage>
   defaultWindowId?: number
-  defaultTabGroupId?: string
   signal?: AbortSignal
   /**
    * Phase 3 — identity of the calling agent/conversation. When set together
@@ -361,6 +360,23 @@ export async function guardToolAccess(
     return
   }
 
+  // P7-H H5 — the window surface used to be completely unguarded: any agent
+  // could list/create/close/activate ANY window, including the one the user is
+  // working in. Creation now needs a current space (it claims its tab, exactly
+  // like `tabs new`); closing/activating needs the window to be provably ours.
+  if (def.name === 'windows') {
+    if (args.action === 'create') {
+      return spaces.assertCurrentSpaceAgentControllable(owner)
+    }
+    if (
+      (args.action === 'close' || args.action === 'activate') &&
+      typeof args.windowId === 'number'
+    ) {
+      return assertWindowControllable(spaces, owner, ctx.page, args.windowId)
+    }
+    return
+  }
+
   if (typeof args.page === 'number') {
     return spaces.assertPageControllable(owner, args.page)
   }
@@ -373,54 +389,148 @@ export async function guardToolAccess(
   }
 }
 
-/** Resolve a groupId-addressed tab_groups call (update/close, or create
- * adding pages to an existing group) to its member page ids and require every
- * member page to belong to the agent's CURRENT space.
+/** A window is controllable only when EVERY tab inside it belongs to the
+ * agent's CURRENT space.
  *
- * Guard semantics finalized 2026-08-24 (P2-6): SPACE-level, matching the CLI
- * face's assertGroupInCurrentSpace. A tab group is the current space's D5
- * visual projection, so every member page must belong to the CURRENT space —
- * the previous agent-level check (assertPagesControllable) waved through a
- * same-agent rename of ANOTHER space's group in a real run (one agent, two
- * spaces). Unknown group ids, empty groups, and tabs missing from the pages
- * map are left to the handler's CDP call for its native error — the guard
- * only rejects what it can prove is foreign. */
+ * Ownership is derived from the ledger rather than stored per window — the same
+ * "the ledger is the only authority" rule as tabs (D-P9) and the same shape as
+ * ego's model, where control comes from a managed label, never from merely
+ * being in a window. Consequences, all deliberate:
+ *   - the window the user is working in holds user tabs (and other agents'
+ *     tabs), so it can never be closed or activated by an agent;
+ *   - a window whose only tabs are yours is yours to close;
+ *   - a window holding no ledger tab at all is refused (nothing proves it is
+ *     ours), which is why `windows create` claims the tab it creates.
+ * Foreign tab URLs are never echoed — only counts. */
+async function assertWindowControllable(
+  spaces: NonNullable<ToolContext['spaces']>,
+  owner: string,
+  page: ToolContext['page'],
+  windowId: number,
+): Promise<void> {
+  // D3 + user-held gate first (same policy as tabs new / the group guard).
+  await spaces.assertCurrentSpaceAgentControllable(owner)
+  const space = await spaces.currentSpace(owner)
+  if (!space) return // unreachable after the assert above; kept defensive
+  const tabs = (await page.tabs()) as Array<{
+    pageId?: number
+    windowId?: number
+  }>
+  const inWindow = tabs.filter(
+    (t) => t?.windowId === windowId && typeof t.pageId === 'number',
+  )
+  if (inWindow.length === 0) {
+    throw new SpaceGuardError(
+      'window-not-in-space',
+      `window ${windowId} holds no tab of your current space`,
+      {
+        spaceId: space.id,
+        hint: 'only a window whose tabs all belong to your current space can be closed or activated',
+      },
+    )
+  }
+  let foreign = 0
+  let firstForeignPage: number | undefined
+  for (const tab of inWindow) {
+    const pageId = tab.pageId as number
+    const sid = await spaces.spaceIdForPage(pageId)
+    if (sid !== space.id) {
+      foreign++
+      firstForeignPage ??= pageId
+    }
+  }
+  if (foreign > 0) {
+    throw new SpaceGuardError(
+      'window-not-in-space',
+      `window ${windowId} is not yours (${foreign} of its ${inWindow.length} tab(s) are outside your current space)`,
+      {
+        spaceId: space.id,
+        ...(firstForeignPage !== undefined ? { pageId: firstForeignPage } : {}),
+        hint: 'close your own tabs instead, or open your own window (windows create) first',
+      },
+    )
+  }
+}
+/**
+ * A group is controllable only when EVERY member tab belongs to the agent's
+ * CURRENT space.
+ *
+ * A tab group is no longer a space's projection (D-P9 deleted the projection
+ * and the persisted per-space group id that came with it), so this guard is
+ * now ownership-based rather than projection-based: hub never assumes a group
+ * is "the space's group", it proves each member tab is ledger-owned by the
+ * current space. Same rule and same shape as `assertWindowControllable`.
+ *
+ * Why the guard exists at all (P1-4, real incident): an agent once renamed and
+ * closed a group and killed 3 of the user's tabs. Closing a group closes its
+ * tabs, so a group-addressed mutation must never be allowed to reach tabs the
+ * caller does not own.
+ *
+ * Consequences, all deliberate:
+ *   - a group holding user tabs (or another space's tabs) is refused — counts
+ *     only, foreign tab URLs are never echoed;
+ *   - an empty or unknown group is refused too: nothing proves it is ours, and
+ *     the native CDP error is no longer an acceptable outcome now that the
+ *     group is a user-facing browser feature;
+ *   - a group whose tabs are ALL in the current space is the agent's to
+ *     rename/close.
+ */
 async function assertTabGroupControllable(
   spaces: NonNullable<ToolContext['spaces']>,
   owner: string,
   page: ToolContext['page'],
   groupId: string,
 ): Promise<void> {
+  // D3 + user-held gate first (same policy as tabs new / windows).
+  await spaces.assertCurrentSpaceAgentControllable(owner)
+  const space = await spaces.currentSpace(owner)
+  if (!space) return // unreachable after the assert above; kept defensive
   const groups = (await page.tabGroupList()) as Array<{
     groupId?: string
     tabIds?: number[]
   }>
   const group = groups.find((g) => g?.groupId === groupId)
-  if (!group || !Array.isArray(group.tabIds) || group.tabIds.length === 0) return
+  const memberTabIds: number[] = Array.isArray(group?.tabIds)
+    ? (group as { tabIds: number[] }).tabIds
+    : []
+  if (memberTabIds.length === 0) {
+    throw new SpaceGuardError(
+      'group-not-in-space',
+      `tab group ${groupId} has no tab of your current space`,
+      {
+        spaceId: space.id,
+        hint: 'only a group whose tabs all belong to your current space can be updated or closed',
+      },
+    )
+  }
   const tabs = (await page.tabs()) as Array<{
     tabId?: number
     pageId?: number
   }>
-  const pageIds = group.tabIds
+  const pageIds = memberTabIds
     .map((tabId) => tabs.find((t) => t?.tabId === tabId)?.pageId)
     .filter((id): id is number => typeof id === 'number')
-  if (pageIds.length === 0) return
-  // D3 + user-held gate first (same policy as tabs new).
-  await spaces.assertCurrentSpaceAgentControllable(owner)
-  const space = await spaces.currentSpace(owner)
-  if (!space) return // unreachable after the assert above; kept defensive
+  let foreign = 0
+  let firstForeignPage: number | undefined
   for (const pageId of pageIds) {
     const sid = await spaces.spaceIdForPage(pageId)
     if (sid !== space.id) {
-      throw new SpaceGuardError(
-        'page-not-in-space',
-        `group ${groupId} is not in your space (page ${pageId} belongs to ${sid ?? 'no space'})`,
-        {
-          pageId,
-          hint: "operate on your current space's group, or space.switch first",
-        },
-      )
+      foreign++
+      firstForeignPage ??= pageId
     }
+  }
+  // A member tab the pages map cannot resolve counts as unproven, not as ours.
+  const unresolved = memberTabIds.length - pageIds.length
+  if (foreign > 0 || unresolved > 0) {
+    throw new SpaceGuardError(
+      'group-not-in-space',
+      `tab group ${groupId} is not yours (${foreign} of its ${memberTabIds.length} tab(s) are outside your current space${unresolved > 0 ? `, ${unresolved} unresolved` : ''})`,
+      {
+        spaceId: space.id,
+        ...(firstForeignPage !== undefined ? { pageId: firstForeignPage } : {}),
+        hint: 'group your own space tabs instead (tab_groups create), or space.switch first',
+      },
+    )
   }
 }
 

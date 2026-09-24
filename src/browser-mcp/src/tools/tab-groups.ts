@@ -1,5 +1,4 @@
 import { z } from 'zod'
-import { ownerOf } from '../../../space/task-space-manager.js'
 import { defineTool, errorResult, textResult } from './framework'
 
 const TAB_GROUP_COLORS = [
@@ -105,20 +104,7 @@ export const tab_groups = defineTool({
       case 'list': {
         const groups = (await page.tabGroupList()) as unknown as TabGroup[]
         const resolved = await Promise.all(
-          groups.map(async (group) => {
-            const resolvedGroup = await withPages(group)
-            if (ctx.spaces && ctx.identity) {
-              // Phase 3 3.4: annotate the owning space on structured groups
-              // (additive field; the text line format is unchanged).
-              const spaceId = await ctx.spaces.spaceIdForPage(
-                resolvedGroup.pageIds[0],
-              )
-              if (spaceId) {
-                return { ...resolvedGroup, space_id: spaceId }
-              }
-            }
-            return resolvedGroup
-          }),
+          groups.map((group) => withPages(group)),
         )
         const text = resolved.length
           ? resolved.map(formatGroup).join('\n')
@@ -137,17 +123,8 @@ export const tab_groups = defineTool({
           )
         }
         const tabIds = await toTabIds(args.pages)
-        let title = args.title
-        let color: TabGroup['color'] | undefined = args.color
-        if (!args.groupId && ctx.spaces && ctx.identity) {
-          // Phase 3 3.4: a new group created while the agent has a current
-          // space defaults to the space name + a deterministic color.
-          const meta = await ctx.spaces.currentSpaceGroupMeta(
-            ownerOf(ctx.identity),
-          )
-          if (title === undefined) title = meta.title
-          if (color === undefined) color = meta.color
-        }
+        const title = args.title
+        const color: TabGroup['color'] | undefined = args.color
         const group = args.groupId
           ? ((await page.cdp('Browser.addTabsToGroup', {
               groupId: args.groupId,

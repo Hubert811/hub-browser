@@ -24,7 +24,6 @@ interface ToolContext {
   page: UnifiedPage            // active/front page (browser-level tools)
   pageFor(pageId: number): Promise<UnifiedPage>  // page-bound instance
   defaultWindowId?: number
-  defaultTabGroupId?: string
   signal?: AbortSignal
 }
 ```
@@ -42,7 +41,7 @@ instead of `options.browserSession`.
 | tool | UnifiedPage call |
 |---|---|
 | `tabs list/active` | `page.tabs()` |
-| `tabs new` | `page.newTab(url, {background, windowId, tabGroupId})` + `page.tabs()` (pageId from targetId) |
+| `tabs new` | `page.newTab(url, {background, windowId})` + `page.tabs()` (pageId from targetId) |
 | `tabs close` | `page.closeTab(pageId)` |
 | `tab_groups list` | `page.tabGroupList()` + `page.tabs()` (tabId↔pageId) |
 | `tab_groups create/update/ungroup/close` | `page.tabGroupCreate/Update/Ungroup/Close`; add-to-existing-group via `page.cdp('Browser.addTabsToGroup')` |
@@ -252,7 +251,7 @@ in this checkout, pre-existing).
   browser-core `Input.scroll`.
 - `download` waits on `Page.downloadWillBegin`/`downloadProgress` events, mirroring
   the vendored implementation (no directory polling).
-- `tabs new` passes `background` + `windowId`/`tabGroupId` defaults through to
+- `tabs new` passes `background` + the `windowId` default through to
   `page.newTab` when provided.
 - Known quirk (pre-existing, affects vendored browser-core equally): CDP
   `mouseWheel` on a **background** tab times out; scroll only works once the tab

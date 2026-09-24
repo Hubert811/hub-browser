@@ -217,7 +217,10 @@ describe('agent-level tab isolation (3.3) — through executeTool', () => {
       ctx,
     )
     expect(upd.isError).toBe(true)
-    expect(textOf(upd)).toContain('is not in your space')
+    expect(textOf(upd)).toContain('is not yours')
+    expect(
+      (upd.structuredContent as { code?: string } | undefined)?.code,
+    ).toBe('group-not-in-space')
 
     const cls = await executeTool(
       tool('tab_groups'),
@@ -225,7 +228,10 @@ describe('agent-level tab isolation (3.3) — through executeTool', () => {
       ctx,
     )
     expect(cls.isError).toBe(true)
-    expect(textOf(cls)).toContain('is not in your space')
+    expect(textOf(cls)).toContain('is not yours')
+    expect(
+      (cls.structuredContent as { code?: string } | undefined)?.code,
+    ).toBe('group-not-in-space')
 
     // The guard fired before dispatch — the handler never touched the group.
     expect(updated).toEqual([])
@@ -240,24 +246,76 @@ describe('agent-level tab isolation (3.3) — through executeTool', () => {
     expect(own.isError).toBeFalsy()
     expect(updated).toEqual(['g-a'])
 
-    // Unknown group ids fall through to the handler's native error (the
-    // guard only rejects what it can prove is foreign).
+    // An EMPTY or UNKNOWN group is refused too: nothing proves it is ours
+    // (P7-F / D-P9 made the guard ownership-based, so "cannot prove" is a
+    // refusal, not a fall-through to the browser's native error).
     const unknown = await executeTool(
       tool('tab_groups'),
       { action: 'update', groupId: 'g-nope', title: 'x' },
       ctx,
     )
     expect(unknown.isError).toBe(true)
-    expect(textOf(unknown)).not.toContain('is not in your space')
+    expect(textOf(unknown)).toContain('has no tab of your current space')
+    expect(
+      (unknown.structuredContent as { code?: string } | undefined)?.code,
+    ).toBe('group-not-in-space')
+  })
+
+  it('a group mixing own and foreign tabs is refused — counts only, foreign urls never echoed', async () => {
+    const gateway = createFakeGateway()
+    const manager = new TaskSpaceManager({
+      storagePath: join(mkdtempSync(join(tmpdir(), 'guard-')), 's.json'),
+      gateway: gateway.gateway,
+      persist: false,
+    })
+    const alice: SpaceIdentity = { agentId: 'alice' }
+    const aSpace = await manager.create('alice', 'a-work')
+    const bSpace = await manager.create('bob', 'b-work')
+    const aTab = await manager.openTab('alice', aSpace.id, 'https://a.example')
+    const bTab = await manager.openTab('bob', bSpace.id, 'https://b.example')
+
+    const closed: string[] = []
+    const page = createFakePage({
+      tabs: (async () =>
+        gateway.tabs.map((t) => ({ ...t, tabId: t.pageId }))) as never,
+      // One member is ours, one is a stranger's: partial ownership is NOT
+      // enough — closing the group would take the stranger's tab down.
+      tabGroupList: (async () => [
+        { groupId: 'g-mixed', tabIds: [aTab, bTab], title: 'mixed' },
+      ]) as never,
+      tabGroupClose: (async (groupId: string) => {
+        closed.push(groupId)
+      }) as never,
+    })
+    const ctx: ToolContext = {
+      ...makeContext(page),
+      identity: alice,
+      spaces: manager,
+    }
+
+    const mixed = await executeTool(
+      tool('tab_groups'),
+      { action: 'close', groupId: 'g-mixed' },
+      ctx,
+    )
+    expect(mixed.isError).toBe(true)
+    // Counts only: the message says HOW MANY are foreign, never WHICH (P1-5 —
+    // a tab that is not ours exposes who holds it, not what is in it).
+    expect(textOf(mixed)).toContain('1 of its 2 tab(s) are outside your current space')
+    expect(textOf(mixed)).not.toContain('https://b.example')
+    expect(
+      (mixed.structuredContent as { code?: string } | undefined)?.code,
+    ).toBe('group-not-in-space')
+    expect(closed).toEqual([])
   })
 
   it('tab_groups update on the SAME agent\u2019s other space is rejected (space-level finalization, 2026-08-24)', async () => {
     // The real-run repro shape: one agent, two spaces. The original
     // groupId-branch fix used the agent-level assertPagesControllable, which
-    // waved this through (both spaces belong to the same owner). The
-    // finalized guard is space-level: a group is the CURRENT space's D5
-    // projection, so members of another space — even the same agent's — are
-    // off-limits.
+    // waved this through (both spaces belong to the same owner). The rule is
+    // space-level and ownership-based (P7-F / D-P9): every member tab must
+    // belong to the caller's CURRENT space, so another space's group — even
+    // the same agent's — is off-limits.
     const gateway = createFakeGateway()
     const manager = new TaskSpaceManager({
       storagePath: join(mkdtempSync(join(tmpdir(), 'guard-')), 's.json'),
@@ -297,7 +355,7 @@ describe('agent-level tab isolation (3.3) — through executeTool', () => {
       ctx,
     )
     expect(upd.isError).toBe(true)
-    expect(textOf(upd)).toContain('is not in your space')
+    expect(textOf(upd)).toContain('is not yours')
     expect(updated).toEqual([])
   })
 

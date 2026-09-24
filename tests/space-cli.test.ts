@@ -1,6 +1,7 @@
 /**
  * Phase 3 — `opencli space` command group (3.6): create/list/current/switch/
- * handoff/takeover/close against a temp ledger. No browser needed (keep:true).
+ * handoff/takeover/close/finish against a temp ledger. No browser needed for
+ * the ledger-only paths (keep:true).
  */
 import { afterEach, describe, expect, it } from 'bun:test'
 import { createProgram } from '../src/opencli-engine/cli.js'
@@ -11,13 +12,10 @@ import * as fs from 'node:fs'
 const BUILTIN_CLIS = path.join(process.cwd(), 'clis')
 const USER_CLIS = path.join(os.homedir(), '.hub', 'clis')
 
-// bug 1 (D5): the space read commands (list/current/switch) now consult the
-// browser gateway so tab-group edits reconcile before answering. These tests
-// are ledger-only — a fast-failing bridge exercises the degradation path
-// (no gateway → sync no-op, output unchanged) and daemon mode keeps the
-// process alive (non-daemon CLI actions call process.exit() after a direct
-// bridge). Mirrors the browser-command test convention in
-// space-browser-cli.test.ts.
+// These tests are ledger-only — a fast-failing bridge exercises the degradation
+// path (no browser reachable) and daemon mode keeps the process alive
+// (non-daemon CLI actions call process.exit() after a direct bridge). Mirrors
+// the browser-command test convention in space-browser-cli.test.ts.
 class FailingBridge {
   async connect(): Promise<never> {
     throw new Error('no browser in ledger-only test')
@@ -96,6 +94,146 @@ describe('opencli space command group (3.6)', () => {
 })
 
 describe('opencli space refresh — TabFreshness 整组回收原语 (CLI)', () => {
+  it('finish keeps the labels you name and closes the rest (MCP parity)', async () => {
+    // Same shared-registry fake as the recycle test: the CLI's gateway and the
+    // setup manager must see the same live tabs.
+    let next = 700
+    const tabs: Array<{ pageId: number; targetId: string; url: string }> = []
+    class FakeFinishPage {
+      async newTab(url?: string) {
+        const pageId = next++
+        const targetId = `target-${pageId}`
+        tabs.push({ pageId, targetId, url: url ?? 'about:blank' })
+        return targetId
+      }
+      async closeTab(target: number | string) {
+        const idx = tabs.findIndex(
+          (t) => t.pageId === target || t.targetId === String(target),
+        )
+        if (idx >= 0) tabs.splice(idx, 1)
+      }
+      async tabs() {
+        return [...tabs]
+      }
+      async selectTab() {}
+      async close() {}
+    }
+    ;(globalThis as any).__HubBrowserFactory = {
+      _cdp: {},
+      _session: {},
+      connect: async () => new FakeFinishPage(),
+    }
+    ;(globalThis as any).__HubDaemonMode = true
+
+    const { ledger, run } = makeRunner()
+    const { TaskSpaceManager, gatewayFromPage } = await import(
+      '../src/space/task-space-manager.ts'
+    )
+    const setup = new TaskSpaceManager({
+      storagePath: ledger,
+      gateway: gatewayFromPage(new FakeFinishPage()),
+      persist: true,
+    })
+    const space = await setup.create('cli:local', 'finish-me')
+    await setup.openTabWithReuse('cli:local', space.id, 'https://a.example/')
+    await setup.openTabWithReuse('cli:local', space.id, 'https://b.example/')
+    const rows = await setup.listTabs(space.id)
+    const keepLabel = String(rows[0].label)
+    const dropLabel = String(rows[1].label)
+
+    // Keep exactly one label: the other tab closes, the space stays.
+    const kept = JSON.parse(
+      await run(['space', 'finish', space.id, '--keep', keepLabel, '--json']),
+    ) as {
+      closedSpace: boolean
+      keptLabels: string[]
+      closedLabels: string[]
+    }
+    expect(kept.keptLabels).toEqual([keepLabel])
+    expect(kept.closedLabels).toEqual([dropLabel])
+    expect(kept.closedSpace).toBe(false)
+    expect(tabs.map((t) => t.url)).toEqual(['https://a.example/'])
+
+    // Keep nothing: everything closes and the space leaves the ledger.
+    const emptied = JSON.parse(
+      await run(['space', 'finish', space.id, '--keep', '', '--json']),
+    ) as { closedSpace: boolean; keptLabels: string[]; closedLabels: string[] }
+    expect(emptied.closedSpace).toBe(true)
+    expect(emptied.keptLabels).toEqual([])
+    expect(emptied.closedLabels).toEqual([keepLabel])
+    expect(tabs).toHaveLength(0)
+  })
+
+  it('finish keeps the labels you name and closes the rest (MCP parity)', async () => {
+    // Same shared-registry fake as the recycle test: the CLI's gateway and the
+    // setup manager must see the same live tabs.
+    let next = 700
+    const tabs: Array<{ pageId: number; targetId: string; url: string }> = []
+    class FakeFinishPage {
+      async newTab(url?: string) {
+        const pageId = next++
+        const targetId = `target-${pageId}`
+        tabs.push({ pageId, targetId, url: url ?? 'about:blank' })
+        return targetId
+      }
+      async closeTab(target: number | string) {
+        const idx = tabs.findIndex(
+          (t) => t.pageId === target || t.targetId === String(target),
+        )
+        if (idx >= 0) tabs.splice(idx, 1)
+      }
+      async tabs() {
+        return [...tabs]
+      }
+      async selectTab() {}
+      async close() {}
+    }
+    ;(globalThis as any).__HubBrowserFactory = {
+      _cdp: {},
+      _session: {},
+      connect: async () => new FakeFinishPage(),
+    }
+    ;(globalThis as any).__HubDaemonMode = true
+
+    const { ledger, run } = makeRunner()
+    const { TaskSpaceManager, gatewayFromPage } = await import(
+      '../src/space/task-space-manager.ts'
+    )
+    const setup = new TaskSpaceManager({
+      storagePath: ledger,
+      gateway: gatewayFromPage(new FakeFinishPage()),
+      persist: true,
+    })
+    const space = await setup.create('cli:local', 'finish-me')
+    await setup.openTabWithReuse('cli:local', space.id, 'https://a.example/')
+    await setup.openTabWithReuse('cli:local', space.id, 'https://b.example/')
+    const rows = await setup.listTabs(space.id)
+    const keepLabel = String(rows[0].label)
+    const dropLabel = String(rows[1].label)
+
+    // Keep exactly one label: the other tab closes, the space stays.
+    const kept = JSON.parse(
+      await run(['space', 'finish', space.id, '--keep', keepLabel, '--json']),
+    ) as {
+      closedSpace: boolean
+      keptLabels: string[]
+      closedLabels: string[]
+    }
+    expect(kept.keptLabels).toEqual([keepLabel])
+    expect(kept.closedLabels).toEqual([dropLabel])
+    expect(kept.closedSpace).toBe(false)
+    expect(tabs.map((t) => t.url)).toEqual(['https://a.example/'])
+
+    // Keep nothing: everything closes and the space leaves the ledger.
+    const emptied = JSON.parse(
+      await run(['space', 'finish', space.id, '--keep', '', '--json']),
+    ) as { closedSpace: boolean; keptLabels: string[]; closedLabels: string[] }
+    expect(emptied.closedSpace).toBe(true)
+    expect(emptied.keptLabels).toEqual([])
+    expect(emptied.closedLabels).toEqual([keepLabel])
+    expect(tabs).toHaveLength(0)
+  })
+
   it('recycles every tab: same URLs, new pageIds, space record preserved', async () => {
     // Shared in-memory tab registry backing both the CLI's browser gateway
     // (via the injected __HubBrowserFactory singleton) and the setup manager.
@@ -198,216 +336,5 @@ describe('opencli space refresh — TabFreshness 整组回收原语 (CLI)', () =
 
     delete (globalThis as any).__HubBrowserFactory
     delete (globalThis as any).__HubDaemonMode
-  })
-})
-
-// ── bug 1 (D5) — CLI read paths carry the browser gateway ──────────────────
-// `space current`/`space list`/`space switch`/`browser tab list` construct the
-// manager with a browser gateway so raw tab-group edits (拖入/拖出) reconcile
-// into the ledger before answering. Without a gateway the reads degrade
-// gracefully (no sync, same output as before).
-describe('bug 1 — CLI read paths carry the browser gateway (D5 v2: drag-ins signal, not claim)', () => {
-  /** Fake BrowserOS neo page with D5 tab-group support (shared registry). */
-  class TabGroupPage {
-    constructor(private browser: TabGroupBrowser) {}
-    async tabs() {
-      return this.browser.tabs.map((t) => ({ ...t }))
-    }
-    async newTab(url?: string) {
-      const tab = this.browser.newTab(url ?? 'about:blank')
-      return tab.targetId
-    }
-    async closeTab() {}
-    async selectTab() {}
-    async tabGroupList() {
-      return this.browser.groups.map((g) => ({ ...g, tabIds: [...g.tabIds] }))
-    }
-    async tabGroupCreate(pages: number[], title?: string) {
-      const tabIds = pages.map((pid) => {
-        const t = this.browser.tabs.find((x) => x.pageId === pid)
-        if (!t) throw new Error(`Page ${pid} not found`)
-        return t.tabId
-      })
-      const group = {
-        groupId: `g-${this.browser.nextGroupId++}`,
-        title: title ?? '',
-        color: 'grey',
-        tabIds,
-      }
-      this.browser.groups.push(group)
-      return group
-    }
-    async tabGroupUpdate() {
-      return undefined
-    }
-    async tabGroupClose() {}
-  }
-
-  class TabGroupBrowser {
-    tabs: Array<{
-      pageId: number
-      targetId: string
-      tabId: string
-      url: string
-      isActive?: boolean
-    }> = []
-    groups: Array<{
-      groupId: string
-      title: string
-      color: string
-      tabIds: string[]
-    }> = []
-    nextPageId = 100
-    nextGroupId = 1
-    async connect() {
-      return new TabGroupPage(this)
-    }
-    newTab(url: string) {
-      const pageId = this.nextPageId++
-      const tab = {
-        pageId,
-        targetId: `target-${pageId}`,
-        tabId: `tab-${pageId}`,
-        url,
-        isActive: false,
-      }
-      this.tabs.push(tab)
-      return tab
-    }
-  }
-
-  it('space current + space list sync a raw-CDP drag-in (mock gateway)', async () => {
-    const { ledger, run } = makeRunner()
-    const browser = new TabGroupBrowser()
-
-    // Setup: create the space + one attributed tab through a manager that
-    // shares the SAME fake browser registry and the CLI's ledger file.
-    const { TaskSpaceManager, gatewayFromPage } = await import(
-      '../src/space/task-space-manager.ts'
-    )
-    const setup = new TaskSpaceManager({
-      storagePath: ledger,
-      gateway: gatewayFromPage(new TabGroupPage(browser)),
-      persist: true,
-    })
-    const space = await setup.create('cli:local', 'sync-me')
-    await setup.openTabWithReuse('cli:local', space.id, 'https://a.example/', {
-      background: true,
-    })
-    expect(browser.tabs).toHaveLength(1)
-    expect(browser.groups).toHaveLength(1)
-    const groupId = browser.groups[0].groupId
-
-    // Raw CDP outside the manager: createTab + addTabsToGroup (拖入).
-    const dragged = browser.newTab('https://b.example/')
-    browser.groups[0].tabIds.push(dragged.tabId)
-
-    // CLI gateway comes from the daemon-singleton seam (spaceGatewayFromBrowser).
-    ;(globalThis as any).__HubBrowserFactory = {
-      _cdp: {},
-      _session: {},
-      connect: async () => browser.connect(),
-    }
-
-    // D5 v2 (P1-7 方向 B): `space current` still reconciles through the
-    // gateway (bug 1 fix intact — the read path carries the browser gateway),
-    // but a drag-in is now a SIGNAL, not a claim: the ledger keeps one tab.
-    const current = await run(['space', 'current', '--json'])
-    const cur = JSON.parse(current) as {
-      space: { id: string; tabIds: number[]; tabGroupId?: string }
-    }
-    expect(cur.space.id).toBe(space.id)
-    expect(cur.space.tabIds).toHaveLength(1)
-    expect(cur.space.tabIds).not.toContain(dragged.pageId)
-    // bug 3: tabGroupId 透出 (SpaceInfo serialization).
-    expect(cur.space.tabGroupId).toBe(groupId)
-
-    // `space list` reconciles too — same one-tab ledger.
-    const list = await run(['space', 'list', '--json'])
-    const parsed = JSON.parse(list) as {
-      spaces: Array<{ id: string; tabIds: number[] }>
-      count: number
-    }
-    const listed = parsed.spaces.find((s) => s.id === space.id)!
-    expect(listed.tabIds).toHaveLength(1)
-
-    // `space switch` still works with a gateway present.
-    const switched = await run(['space', 'switch', space.id, '--json'])
-    expect(switched).toContain(space.id)
-
-    delete (globalThis as any).__HubBrowserFactory
-  })
-
-  it('browser tab list also reconciles via the connected page gateway', async () => {
-    const { ledger, run } = makeRunner()
-    const browser = new TabGroupBrowser()
-
-    const { TaskSpaceManager, gatewayFromPage } = await import(
-      '../src/space/task-space-manager.ts'
-    )
-    const setup = new TaskSpaceManager({
-      storagePath: ledger,
-      gateway: gatewayFromPage(new TabGroupPage(browser)),
-      persist: true,
-    })
-    const space = await setup.create('cli:local', 'tablist-sync')
-    await setup.openTabWithReuse('cli:local', space.id, 'https://a.example/', {
-      background: true,
-    })
-    const dragged = browser.newTab('https://b.example/')
-    browser.groups[0].tabIds.push(dragged.tabId)
-
-    // browser tab list connects its own page (via the bridge override); the
-    // connected page doubles as the manager gateway for the sync.
-    class TabGroupBridge {
-      async connect() {
-        return browser.connect()
-      }
-    }
-    ;(globalThis as any).__HubBrowserBridgeOverride = TabGroupBridge
-
-    const listed = await run(['browser', '--session', 'smoke', 'tab', 'list', '-f', 'json'])
-    const tabs = JSON.parse(listed) as Array<{ pageId: number; url: string }>
-    // D5 v2: the dragged-in tab is NOT claimed, so the agent-scoped list
-    // (filterTabsForAgent) keeps showing only the ledger tab.
-    expect(tabs.map((t) => t.pageId)).not.toContain(dragged.pageId)
-    expect(tabs).toHaveLength(1)
-
-    delete (globalThis as any).__HubBrowserBridgeOverride
-  })
-
-  it('no gateway → reads degrade: no sync, same ledger, command still succeeds', async () => {
-    const { ledger, run } = makeRunner()
-    const browser = new TabGroupBrowser()
-
-    const { TaskSpaceManager, gatewayFromPage } = await import(
-      '../src/space/task-space-manager.ts'
-    )
-    const setup = new TaskSpaceManager({
-      storagePath: ledger,
-      gateway: gatewayFromPage(new TabGroupPage(browser)),
-      persist: true,
-    })
-    const space = await setup.create('cli:local', 'degrade-me')
-    await setup.openTabWithReuse('cli:local', space.id, 'https://a.example/', {
-      background: true,
-    })
-    // Drag-in happens, but this CLI run has NO browser gateway (FailingBridge).
-    const dragged = browser.newTab('https://b.example/')
-    browser.groups[0].tabIds.push(dragged.tabId)
-
-    // No __HubBrowserFactory here — spaceGatewayFromBrowser() degrades to
-    // gateway undefined; the read must still succeed with the unsynced ledger.
-    const current = await run(['space', 'current', '--json'])
-    const cur = JSON.parse(current) as { space: { id: string; tabIds: number[] } }
-    expect(cur.space.id).toBe(space.id)
-    expect(cur.space.tabIds).toHaveLength(1)
-
-    const list = await run(['space', 'list', '--json'])
-    const parsed = JSON.parse(list) as {
-      spaces: Array<{ id: string; tabIds: number[] }>
-      count: number
-    }
-    expect(parsed.spaces.find((s) => s.id === space.id)!.tabIds).toHaveLength(1)
   })
 })

@@ -1380,7 +1380,10 @@ export abstract class BasePage implements IPage {
   }
 
   async getCurrentUrl(): Promise<string | null> {
-    if (this._lastUrl) return this._lastUrl;
+    // Fresh read FIRST: any navigation that does not go through goto() — a hash
+    // route, pushState, a link click, a redirect — must be visible here, and
+    // URL polling is precisely "read until it changes". The last known value is
+    // kept only as the fallback for a page that cannot be evaluated.
     try {
       const current = await this.evaluate('window.location.href');
       if (typeof current === 'string' && current) {
@@ -1388,9 +1391,9 @@ export abstract class BasePage implements IPage {
         return current;
       }
     } catch {
-      // Best-effort
+      // Best-effort: the page may be gone.
     }
-    return null;
+    return this._lastUrl ?? null;
   }
 
   async installInterceptor(pattern: string): Promise<void> {

@@ -379,15 +379,17 @@ describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
     process.env.HUB_AGENT_ID = 'agent-a'
     await run(['space', 'create', 'alice', '--json'])
     await run(['browser', '--session', 'alice-work', 'open', 'https://a.example'])
+    // Explicit group for alice's tab (P7-F deleted the space ↔ tab-group
+    // projection, so nothing auto-groups a space's tabs any more).
+    await run(['browser', '--session', 'alice-work', 'group', 'create', '--pages', '100', '--title', 'alice'])
 
     process.env.HUB_AGENT_ID = 'agent-b'
     await run(['space', 'create', 'bob', '--json'])
     await run(['browser', '--session', 'bob-work', 'open', 'https://b.example'])
 
     // agent-b must NOT be able to drag agent-a's tab (page 100) into its own
-    // group — D5 treats a drag INTO the group as an ownership transfer.
-    // (The two existing groups are the D5 space projections: each space
-    // create/open auto-groups its tabs under the space name.)
+    // group — a group is a plain browser feature now, but moving another
+    // space's tab into it is still an ownership change this guard forbids.
     const groupsBefore = browser.groups.length
     const out = await run(['browser', '--session', 'bob-work', 'group', 'create', '--pages', '100'])
     expect(out).toContain('not in your space')
@@ -395,7 +397,7 @@ describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
     expect(browser.groups).toHaveLength(groupsBefore)
     expect(browser.groups.find((g) => g.pages.includes(100))?.title).toBe('alice')
 
-    // Grouping its OWN page works (a genuinely new group beyond the projections)
+    // Grouping its OWN page works (a genuinely new group beyond alice's).
     const own = await run(['browser', '--session', 'bob-work', 'group', 'create', '--pages', '101', '--title', 'bob-extra'])
     expect(browser.groups).toHaveLength(groupsBefore + 1)
     expect(browser.groups.at(-1)?.pages).toEqual([101])
@@ -444,13 +446,17 @@ describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
     process.env.HUB_AGENT_ID = 'agent-a'
     await run(['space', 'create', 'alice', '--json'])
     await run(['browser', '--session', 'alice-work', 'open', 'https://a.example'])
+    // P7-F deleted the space ↔ tab-group projection, so groups are created
+    // explicitly here. The guard is now ownership-based: a group-addressed
+    // mutation needs EVERY member tab in the caller's CURRENT space.
+    await run(['browser', '--session', 'alice-work', 'group', 'create', '--pages', '100', '--title', 'alice'])
 
     process.env.HUB_AGENT_ID = 'agent-b'
     await run(['space', 'create', 'bob', '--json'])
     await run(['browser', '--session', 'bob-work', 'open', 'https://b.example'])
+    await run(['browser', '--session', 'bob-work', 'group', 'create', '--pages', '101', '--title', 'bob'])
 
-    // D5 projection groups: alice's tabs grouped under 'alice', bob's under
-    // 'bob'. Grab live group ids from the list (never hardcode fake ids).
+    // Grab live group ids from the list (never hardcode fake ids).
     const groups = JSON.parse(
       await run(['browser', '--session', 'bob-work', 'group', 'list']),
     ) as Array<{ groupId: string; title?: string; tabIds: number[] }>
@@ -458,21 +464,20 @@ describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
     const own = groups.find((g) => g.title === 'bob')
     expect(foreign).toBeDefined()
     expect(own).toBeDefined()
-    // The D5 projection sync itself may call tabGroupUpdate; only calls past
-    // this point are the command under test.
     const updatesBefore = browser.groupUpdates.length
     const closesBefore = browser.groupCloses.length
 
     // agent-b must NOT be able to rename agent-a's group — pre-fix this
     // sailed through (groupId-addressed, pages gate never fired).
     const upd = await run(['browser', '--session', 'bob-work', 'group', 'update', foreign!.groupId, '--title', 'hack'])
-    expect(upd).toContain('not in your space')
-    expect(upd).toContain('page-not-in-space')
+    expect(upd).toContain('group-not-in-space')
+    expect(upd).toContain('is not yours')
     expect(browser.groupUpdates.slice(updatesBefore)).toEqual([])
 
     // Nor close it — that would take agent-a's tabs down with the group.
     const cls = await run(['browser', '--session', 'bob-work', 'group', 'close', foreign!.groupId])
-    expect(cls).toContain('not in your space')
+    expect(cls).toContain('group-not-in-space')
+    expect(cls).toContain('is not yours')
     expect(browser.groupCloses.slice(closesBefore)).toEqual([])
     expect(browser.tabs.map((t) => t.targetId)).toContain('target-100')
     expect(browser.groups.find((g) => g.pages.includes(100))?.title).toBe('alice')
@@ -494,8 +499,11 @@ describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
     process.env.HUB_AGENT_ID = 'solo'
     await run(['space', 'create', 'work-one', '--json'])
     await run(['browser', '--session', 's1', 'open', 'https://one.example'])
+    // Explicit groups (P7-F deleted the projection) while work-one is current.
+    await run(['browser', '--session', 's1', 'group', 'create', '--pages', '100', '--title', 'work-one'])
     await run(['space', 'create', 'work-two', '--json'])
     await run(['browser', '--session', 's2', 'open', 'https://two.example'])
+    await run(['browser', '--session', 's2', 'group', 'create', '--pages', '101', '--title', 'work-two'])
 
     const groups = JSON.parse(
       await run(['browser', '--session', 's2', 'group', 'list']),
@@ -507,16 +515,16 @@ describe('hub CLI P1-4 gate: group commands + fork tool wrappers', () => {
     const updatesBefore = browser.groupUpdates.length
     const closesBefore = browser.groupCloses.length
 
-    // Current space is work-two; renaming/closing work-one's projection
-    // group must be rejected at the SPACE level even though both spaces
-    // belong to the same agent.
+    // Current space is work-two; renaming/closing work-one's group must be
+    // rejected by OWNERSHIP even though both spaces belong to the same agent.
     const upd = await run(['browser', '--session', 's2', 'group', 'update', foreign!.groupId, '--title', 'hijacked'])
-    expect(upd).toContain('is not in your space')
-    expect(upd).toContain('page-not-in-space')
+    expect(upd).toContain('group-not-in-space')
+    expect(upd).toContain('is not yours')
     expect(browser.groupUpdates.slice(updatesBefore)).toEqual([])
 
     const cls = await run(['browser', '--session', 's2', 'group', 'close', foreign!.groupId])
-    expect(cls).toContain('is not in your space')
+    expect(cls).toContain('group-not-in-space')
+    expect(cls).toContain('is not yours')
     expect(browser.groupCloses.slice(closesBefore)).toEqual([])
     // work-one's tab survives the close attempt.
     expect(browser.tabs.map((t) => t.url)).toContain('https://one.example')

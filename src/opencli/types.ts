@@ -24,6 +24,18 @@ export interface SnapshotOptions {
   maxTextLength?: number;
   /** Observation backend. `dom` is the stable default; `ax` is an opt-in prototype. */
   source?: 'dom' | 'ax';
+  /**
+   * P7-B S2 — focus the AX capture on the subtree rooted at this ref (minted by
+   * the previous snapshot). Cheaper than a full capture on iframe-heavy pages;
+   * refs outside the subtree go stale until the next full snapshot. AX backend only.
+   */
+  root?: string;
+  /**
+   * P7-B S1 — `viewport` drops AX nodes outside the current viewport (and the
+   * frames they would have stitched); `full_page` is this layer's default so
+   * internal callers keep whole-page output. AX backend only.
+   */
+  scope?: 'viewport' | 'full_page';
 }
 
 export interface WaitOptions {

@@ -28,15 +28,12 @@ function tempLedger(): string {
   return join(mkdtempSync(join(tmpdir(), 'hub-reap-')), 'hub-spaces.json')
 }
 
-/** Minimal gateway with optional close/tabGroupClose spies. */
+/** Minimal gateway with an optional close spy. */
 function createReapGateway(opts?: {
   closed?: number[]
-  closedGroups?: string[]
   closeThrowsFor?: Set<number>
-  tabGroupCloseThrows?: boolean
 }): SpaceTabGateway {
   const closed = opts?.closed ?? []
-  const closedGroups = opts?.closedGroups ?? []
   return {
     newTab: async () => 1,
     listTabs: async () => [] as TabLike[],
@@ -44,14 +41,6 @@ function createReapGateway(opts?: {
       const id = Number(target)
       closed.push(id)
       if (opts?.closeThrowsFor?.has(id)) throw new Error(`close failed for ${id}`)
-    },
-    tabGroupList: async () => [],
-    tabGroupCreate: async () => ({ groupId: 'g-1', tabIds: [], title: '' }),
-    tabGroupAddTabs: async () => {},
-    tabGroupUpdate: async () => ({}),
-    tabGroupClose: async (groupId) => {
-      closedGroups.push(groupId)
-      if (opts?.tabGroupCloseThrows) throw new Error('group close failed')
     },
   }
 }
@@ -203,7 +192,10 @@ describe('D8 legacy-space auto-reap — Tier 2 (idle agent spaces, spaceTtl)', (
     expect(raw.spaces.noStamp).toBeDefined()
     expect(raw.spaces.freshAgent).toBeDefined()
     expect(raw.spaces.userHeld).toBeDefined()
-    expect(raw.deletedSpaces).toContain('staleAgent')
+    // v4 (M5) drops `deletedSpaces`: the daemon is the single writer, so the
+    // merge-on-save tombstones have nothing left to guard against. The ids it
+    // named are applied on read, never rewritten.
+    expect(raw.deletedSpaces).toBeUndefined()
     // user-held never reaped (public API works on well-formed records).
     await expect(manager.getSpace('userHeld')).resolves.toMatchObject({
       id: 'userHeld',
@@ -378,7 +370,9 @@ describe('D8 legacy-space auto-reap — ledger integrity + persistence', () => {
     // In-memory: reaped space gone + owner current pointer cleared.
     expect((await manager.listSpaces('agent-a'))).toHaveLength(0)
     expect(await manager.currentSpace('agent-a')).toBeUndefined()
-    // Disk: synced (persist:true) — space removed, tombstone appended.
+    // Disk: synced (persist:true) — space removed. v4 (M5) no longer writes a
+    // tombstone list: the daemon is the only writer, so there is no second
+    // writer left to resurrect a space from.
     const raw = JSON.parse(readFileSync(ledger, 'utf-8')) as {
       spaces: Record<string, unknown>
       deletedSpaces?: string[]
@@ -386,7 +380,7 @@ describe('D8 legacy-space auto-reap — ledger integrity + persistence', () => {
     }
     expect(raw.spaces.old1).toBeUndefined()
     expect(raw.spaces.other).toBeDefined()
-    expect(raw.deletedSpaces).toContain('old1')
+    expect(raw.deletedSpaces).toBeUndefined()
     expect(raw.currentSpaceByOwner['agent-a']).toBeUndefined()
     expect(raw.currentSpaceByOwner['agent-b']).toBe('other')
   })
@@ -459,10 +453,6 @@ describe('D8 restore() must not refresh lastActiveAt unconditionally', () => {
       newTab: async () => 1,
       listTabs: async () => [...tabs],
       closeTab: async () => {},
-      tabGroupList: async () => [],
-      tabGroupCreate: async () => ({ groupId: 'g-1', tabIds: [], title: '' }),
-      tabGroupAddTabs: async () => {},
-      tabGroupUpdate: async () => ({}),
     }
   }
 
@@ -593,12 +583,11 @@ describe('D8 restore() must not refresh lastActiveAt unconditionally', () => {
   })
 })
 
-describe('D8 legacy-space auto-reap — best-effort tab/group close', () => {
-  it('Tier 2 eviction closes tabs and the tab group through the gateway, swallowing errors', async () => {
+describe('D8 legacy-space auto-reap — best-effort tab close', () => {
+  it('Tier 2 eviction closes tabs through the gateway, swallowing errors', async () => {
     const ledger = tempLedger()
     const t = now()
     const closed: number[] = []
-    const closedGroups: string[] = []
     writeFileSync(
       ledger,
       JSON.stringify({
@@ -615,7 +604,6 @@ describe('D8 legacy-space auto-reap — best-effort tab/group close', () => {
               { pageId: 101, url: 'https://a.example' },
               { pageId: 102, url: 'https://b.example' },
             ],
-            tabGroupId: 'grp-1',
           },
         },
         currentSpaceByOwner: { 'agent-a': 's1' },
@@ -623,9 +611,7 @@ describe('D8 legacy-space auto-reap — best-effort tab/group close', () => {
     )
     const gateway = createReapGateway({
       closed,
-      closedGroups,
       closeThrowsFor: new Set([102]),
-      tabGroupCloseThrows: true,
     })
     const manager = new TaskSpaceManager({
       storagePath: ledger,
@@ -647,7 +633,6 @@ describe('D8 legacy-space auto-reap — best-effort tab/group close', () => {
     // Let the fire-and-forget closes settle; errors are swallowed.
     await new Promise((r) => setTimeout(r, 10))
     expect(closed).toEqual([101, 102])
-    expect(closedGroups).toEqual(['grp-1'])
     // Ledger eviction is authoritative regardless of browser failures.
     expect((await manager.listSpaces('agent-a'))).toHaveLength(0)
   })

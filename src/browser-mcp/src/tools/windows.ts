@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { ownerOf } from '../../../space/task-space-manager.js'
 import { defineTool, errorResult, textResult } from './framework'
 
 const ACTIONS = ['list', 'create', 'close', 'activate'] as const
@@ -43,6 +44,30 @@ export const windows = defineTool({
       case 'create': {
         const window = (await ctx.page.windowCreate()) as unknown as {
           windowId: number
+        }
+        // P7-H H5 — a new window always comes with exactly one tab, and the
+        // window guard derives ownership from the ledger, so claim that tab the
+        // same way `tabs new` does. Without this the agent could not close the
+        // window it just opened (nothing would prove the window is its own).
+        if (ctx.spaces && ctx.identity) {
+          const pages = (await ctx.page.tabs()) as unknown as Array<{
+            pageId: number
+            windowId?: number
+            targetId?: string
+            tabId?: number
+          }>
+          const fresh = pages.find((p) => p.windowId === window.windowId)
+          if (fresh && typeof fresh.pageId === 'number') {
+            await ctx.spaces
+              .recordTabForCurrentSpace(
+                ownerOf(ctx.identity),
+                fresh.pageId,
+                'about:blank',
+                fresh.targetId,
+                fresh.tabId,
+              )
+              .catch(() => {})
+          }
         }
         return textResult(`created window ${window.windowId}`, {
           action: 'create',

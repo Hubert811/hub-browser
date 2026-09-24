@@ -38,10 +38,7 @@ export const SPACE_NOTIFICATION_METHODS: Readonly<
   'space.switched': 'notifications/space/switched',
   'space.closed': 'notifications/space/closed',
   'space.tabs_recycled': 'notifications/space/tabs_recycled',
-  // P1-7 方向 B (D5 v2) drag signals — the group is a projection; dragging
-  // never mutates the ledger, it only signals.
-  'tab.dragged_in': 'notifications/space/tab_dragged_in',
-  'tab.dragged_out': 'notifications/space/tab_dragged_out',
+  'space.tabs_changed': 'notifications/space/tabs_changed',
 }
 
 /** JSON-RPC notification params for a space event (JSON-safe subset). */
@@ -52,14 +49,6 @@ export type SpaceNotificationParams = {
   ownership?: string
   /** Number of tabs involved (carried by space.tabs_recycled). */
   urls?: number
-  /**
-   * P1-7 方向 B — drag-signal payload (tab.dragged_in / tab.dragged_out):
-   * the page whose group membership changed, its best-known url, and the
-   * ledger space still owning it (absent = unclaimed tab).
-   */
-  pageId?: number
-  url?: string
-  ledgerSpaceId?: string
   timestamp: number
 }
 
@@ -80,11 +69,6 @@ export function spaceEventToNotification(
   if (event.owner !== undefined) params.owner = event.owner
   if (event.ownership !== undefined) params.ownership = event.ownership
   if (event.urls !== undefined) params.urls = event.urls
-  if (event.pageId !== undefined) params.pageId = event.pageId
-  if (event.url !== undefined) params.url = event.url
-  if (event.ledgerSpaceId !== undefined) {
-    params.ledgerSpaceId = event.ledgerSpaceId
-  }
   return { method: SPACE_NOTIFICATION_METHODS[event.type], params }
 }
 

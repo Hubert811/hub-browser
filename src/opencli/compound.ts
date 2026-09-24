@@ -56,7 +56,6 @@ export type CompoundInfo = DateCompound | SelectCompound | FileCompound;
 
 /** Max options included in a SelectCompound.options[]. Above this, `options_total` still reflects the true count. */
 export const COMPOUND_SELECT_OPTIONS_CAP = 50;
-
 /** Max characters per option label / file name. */
 export const COMPOUND_LABEL_CAP = 80;
 
@@ -147,3 +146,28 @@ function compoundInfoOf(el) {
   return null;
 }
 `;
+
+/**
+ * C2 — appended to browser-core's DOM-unit probe so ONE `callFunctionOn` per ref
+ * returns the locating identity and the compound view together, instead of hub
+ * running a second probe sweep over the same refs.
+ */
+export const COMPOUND_EXTRAS_JS = `${COMPOUND_INFO_JS}
+function __domUnitExtras(el) { return compoundInfoOf(el); }`;
+
+/**
+ * Inline description of a compound control, rendered after `[ref=eN]` as
+ * `[compound: …]`. Pure text shaping — kept here so the snapshot projection
+ * stays a thin read of `DomUnit.extras`.
+ */
+export function renderCompoundDesc(info: CompoundInfo): string {
+  if (info.control === 'select') {
+    const opts =
+      info.options?.slice(0, 5).map((o) => o.label).join('/') ?? '';
+    return `select, ${info.options_total} options${info.multiple ? ' (multi)' : ''}, current: ${info.current || 'none'}${opts ? ', e.g. ' + opts : ''}`;
+  }
+  if (info.control === 'file') {
+    return `file${info.multiple ? ' (multi)' : ''}${info.accept ? ', accept: ' + info.accept : ''}`;
+  }
+  return `${info.control}, format: ${info.format}, current: ${info.current || 'none'}`;
+}

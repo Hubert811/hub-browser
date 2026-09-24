@@ -136,9 +136,17 @@ describe('bindAdapterPageToSpace — adapter command → current space', () => {
     expect(factory.connects).toEqual([])
 
     // The tab is attributed to the space ledger (bug #2/#6: owned + closable).
+    // P7-A adds the durable label + origin attribution to the persisted ref.
     const spaces = ledgerSpaces(storagePath)
     expect(spaces[space.id].tabs).toEqual([
-      { pageId: 100, targetId: 'target-100', url: 'https://zhihu.com', restored: false },
+      {
+        pageId: 100,
+        targetId: 'target-100',
+        url: 'https://zhihu.com',
+        label: 'p1',
+        openedBy: 'agent',
+        restored: false,
+      },
     ])
     expect(spaces[space.id].owner).toBe('agent-a')
   })

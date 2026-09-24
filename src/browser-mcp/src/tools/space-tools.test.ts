@@ -1,5 +1,5 @@
 /**
- * Phase 3 — `space.*` tools + tab_groups per-space coloring (3.4/3.6 MCP side).
+ * Phase 3 — `space.*` tools (3.4/3.6 MCP side).
  */
 import { describe, expect, it } from 'bun:test'
 import { mkdtempSync } from 'node:fs'
@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   TaskSpaceManager,
-  deterministicColor,
   type SpaceIdentity,
   type SpaceTabGateway,
   type TabLike,
@@ -288,65 +287,6 @@ describe('space.* tools', () => {
     const result = await executeTool(tool('space.create'), { name: 'x' }, ctx)
     expect(result.isError).toBe(true)
     expect(textOf(result)).toContain('not configured')
-  })
-})
-
-describe('tab_groups per-space coloring (3.4)', () => {
-  it('create defaults title to the space name and color to a deterministic color', async () => {
-    const manager = freshManager()
-    const space = await manager.create('alice', '搜索任务')
-    // The page must belong to the space first (guard rejects unowned pages).
-    await manager.recordTabForCurrentSpace('alice', 7, 'https://a.example')
-    const page = createFakePage({
-      tabs: (async () => [
-        { pageId: 7, tabId: 71, targetId: 't7', url: 'https://a.example' },
-      ]) as never,
-      tabGroupList: (async () => []) as never,
-      cdp: (async (method: string, params?: Record<string, unknown>) => {
-        if (method === 'Browser.createTabGroup') {
-          return {
-            group: {
-              groupId: 'g-1',
-              windowId: 1,
-              title: params?.title ?? undefined,
-              color: params?.color ?? undefined,
-              collapsed: false,
-              tabIds: params?.tabIds ?? [],
-            },
-          }
-        }
-        return {}
-      }) as never,
-    })
-    const result = await executeTool(
-      browserTool('tab_groups'),
-      { action: 'create', pages: [7] },
-      ctxFor(manager, page),
-    )
-    expect(result.isError).toBeFalsy()
-    const group = (result.structuredContent as { group: { title?: string; color?: string } }).group
-    expect(group.title).toBe('搜索任务')
-    expect(group.color).toBe(deterministicColor(space.id))
-  })
-
-  it('list annotates groups with the owning space_id (additive)', async () => {
-    const manager = freshManager()
-    const space = await manager.create('alice', 'work')
-    await manager.recordTabForCurrentSpace('alice', 7, 'https://a.example')
-    const page = createFakePage({
-      tabs: (async () => [
-        { pageId: 7, tabId: 71, targetId: 't7', url: 'https://a.example' },
-      ]) as never,
-      tabGroupList: (async () => [
-        { groupId: 'g-1', windowId: 1, title: 'Work', color: 'blue', collapsed: false, tabIds: [71] },
-      ]) as never,
-    })
-    const result = await executeTool(browserTool('tab_groups'), { action: 'list' }, ctxFor(manager, page))
-    expect(result.isError).toBeFalsy()
-    const groups = (result.structuredContent as { groups: Array<Record<string, unknown>> }).groups
-    expect(groups[0].space_id).toBe(space.id)
-    // Existing keys are preserved.
-    expect(groups[0].groupId).toBe('g-1')
   })
 })
 

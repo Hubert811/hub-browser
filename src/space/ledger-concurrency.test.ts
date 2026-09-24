@@ -8,9 +8,9 @@ import { fileURLToPath } from 'node:url'
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 /**
- * Worker script each concurrent process runs: N rounds of create + (every
- * other round) close-with-tombstone against the shared ledger. Every round
- * exercises the locked read-merge-write save path.
+ * Worker script each concurrent process runs: N rounds of create + (every other
+ * round) close against the shared ledger, through a manager that must CLAIM the
+ * ledger before it may write.
  */
 function workerScript(): string {
   return `
@@ -24,6 +24,7 @@ for (let i = 0; i < rounds; i++) {
   if (i % 2 === 0) await m.closeSpace(owner, s.id, { keep: true })
 }
 m.dispose()
+process.stderr.write('WORKER-DONE ' + worker + '\\n')
 `
 }
 
@@ -38,8 +39,8 @@ function runWorker(scriptPath: string, ledger: string, worker: string, rounds: n
   })
 }
 
-describe('ledger concurrency (P1-7, real cross-process)', () => {
-  it('two processes racing create/close keep the ledger conserved and intact', async () => {
+describe('ledger authority (M5 — one writer by construction)', () => {
+  it('two processes racing the same ledger: exactly ONE may write it', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-race-'))
     const ledger = path.join(dir, 'hub-spaces.json')
     const scriptPath = path.join(dir, 'worker.ts')
@@ -50,24 +51,31 @@ describe('ledger concurrency (P1-7, real cross-process)', () => {
       runWorker(scriptPath, ledger, 'a', rounds),
       runWorker(scriptPath, ledger, 'b', rounds),
     ])
+    // Both processes exit cleanly: the loser is not crashed, it is READ-ONLY
+    // (and says so), because two writers is the thing M5 removed.
     expect(a.code).toBe(0)
     expect(b.code).toBe(0)
 
-    // The ledger parses (no torn write) and no lock/tmp debris is left behind.
-    const final = JSON.parse(fs.readFileSync(ledger, 'utf-8')) as {
-      spaces: Record<string, unknown>
-      deletedSpaces: string[]
-    }
-    const debris = fs.readdirSync(dir).filter((f) => f !== 'hub-spaces.json' && f !== 'worker.ts')
-    expect(debris).toEqual([])
+    const losers = [a, b].filter((w) => w.stderr.includes('read-only for this process'))
+    const winners = [a, b].filter((w) => !w.stderr.includes('read-only for this process'))
+    expect(winners).toHaveLength(1)
+    expect(losers).toHaveLength(1)
 
-    // Conservation: every created space is either alive or tombstoned, and
-    // the two sets are disjoint — close tombstones were never lost to a
-    // concurrent merge, and no closed space was resurrected.
-    const alive = new Set(Object.keys(final.spaces))
-    const dead = new Set(final.deletedSpaces ?? [])
-    const total = 2 * rounds
-    expect(alive.size + dead.size).toBe(total)
-    for (const id of dead) expect(alive.has(id)).toBe(false)
+    // The ledger parses, holds ONLY the winner's spaces (the loser's never
+    // landed — it was read-only), and leaves no lock/tmp/authority debris.
+    const final = JSON.parse(fs.readFileSync(ledger, 'utf-8')) as {
+      spaces: Record<string, { owner: string }>
+    }
+    const winnerId = /WORKER-DONE (\w+)/.exec(winners[0].stderr)?.[1]
+    expect(winnerId).toBeTruthy()
+    const owners = new Set(Object.values(final.spaces).map((s) => s.owner))
+    expect(owners.size).toBeGreaterThan(0)
+    for (const owner of owners) {
+      expect(owner.startsWith(`w${winnerId}-`)).toBe(true)
+    }
+    const debris = fs
+      .readdirSync(dir)
+      .filter((f) => f !== 'hub-spaces.json' && f !== 'worker.ts')
+    expect(debris).toEqual([])
   }, 60_000)
 })

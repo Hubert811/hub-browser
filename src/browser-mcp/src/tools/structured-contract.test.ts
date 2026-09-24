@@ -257,7 +257,9 @@ describe('browser tool structured contract', () => {
         'tab_groups.close': ['groupId'],
         history: ['count', 'entries'],
         navigate: ['page', 'url'],
-        snapshot: ['contentLength', 'page', 'tokenEstimate', 'writtenToFile'],
+        // P7-B S1 — `scope` defaults to viewport and is echoed back, so it is
+        // part of the pinned snapshot key set (deliberate pin update).
+        snapshot: ['contentLength', 'page', 'scope', 'tokenEstimate', 'writtenToFile'],
         diff: ['added', 'changed', 'removed'],
         act: ['changed', 'kind'],
         download: ['filename', 'page', 'path', 'ref'],

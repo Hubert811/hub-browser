@@ -30,7 +30,11 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { withLedgerLock } from './ledger-lock.js'
+import {
+  claimLedgerAuthority,
+  describeAuthority,
+  releaseLedgerAuthority,
+} from './ledger-authority.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -73,14 +77,41 @@ export interface TabLike {
   url?: string
   title?: string
   isActive?: boolean
+  /** Owning browser window. Already present at runtime (`PageInfo.windowId`);
+   *  the window guard (P7-H H5) derives a window's ownership from the ledger
+   *  membership of the tabs inside it, so it must be typed here. */
+  windowId?: number
   /** True while the tab is still loading — busy-but-healthy, must not fail
    * the F16 restore health probe. */
   isLoading?: boolean
+  /**
+   * M3 — the PERSISTED tab id this live tab was restored from, when the
+   * browser can say so.
+   *
+   * This is the one thing no client outside the browser can reconstruct:
+   * `tabId` and `targetId` both die with the browser run, and Chromium's
+   * session restore gives the restored WebContents a NEW SessionID while the
+   * persisted session data still carries the OLD one. A browser that surfaces
+   * that mapping turns cross-restart rebinding from a URL GUESS into evidence.
+   *
+   * Absent on a browser that does not report it — every reader must degrade to
+   * the URL heuristics, never assume it exists. See `restore()` strategy 0b.
+   */
+  restoredFromTabId?: number
 }
 
 /** One tab attributed to a space (ledger). */
 export interface TabRef {
   pageId: number
+  /**
+   * M2 — the browser's OWN tab identity (Chromium `SessionID`), and therefore
+   * the ledger's primary anchor. `pageId` is a per-connection counter that
+   * means nothing outside the connection that minted it; `tabId` is what the
+   * browser itself uses (`Browser.getTabInfo` / `closeTab` / `activeTabId`),
+   * is immutable for the life of the tab, and exists for every live tab. It is
+   * unique only within one browser run — see `targetId` and `restore()`.
+   */
+  tabId?: number
   /**
    * Stable tab identity (CDP targetId). pageId is a per-connection sequence
    * number — it drifts across process restarts, so a ledger reconciled by
@@ -99,7 +130,28 @@ export interface TabRef {
    * daemon/MCP start re-attaches or re-opens them exactly once (Phase 3 A).
    */
   restored?: boolean
+  /**
+   * P7-H1 — the window this tab was observed in. Advisory, exactly like pageId:
+   * window ids drift across browser restarts, so this is re-bound by restore()
+   * and never used as a matching key.
+   */
+  windowId?: number
+  /**
+   * P7-A — durable page label (ego semantics: `p1`, `p2`, … per space). The
+   * cross-process handle an agent uses instead of a pageId, which drifts.
+   * Assigned when the tab enters the space and kept across restores.
+   */
+  label?: string
+  /**
+   * P7-A — origin attribution, stamped when the tab is first recorded and never
+   * rewritten (ego: conservative and immutable). `unknown` means "not provably
+   * ours" and is treated as user-owned when deciding what may be closed.
+   */
+  openedBy?: TabOrigin
 }
+
+/** Where a tab came from — see TabRef.openedBy. */
+export type TabOrigin = 'agent' | 'unknown'
 
 /** Persisted per-space record. */
 export interface SpaceRecord {
@@ -112,14 +164,26 @@ export interface SpaceRecord {
   lastActiveAt: number
   /** When restore() last reconciled this space's tabs with the live browser. */
   restoredAt?: number
-  tabs: TabRef[]
   /**
-   * D5 (2026-08-03): the browser tab group this space is projected onto
-   * (title = space name, color = deterministicColor(id)). Absent until the
-   * first tab is wired into a group. Persisted with the ledger so a restarted
-   * daemon/MCP reuses the same group instead of creating a duplicate.
+   * P7-H1 — the space's own window, created lazily by the first open_tab
+   * (`Browser.createWindow` always brings one tab, so the window is created
+   * with the tab the caller wanted). Advisory: verified against windowList()
+   * before reuse and re-created when it is gone.
    */
-  tabGroupId?: string
+  windowId?: number
+  /**
+   * P7-A — the tab the user was on at the last handoff boundary (ego
+   * `userPage()`). Captured when the agent hands the space over / the user
+   * confirms control, and it is the ONE place where a tab outside the agent's
+   * control may expose url/title: handing the space over IS the consent.
+   */
+  handoffPage?: {
+    pageId: number
+    label?: string
+    url?: string
+    title?: string
+  }
+  tabs: TabRef[]
 }
 
 /** Public (JSON-safe) space shape returned by the API. */
@@ -132,17 +196,18 @@ export interface SpaceInfo {
   createdAt: string
   lastActiveAt: string
   tabIds: number[]
-  /**
-   * D5 (2026-08-03): the browser tab group this space is projected onto
-   * (same value as SpaceRecord.tabGroupId). Absent until the first tab is
-   * wired into a group. Exposed so CLI/MCP consumers (`space current --json`
-   * etc.) can surface it without reading the raw ledger.
-   */
-  tabGroupId?: string
+  /** P7-H1 — the space's own window, when it has one. */
+  windowId?: number
 }
 
 export interface SpaceTabInfo {
   pageId: number
+  /** P7-A — durable page label (`p1`, `p2`, …) — see TabRef.label. */
+  label?: string
+  /** P7-A — origin attribution — see TabRef.openedBy. */
+  openedBy?: TabOrigin
+  /** M2 — the browser's own tab identity — see TabRef.tabId. */
+  tabId?: number
   /** Stable tab identity (present when known) — see TabRef.targetId. */
   targetId?: string
   url: string
@@ -159,8 +224,50 @@ export interface SpaceTabInfo {
   ageMs?: number
 }
 
-/** URL-reuse matching modes (ego openOrReuseTab semantics). */
-export type TabUrlReuseMode =
+/**
+ * P7-A follow-up — a live tab inside the space's own window that the ledger
+ * does NOT know about (the user dragged it in, or it is another agent's).
+ *
+ * Identity only, deliberately: hub's P1-5 posture is that a tab which is not
+ * ours exposes WHO holds it, never WHAT is in it (`tabs view=all` strips
+ * url/title for the same reason). `adopt` is the consent boundary — once the
+ * tab is in the ledger its url/title become readable, and the ledger records
+ * that the agent took responsibility for it (`openedBy: 'unknown'`).
+ */
+export interface UnmanagedTabInfo {
+  unmanaged: true
+  pageId: number
+  targetId?: string
+  isActive?: boolean
+}
+
+/** One row of the window-scoped listing: ours (ledger) or merely present. */
+export type SpaceWindowTabInfo = SpaceTabInfo | UnmanagedTabInfo
+
+/** True for the P1-5 identity-only rows. */
+export function isUnmanagedTab(
+  tab: SpaceWindowTabInfo,
+): tab is UnmanagedTabInfo {
+  return (tab as UnmanagedTabInfo).unmanaged === true
+}
+
+/**
+ * Result of the window-scoped listing.
+ *
+ * `scope: 'window'` — the space's window was resolved, so `tabs` is every live
+ * tab in it (ledger rows + `unmanaged` rows). `scope: 'ledger-only'` — the
+ * window could not be resolved (no ledger windowId AND no live managed tab
+ * carrying one), so the listing degrades to exactly `listTabs()`: we must
+ * never guess a boundary, because guessing wrong is how a stranger's tab gets
+ * reported as ours.
+ */
+export interface SpaceWindowTabs {
+  tabs: SpaceWindowTabInfo[]
+  windowId?: number
+  scope: 'window' | 'ledger-only'
+}
+
+/** URL-reuse matching modes (ego openOrReuseTab semantics). */export type TabUrlReuseMode =
   | 'exact'
   | 'origin'
   | 'origin+path'
@@ -172,6 +279,29 @@ export interface OpenTabResult {
   pageId: number
   /** true when an existing tab in the space matched and was switched to. */
   reused: boolean
+  /** P7-A — the durable page label (`p1`, `p2`, …) of the tab. */
+  label?: string
+  /**
+   * The tab's CDP target id, when known. Callers that hold a long-lived page
+   * handle (the CLI's `browser open` → `browser <session> state`) need it to
+   * REBIND to the tab they just opened: the tab lives in the space's window,
+   * which is usually not the window their handle was connected to.
+   */
+  targetId?: string
+}
+
+/**
+ * P7-A — `finish` receipt (ego shape): what was kept, what was closed, and how
+ * many tabs in the window were left alone because they are not ours.
+ */
+export interface FinishReceipt {
+  spaceId: string
+  /** True when the space left the ledger (nothing remained to keep). */
+  closedSpace: boolean
+  keptLabels: string[]
+  closedLabels: string[]
+  /** Live tabs in the space's window that are not in the ledger (the user's). */
+  preservedUnmanagedCount: number
 }
 
 /** One tab before/after a space recycle (old pageId → reopened pageId, same URL). */
@@ -213,7 +343,7 @@ export interface ReapEviction {
 export interface SpaceTabGateway {
   newTab(
     url: string,
-    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+    opts?: { background?: boolean; windowId?: number },
   ): Promise<string | number | undefined>
   closeTab(target: number | string): Promise<void>
   listTabs(): Promise<TabLike[]>
@@ -230,29 +360,26 @@ export interface SpaceTabGateway {
    * (e.g. UnifiedPage.selectTab). Optional — callers must tolerate absence.
    */
   activate?(target: number | string): Promise<void>
+  /**
+   * P7-H1 — window family. All optional: a gateway without it degrades to the
+   * legacy shared-window behaviour (every space's tabs in one window), which is
+   * exactly what a browser without the CDP window commands gives us.
+   */
+  windowList?(): Promise<WindowLike[]>
+  /** Creates a window WITH one tab at `url` (Chromium always adds one tab). */
+  windowCreate?(opts?: { url?: string }): Promise<WindowLike | undefined>
+  windowClose?(windowId: number): Promise<void>
+  windowActivate?(windowId: number): Promise<void>
+  /** P7-H2 — physically move a tab into another window (cross-window move). */
+  moveTab?(target: number | string, windowId: number): Promise<void>
+}
 
-  // ── D5 (2026-08-03): space ↔ tab group 双向同步 — tab-group capability family ──
-  //
-  // Every method is OPTIONAL: a browser/provider without tab-group support
-  // simply lacks the method, and callers must tolerate absence (best-effort,
-  // silent degradation — tab attribution never depends on group success).
-  // `tabGroupList` returns the raw Browser.getTabGroups group objects
-  // ({ groupId, title, color, collapsed, tabIds: tabId[], windowId });
-  // `tabGroupCreate` returns the created group or undefined.
-  tabGroupList?(): Promise<unknown[]>
-  tabGroupCreate?(
-    pages: number[],
-    title?: string,
-  ): Promise<
-    | { groupId?: string; tabIds?: number[]; title?: string; color?: string }
-    | undefined
-  >
-  tabGroupAddTabs?(groupId: string, pages: number[]): Promise<void>
-  tabGroupUpdate?(
-    groupId: string,
-    opts: { title?: string; color?: string; collapsed?: boolean },
-  ): Promise<unknown>
-  tabGroupClose?(groupId: string): Promise<void>
+/** Live browser window shape (subset of the CDP WindowInfo hub uses). */
+export interface WindowLike {
+  windowId: number
+  tabCount?: number
+  isActive?: boolean
+  isVisible?: boolean
 }
 
 export type SpaceGuardErrorCode =
@@ -266,6 +393,21 @@ export type SpaceGuardErrorCode =
   | 'not-configured'
   | 'tab-resolve-failed'
   | 'not-handed-off'
+  | 'tab-agent-owned'
+  | 'label-taken'
+  /**
+   * P7-H H5 — a window-addressed mutation (windows close/activate) whose tabs
+   * are not all in the agent's current space.
+   */
+  | 'window-not-in-space'
+  /**
+   * P7-F / D-P9 — a group-addressed mutation (`tab_groups update`/`close`,
+   * `hub browser group update/close`) whose member tabs are not all in the
+   * agent's current space. Replaces the deleted projection-based guard: a tab
+   * group is no longer "the space's group", so control is proven from ledger
+   * ownership of every member tab instead.
+   */
+  | 'group-not-in-space'
 
 export class SpaceGuardError extends Error {
   readonly code: SpaceGuardErrorCode
@@ -296,15 +438,15 @@ export type SpaceEventType =
   | 'space.closed'
   | 'space.tabs_recycled'
   /**
-   * P1-7 方向 B (D5 v2) — drag signals. Chrome tab groups are a VISUAL
-   * PROJECTION of ledger ownership; dragging a tab in/out of a group NEVER
-   * mutates the ledger anymore. Reconcile detects membership changes and
-   * emits these signals so orchestration layers (or a future cross-process
-   * bus) can react; the only path that moves ownership is the explicit
-   * transferTab() API.
+   * M1 follow-up — the space's TAB SET changed (opened / closed / adopted /
+   * released / transferred / reconciled). Without this the push feed was deaf
+   * to the single most common change there is: `space.open_tab` emitted
+   * nothing, so a Space UI subscribed to /spaces/stream would keep showing a
+   * stale tab count until some unrelated event happened to fire.
+   *
+   * `urls` carries the new tab COUNT (see SpaceEvent.urls).
    */
-  | 'tab.dragged_in'
-  | 'tab.dragged_out'
+  | 'space.tabs_changed'
 
 export interface SpaceEvent {
   type: SpaceEventType
@@ -315,14 +457,6 @@ export interface SpaceEvent {
   ownership?: SpaceOwnership
   /** Number of tabs involved (e.g. space.tabs_recycled carries the recycled count). */
   urls?: number
-  /**
-   * P1-7 方向 B — drag-signal payload (tab.dragged_in / tab.dragged_out):
-   * the page that changed group membership, its best-known url, and the
-   * space whose ledger still owns it (undefined = unclaimed tab).
-   */
-  pageId?: number
-  url?: string
-  ledgerSpaceId?: string
   timestamp: number
 }
 
@@ -331,6 +465,12 @@ export type SpaceEventListener = (event: SpaceEvent) => void
 /** 简单进程内事件总线 (骨架; 跨进程推送不在本阶段范围). */
 export class SpaceEventBus {
   private readonly listeners = new Map<SpaceEventType, Set<SpaceEventListener>>()
+  /**
+   * P7-C — wildcard subscribers. The daemon's SSE feed needs EVERY change, not
+   * one type at a time: enumerating the seven types at the call site would
+   * silently stop covering a type the day an eighth is added.
+   */
+  private readonly anyListeners = new Set<SpaceEventListener>()
 
   on(type: SpaceEventType, listener: SpaceEventListener): () => void {
     let set = this.listeners.get(type)
@@ -342,12 +482,23 @@ export class SpaceEventBus {
     return () => this.off(type, listener)
   }
 
+  /** Subscribe to every event type; returns the unsubscribe function. */
+  onAny(listener: SpaceEventListener): () => void {
+    this.anyListeners.add(listener)
+    return () => {
+      this.anyListeners.delete(listener)
+    }
+  }
+
   off(type: SpaceEventType, listener: SpaceEventListener): void {
     this.listeners.get(type)?.delete(listener)
   }
 
   emit(event: SpaceEvent): void {
-    for (const listener of [...(this.listeners.get(event.type) ?? [])]) {
+    for (const listener of [
+      ...(this.listeners.get(event.type) ?? []),
+      ...this.anyListeners,
+    ]) {
       try {
         listener(event)
       } catch {
@@ -362,22 +513,112 @@ export class SpaceEventBus {
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface PersistedState {
-  version: 1
+  version: 4
   spaces: Record<string, SpaceRecord>
   currentSpaceByOwner: Record<string, string>
-  /**
-   * Cross-process close tombstones (Phase 3.3 dual-identity robustness).
-   *
-   * Space ids closed by any process. They are persisted so that a
-   * merge-on-save in another process never resurrects a space that was
-   * deliberately closed, even when that other process still holds a stale
-   * in-memory copy. Entries are low-volume UUIDs; not pruned because a
-   * process we cannot see may still hold the id in memory.
-   */
-  deletedSpaces?: string[]
 }
 
-export const SPACE_STORAGE_VERSION = 1
+/**
+ * Ledger schema version.
+ *
+ * v1 (D5, 2026-08-03) projected every space onto a Chrome tab group and
+ * persisted the projection as `SpaceRecord.tabGroupId`.
+ * v2 (P7-F, decision D-P9) removes that projection: the ledger is the single
+ * source of truth and Chrome tab groups are an ordinary browser feature hub
+ * does not tie to spaces.
+ * v3 (M2, space-ledger-architecture.md L2) anchors tab identity on the
+ * browser's own `tabId` (Chromium SessionID) instead of hub's connection-local
+ * `pageId`. No field is dropped or rewritten: `tabId` is additive and a v2 ref
+ * simply lacks it, which `restore()` fills in on its next pass. The version is
+ * stamped anyway because the SEMANTICS of the stored fields changed — a v2-era
+ * reader would ignore `tabId` and reconcile by `pageId`, which is exactly the
+ * misbinding this version exists to stop.
+ * v4 (M5) drops `deletedSpaces`. Those tombstones existed so a merge-on-save in
+ * another process could not resurrect a space this one closed — and M5 removed
+ * the second writer (the daemon owns the ledger; `hub --mcp` is its client), so
+ * there is nothing left to merge with. The field is dropped on read.
+ */
+export const SPACE_STORAGE_VERSION = 4
+
+/** P7-C bridge — how long the UI snapshot waits for a live tab probe. */
+const UI_SNAPSHOT_PROBE_TIMEOUT_MS = 2_000
+
+/** True when a raw ledger space object still carries the dropped v1 field. */
+function carriesTabGroupId(value: unknown): boolean {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    'tabGroupId' in (value as Record<string, unknown>)
+  )
+}
+
+/**
+ * v1 → v2 ledger migration (P7-F / decision D-P9).
+ *
+ * Trigger — EITHER is enough:
+ *   - the file says `version: 1` (the projection era), or its `version` is
+ *     missing / not a number (the pre-versioning shape);
+ *   - any space still carries `tabGroupId`, whatever the version claims.
+ * A v2 file with no such field is a no-op.
+ *
+ * What it does: drops `SpaceRecord.tabGroupId` from every space and returns the
+ * state stamped as version 2. Everything else rides through untouched — this
+ * pass migrates ONE field, it does not validate the rest of the ledger, so
+ * unknown/older shapes are tolerated instead of throwing. Idempotent: running
+ * it again on its own output changes nothing, which is what lets a migrated
+ * file round-trip through merge-on-save without the field creeping back.
+ *
+ * Every disk read goes through here (`readRaw()`), so the migration applies to
+ * `load()` and the legacy-ledger import alike — both
+ * paths that previously ignored `raw.version` entirely.
+ */
+function migratePersistedState(raw: unknown): Partial<PersistedState> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const state = raw as {
+    version?: unknown
+    spaces?: unknown
+    currentSpaceByOwner?: unknown
+    deletedSpaces?: unknown
+  }
+  const rawSpaces = state.spaces
+  if (!rawSpaces || typeof rawSpaces !== 'object' || Array.isArray(rawSpaces)) {
+    return {}
+  }
+  const entries = Object.entries(rawSpaces as Record<string, unknown>)
+  const version = typeof state.version === 'number' ? state.version : undefined
+  const legacy =
+    version !== SPACE_STORAGE_VERSION || entries.some(([, v]) => carriesTabGroupId(v))
+  // v4 drops `deletedSpaces` — but the ids it named were CLOSED, so they must
+  // be applied one last time on the way in. Dropping the list without applying
+  // it would resurrect every space any past version had tombstoned.
+  const tombstoned = new Set(
+    Array.isArray(state.deletedSpaces)
+      ? state.deletedSpaces.filter((v): v is string => typeof v === 'string')
+      : [],
+  )
+  const spaces: Record<string, SpaceRecord> = {}
+  for (const [id, value] of entries) {
+    if (tombstoned.has(id)) continue
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    if (legacy) {
+      const { tabGroupId: _dropped, ...rest } = value as Record<string, unknown>
+      spaces[id] = rest as unknown as SpaceRecord
+    } else {
+      spaces[id] = value as unknown as SpaceRecord
+    }
+  }
+  return {
+    version: SPACE_STORAGE_VERSION,
+    spaces,
+    currentSpaceByOwner:
+      state.currentSpaceByOwner &&
+      typeof state.currentSpaceByOwner === 'object' &&
+      !Array.isArray(state.currentSpaceByOwner)
+        ? (state.currentSpaceByOwner as Record<string, string>)
+        : {},
+  }
+}
 
 /**
  * Single user-data root (方案 C): `~/.hub` by default, overridable via
@@ -403,6 +644,33 @@ export function defaultStoragePath(): string {
 }
 
 /**
+ * M1 — the process-wide space authority seam (decision L1).
+ *
+ * A host that owns the ledger for a whole process installs its manager here so
+ * that EVERY in-process consumer — MCP sessions, `/command` CLI runs, the HTTP
+ * feeds — reads one in-memory truth instead of each building a private view
+ * over the same file. That private-view-per-consumer shape is precisely what
+ * forced locks, merge-on-save and close tombstones into the storage layer.
+ *
+ * Processes that own no ledger (a standalone CLI invocation, a `hub --mcp`
+ * stdio server) leave this unset and keep the per-caller manager: they are
+ * clients of the file, not authorities over it.
+ */
+let processAuthority: TaskSpaceManager | undefined
+
+/** Install (or clear) this process's space authority. */
+export function setProcessSpaceManager(
+  manager: TaskSpaceManager | undefined,
+): void {
+  processAuthority = manager
+}
+
+/** The authority installed by this process's host, when there is one. */
+export function processSpaceManager(): TaskSpaceManager | undefined {
+  return processAuthority
+}
+
+/**
  * One-time migration: when the new ledger (`targetPath`) does not exist yet and
  * the legacy `~/.opencli/hub-spaces.json` ledger does, fold the legacy content
  * into the new ledger using the same merge-on-save shape and the same atomic
@@ -419,31 +687,31 @@ export function migrateLegacyLedger(
   // processes can both see "no ledger yet" and the slower rename then
   // clobbers state the faster one already merged in. Serialize under the
   // ledger lock and re-check inside the critical section.
-  return withLedgerLock(targetPath, () => {
-    try {
-      if (fs.existsSync(targetPath)) return false
-      if (!fs.existsSync(legacyPath)) return false
-      const raw = JSON.parse(fs.readFileSync(legacyPath, 'utf-8')) as Partial<PersistedState>
-      if (!raw || typeof raw !== 'object') return false
-      const deleted = new Set(raw.deletedSpaces ?? [])
-      const spaces = Object.fromEntries(
-        Object.entries(raw.spaces ?? {}).filter(([id]) => !deleted.has(id)),
-      )
-      const merged: PersistedState = {
-        version: SPACE_STORAGE_VERSION,
-        spaces,
-        currentSpaceByOwner: raw.currentSpaceByOwner ?? {},
-        deletedSpaces: raw.deletedSpaces ?? [],
-      }
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true })
-      const tmp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`
-      fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf-8')
-      fs.renameSync(tmp, targetPath)
-      return true
-    } catch {
-      return false
+  try {
+    // Defence in depth for the constructor's empty-path guard: an empty
+    // target would put the staging file in the process CWD.
+    if (!targetPath) return false
+    if (fs.existsSync(targetPath)) return false
+    if (!fs.existsSync(legacyPath)) return false
+    const raw = JSON.parse(fs.readFileSync(legacyPath, 'utf-8')) as unknown
+    // The legacy file is a v1-era ledger by definition — run it through the
+    // same migration as any other disk read so the imported spaces land in the
+    // current schema (no `tabGroupId`, no tombstones).
+    const migrated = migratePersistedState(raw)
+    if (!migrated.spaces) return false
+    const imported: PersistedState = {
+      version: SPACE_STORAGE_VERSION,
+      spaces: migrated.spaces,
+      currentSpaceByOwner: migrated.currentSpaceByOwner ?? {},
     }
-  })
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true })
+    const tmp = `${targetPath}.${process.pid}.${randomUUID()}.tmp`
+    fs.writeFileSync(tmp, JSON.stringify(imported, null, 2), 'utf-8')
+    fs.renameSync(tmp, targetPath)
+    return true
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -499,96 +767,26 @@ function resolveReapTtl(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Deterministic tab-group color (3.4)
-// ─────────────────────────────────────────────────────────────────────────────
-
-export const TAB_GROUP_COLORS = [
-  'grey',
-  'blue',
-  'red',
-  'yellow',
-  'green',
-  'pink',
-  'purple',
-  'cyan',
-  'orange',
-] as const
-
-/**
- * D5 — hard bound on one lazy tab-group reconcile pass. An unreachable browser
- * can make the provider gateway's connect() take CDP_CONNECT (10s); the sync
- * is best-effort and must never block space reads / the page guard / open.
- */
-export const TAB_GROUP_SYNC_TIMEOUT_MS = 1000
-
-export function deterministicColor(seed: string): string {
-  let hash = 0
-  for (let i = 0; i < seed.length; i++) {
-    hash = (hash * 31 + seed.charCodeAt(i)) | 0
-  }
-  return TAB_GROUP_COLORS[Math.abs(hash) % TAB_GROUP_COLORS.length]
-}
-
-/** Raw tab-group shape returned by Browser.getTabGroups (subset we read). */
-interface LiveTabGroup {
-  groupId?: string
-  title?: string
-  color?: string
-  collapsed?: boolean
-  tabIds?: Array<string | number>
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Gateways (UnifiedPage / provider adapters)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type PageLike = {
   newTab?(
     url?: string,
-    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+    opts?: { background?: boolean; windowId?: number },
   ): Promise<string | number | undefined>
   closeTab?(target: number | string): Promise<void>
   tabs?(): Promise<unknown[]>
   selectTab?(target: number | string): Promise<void>
   /** F16 — bounded health probe (zombie-renderer detection) for one tab. */
   probeTab?(target: number | string): Promise<boolean>
-  // D5 — optional tab-group surface (UnifiedPage). Pages that cannot group
-  // tabs omit these; the gateway then omits the corresponding methods.
-  tabGroupList?(): Promise<unknown[]>
-  tabGroupCreate?(pages: number[], title?: string): Promise<unknown>
-  addTabsToGroup?(pages: number[], groupId: string): Promise<void>
-  tabGroupUpdate?(
-    groupId: string,
-    opts: { title?: string; color?: string; collapsed?: boolean },
-  ): Promise<unknown>
-  tabGroupClose?(groupId: string): Promise<void>
-}
-
-/** D5 — expose exactly the tab-group methods a page supports (absent → omitted). */
-function pageTabGroupMethods(page: PageLike): Partial<SpaceTabGateway> {
-  const methods: Partial<SpaceTabGateway> = {}
-  if (page.tabGroupList) {
-    methods.tabGroupList = () => page.tabGroupList!()
-  }
-  if (page.tabGroupCreate) {
-    methods.tabGroupCreate = (pages, title) =>
-      page.tabGroupCreate!(pages, title) as Promise<
-        | { groupId?: string; tabIds?: number[]; title?: string; color?: string }
-        | undefined
-      >
-  }
-  if (page.addTabsToGroup) {
-    methods.tabGroupAddTabs = async (groupId, pages) => {
-      await page.addTabsToGroup!(pages, groupId)
-    }
-  }
-  if (page.tabGroupUpdate) {
-    methods.tabGroupUpdate = (groupId, opts) => page.tabGroupUpdate!(groupId, opts)
-  }
-  if (page.tabGroupClose) {
-    methods.tabGroupClose = (groupId) => page.tabGroupClose!(groupId)
-  }
-  return methods
+  /** P7-H1 — optional window family; absent → shared-window behaviour.
+   *  Typed loosely like `tabs?()` — the gateway narrows to WindowLike. */
+  windowList?(): Promise<unknown[]>
+  windowCreate?(opts?: { url?: string }): Promise<unknown>
+  windowClose?(windowId: number): Promise<void>
+  windowActivate?(windowId: number): Promise<void>
+  moveTab?(target: number | string, windowId: number): Promise<void>
 }
 
 type ProviderLike = {
@@ -631,8 +829,30 @@ export function gatewayFromPage(page: PageLike): SpaceTabGateway {
           },
         }
       : {}),
-    // D5 — pass through the tab-group family the page supports (best-effort).
-    ...pageTabGroupMethods(page),
+    ...(page.windowList
+      ? { windowList: async () => (await page.windowList!()) as WindowLike[] }
+      : {}),
+    ...(page.windowCreate
+      ? {
+          windowCreate: async (opts?: { url?: string }) =>
+            (await page.windowCreate!(opts)) as WindowLike | undefined,
+        }
+      : {}),
+    ...(page.windowClose
+      ? { windowClose: async (windowId: number) => page.windowClose!(windowId) }
+      : {}),
+    ...(page.windowActivate
+      ? {
+          windowActivate: async (windowId: number) =>
+            page.windowActivate!(windowId),
+        }
+      : {}),
+    ...(page.moveTab
+      ? {
+          moveTab: async (target: number | string, windowId: number) =>
+            page.moveTab!(target, windowId),
+        }
+      : {}),
   }
 }
 
@@ -674,51 +894,59 @@ export function gatewayFromProvider(provider: ProviderLike): SpaceTabGateway {
       const page = await provider.connect()
       if (page.selectTab) await page.selectTab(target)
     },
-    // D5 — tab-group family, connect-lazy like the rest of the provider
-    // gateway. Every call is best-effort: a page/provider without the
-    // capability no-ops (empty list / undefined / no-op) instead of throwing,
-    // so tab attribution never depends on group support.
-    tabGroupList: async () => {
-      try {
-        const page = await provider.connect()
-        return (await page.tabGroupList?.()) ?? []
-      } catch {
-        return []
+    // P7-H1 window family — MIRRORS gatewayFromPage. It was missing here, and
+    // every MCP path (stdio `hub --mcp` AND the daemon's HTTP sessions) builds
+    // its gateway with gatewayFromProvider: so per-space windows silently
+    // degraded to the legacy shared window for all agent traffic, while the
+    // live smoke (which uses gatewayFromPage) passed. The window model only
+    // ever worked on the CLI/restore path.
+    //
+    // Each accessor re-resolves the page: the provider owns the connection
+    // lifecycle and may reconnect between calls.
+    windowList: async () => {
+      const page = await provider.connect()
+      if (!page.windowList) {
+        throw new SpaceGuardError(
+          'no-gateway',
+          'browser provider does not support listing windows',
+        )
       }
+      return (await page.windowList()) as WindowLike[]
     },
-    tabGroupCreate: async (pages, title) => {
-      try {
-        const page = await provider.connect()
-        return (await page.tabGroupCreate?.(pages, title)) as
-          | { groupId?: string; tabIds?: number[]; title?: string; color?: string }
-          | undefined
-      } catch {
-        return undefined
+    windowCreate: async (opts) => {
+      const page = await provider.connect()
+      if (!page.windowCreate) {
+        throw new SpaceGuardError(
+          'no-gateway',
+          'browser provider does not support creating windows',
+        )
       }
+      return (await page.windowCreate(opts)) as WindowLike | undefined
     },
-    tabGroupAddTabs: async (groupId, pages) => {
-      try {
-        const page = await provider.connect()
-        await page.addTabsToGroup?.(pages, groupId)
-      } catch {
-        // Best-effort — a failed group write never breaks tab attribution.
+    windowClose: async (windowId) => {
+      const page = await provider.connect()
+      if (!page.windowClose) {
+        throw new SpaceGuardError(
+          'no-gateway',
+          'browser provider does not support closing windows',
+        )
       }
+      await page.windowClose(windowId)
     },
-    tabGroupUpdate: async (groupId, opts) => {
-      try {
-        const page = await provider.connect()
-        return await page.tabGroupUpdate?.(groupId, opts)
-      } catch {
-        return undefined
-      }
+    windowActivate: async (windowId) => {
+      const page = await provider.connect()
+      if (!page.windowActivate) return
+      await page.windowActivate(windowId)
     },
-    tabGroupClose: async (groupId) => {
-      try {
-        const page = await provider.connect()
-        await page.tabGroupClose?.(groupId)
-      } catch {
-        // Best-effort — a failed group close never breaks space close.
+    moveTab: async (target, windowId) => {
+      const page = await provider.connect()
+      if (!page.moveTab) {
+        throw new SpaceGuardError(
+          'no-gateway',
+          'browser provider does not support moving tabs between windows',
+        )
       }
+      await page.moveTab(target, windowId)
     },
   }
 }
@@ -731,23 +959,22 @@ const EMPTY_STATE = (): PersistedState => ({
   version: SPACE_STORAGE_VERSION,
   spaces: {},
   currentSpaceByOwner: {},
-  deletedSpaces: [],
 })
 
 export class TaskSpaceManager {
   readonly events: SpaceEventBus | null
-  /**
-   * P1-7 方向 B — last observed group membership per space (pageId sets),
-   * in-memory per process. Membership DIFFS against this baseline are what
-   * emit tab.dragged_in/out; a cold start (no baseline) only records one.
-   * Deliberately not persisted: drag signals are ephemeral, and a restarted
-   * process must not replay the world as "changes".
-   */
-  private readonly lastGroupMembership = new Map<string, Set<number>>()
   private state: PersistedState
   private readonly storagePath: string | undefined
   private readonly gateway: SpaceTabGateway | undefined
   private readonly persist: boolean
+  /**
+   * M5 — this manager may write the ledger only when its PROCESS holds the
+   * authority for it (src/space/ledger-authority.ts). A manager that cannot
+   * claim (another live hub process owns the file) still serves reads — which
+   * is what an inspecting caller wants — but never writes, so two authorities
+   * cannot silently drop each other's spaces.
+   */
+  private readonly readOnly: boolean
   /** D8 — TTL reaper on/off (options.reap.enabled === false or HUB_SPACE_REAP=off → off). */
   private readonly reapEnabled: boolean
   /** D8 — Tier 1 empty-space idle TTL (ms). */
@@ -764,18 +991,58 @@ export class TaskSpaceManager {
     number,
     { ops: number; openedAt: number }
   >()
+  /**
+   * P7-C — external-writer convergence for the daemon's `/spaces/stream` feed.
+   *
+   * The daemon owns the ledger, but not every writer goes through it yet (a
+   * `hub --mcp` stdio server, a direct CLI invocation). Those changes are not
+   * on this process's event bus, so the file itself has to be watched. The
+   * callback is invoked AFTER the state has been re-read, so a subscriber can
+   * immediately render the new truth.
+   */
+  private storageWatcher: fs.FSWatcher | undefined
+  private storageWatchCallback: (() => void) | undefined
+  /**
+   * The exact JSON this manager last wrote. An fs event whose content matches
+   * is our OWN save, not an external change — without this every local write
+   * would re-enter as a spurious "reloaded" notification.
+   */
+  private lastPersistedJson: string | undefined
 
   constructor(options: TaskSpaceManagerOptions = {}) {
-    this.storagePath = options.storagePath ?? defaultStoragePath()
+    const configuredPath = options.storagePath
+    this.storagePath = configuredPath ?? defaultStoragePath()
     // One-time legacy migration: only when this manager is using the default
     // ledger location (no HUB_SPACES_FILE / explicit temp override), so tests
     // with temp ledgers and opt-out deployments are never touched. Idempotent —
     // migrateLegacyLedger no-ops once the new path exists.
-    if (!options.storagePath || options.storagePath === defaultStoragePath()) {
+    //
+    // An EMPTY path means "no ledger file at all" and must be skipped: passing
+    // it through would write the migration's staging file into the process's
+    // CWD (observed as stray `.pid.uuid.tmp` dotfiles in the repo root, because
+    // `${''}.${pid}.${uuid}.tmp` has no directory component).
+    if (
+      this.storagePath &&
+      (configuredPath === undefined || configuredPath === defaultStoragePath())
+    ) {
       migrateLegacyLedger(this.storagePath)
     }
     this.gateway = options.gateway
     this.persist = options.persist ?? true
+    // Claim the ledger for this process. Failure is not fatal — reads stay
+    // useful — but writes are refused, loudly, once.
+    let readOnly = false
+    if (this.persist && this.storagePath) {
+      const claim = claimLedgerAuthority(this.storagePath)
+      if (claim.ok === false) {
+        readOnly = true
+        console.warn(
+          `[hub-spaces] another hub process owns this ledger (${describeAuthority(claim.holder)}) — ` +
+            `${this.storagePath} is read-only for this process; its space changes will NOT persist`,
+        )
+      }
+    }
+    this.readOnly = readOnly
     this.events = options.events === undefined ? new SpaceEventBus() : options.events
     // D8 — reap config: options.reap → env → defaults; HUB_SPACE_REAP=off
     // (or reap.enabled === false) disables the sweep entirely.
@@ -804,14 +1071,20 @@ export class TaskSpaceManager {
 
   // ── storage ──
 
-  /** Parse the ledger file without applying tombstones ({} when missing/corrupt). */
+  /**
+   * Parse the ledger file without applying tombstones ({} when missing/corrupt).
+   *
+   * Every read is normalized through migratePersistedState(): a v1 ledger (or
+   * any ledger still carrying `tabGroupId`) loads as the current version with
+   * the dropped projection field removed. This is the single choke point for
+   * the whole storage layer — load() and reload() both read through it,
+   * so no stale `tabGroupId` can survive a merge-on-save round-trip.
+   */
   private readRaw(): Partial<PersistedState> {
     if (!this.storagePath) return {}
     try {
       const raw = fs.readFileSync(this.storagePath, 'utf-8')
-      const parsed = JSON.parse(raw) as Partial<PersistedState>
-      if (!parsed || typeof parsed !== 'object' || !parsed.spaces) return {}
-      return parsed
+      return migratePersistedState(JSON.parse(raw))
     } catch {
       return {}
     }
@@ -819,102 +1092,130 @@ export class TaskSpaceManager {
 
   private load(): PersistedState {
     const raw = this.readRaw()
-    const deleted = new Set(raw.deletedSpaces ?? [])
-    const spaces = Object.fromEntries(
-      Object.entries(raw.spaces ?? {}).filter(([id]) => !deleted.has(id)),
-    )
+    const spaces = raw.spaces ?? {}
     return {
       version: SPACE_STORAGE_VERSION,
       spaces,
-      currentSpaceByOwner: raw.currentSpaceByOwner ?? {},
-      // Tombstones persist (never pruned): another process may still hold the
-      // id in memory, and its merge-on-save must not resurrect the space.
-      deletedSpaces: raw.deletedSpaces ?? [],
+      // bug #10 — a pointer must never name a space that is not there. The v4
+      // migration APPLIES the old tombstones, which can remove a space a
+      // pointer still names; a hand-edited or truncated file can too. This is
+      // the one choke point every read goes through, so filter here.
+      currentSpaceByOwner: Object.fromEntries(
+        Object.entries(raw.currentSpaceByOwner ?? {}).filter(
+          ([, id]) => spaces[id] !== undefined,
+        ),
+      ),
     }
   }
 
   /** Re-read the ledger from disk (跨进程/外部变更时使用). */
   reload(): void {
-    const fresh = this.load()
-    fresh.deletedSpaces = [
-      ...new Set([
-        ...(this.state.deletedSpaces ?? []),
-        ...(fresh.deletedSpaces ?? []),
-      ]),
-    ]
-    this.state = fresh
-  }
-
-  /**
-   * Merge-on-save (Phase 3.3 dual-identity robustness): instead of clobbering
-   * the shared file with this process's view, keep spaces/current-mappings the
-   * process has never seen (other agents' spaces written by other MCP/daemon
-   * processes) and apply close tombstones from memory AND disk. In-memory
-   * state stays authoritative for ids this process knows.
-   */
-  private mergeWithDisk(): PersistedState {
-    const disk = this.readRaw()
-    const deleted = new Set([
-      ...(this.state.deletedSpaces ?? []),
-      ...(disk.deletedSpaces ?? []),
-    ])
-    const spaces: Record<string, SpaceRecord> = {
-      ...(disk.spaces ?? {}),
-      ...this.state.spaces,
-    }
-    for (const id of deleted) delete spaces[id]
-    // bug #10: closeSpace deletes the owner's current-space pointer from
-    // memory, but disk may still hold the stale id — a naive merge would
-    // resurrect it (pointing at a space that no longer exists). Filter the
-    // merged map so every pointer targets a live, non-deleted space.
-    const currentSpaceByOwner = Object.fromEntries(
-      Object.entries({
-        ...(disk.currentSpaceByOwner ?? {}),
-        ...this.state.currentSpaceByOwner,
-      }).filter(([, id]) => !deleted.has(id) && spaces[id]),
-    )
-    return {
-      version: SPACE_STORAGE_VERSION,
-      spaces,
-      currentSpaceByOwner,
-      deletedSpaces: [
-        ...new Set([
-          ...(this.state.deletedSpaces ?? []),
-          ...(disk.deletedSpaces ?? []),
-        ]),
-      ],
-    }
+    this.state = this.load()
   }
 
   private save(): void {
     if (!this.persist || !this.storagePath) return
+    // Single writer by construction: a process that does not own the ledger
+    // must not write it (see the constructor).
+    if (this.readOnly) return
+    const json = JSON.stringify(this.state, null, 2)
     try {
       fs.mkdirSync(path.dirname(this.storagePath), { recursive: true })
-      // P1-7: serialize the read-merge-write critical section across processes,
-      // and use a unique tmp name so two concurrent saves never clobber each
-      // other's tmp file (with a fixed `.tmp` name P2's write can overwrite
-      // P1's before either renames — even though rename itself is atomic).
-      withLedgerLock(this.storagePath, () => {
-        const tmp = `${this.storagePath}.${process.pid}.${randomUUID()}.tmp`
+      const tmp = `${this.storagePath}.${process.pid}.${randomUUID()}.tmp`
+      try {
+        fs.writeFileSync(tmp, json, 'utf-8')
+        fs.renameSync(tmp, this.storagePath)
+        // Remember what WE wrote, so the storage watcher can tell our own save
+        // apart from an external writer's (see lastPersistedJson).
+        this.lastPersistedJson = json
+      } finally {
         try {
-          fs.writeFileSync(tmp, JSON.stringify(this.mergeWithDisk(), null, 2), 'utf-8')
-          fs.renameSync(tmp, this.storagePath)
-        } finally {
-          try {
-            fs.rmSync(tmp, { force: true })
-          } catch {
-            // already renamed away (or never written) — nothing to clean up
-          }
+          fs.rmSync(tmp, { force: true })
+        } catch {
+          // already renamed away (or never written) — nothing to clean up
         }
-      })
+      }
     } catch {
       // Ledger persistence is best-effort; in-memory state stays authoritative
       // for this process.
     }
   }
 
+  /**
+   * P7-C — converge on ledger changes written by a writer OUTSIDE this process
+   * (a `hub --mcp` stdio server, a direct CLI invocation). Those never reach
+   * this process's events, so the daemon's `/spaces/stream` feed would keep
+   * serving stale state without this.
+   *
+   * `onChange` fires AFTER the state has been re-read from disk. Best-effort
+   * throughout: no watcher available (unsupported FS, unwritable directory)
+   * simply means external writers are not pushed — reads stay correct because
+   * `reload()` is still available. Idempotent; the watcher is closed by
+   * `dispose()`.
+   */
+  watchStorage(onChange: () => void): void {
+    this.storageWatchCallback = onChange
+    if (this.storageWatcher || !this.storagePath) return
+    const dir = path.dirname(this.storagePath)
+    const base = path.basename(this.storagePath)
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+    } catch {
+      // Fall through: fs.watch will simply fail and be treated as "no watcher".
+    }
+    try {
+      // Watch the DIRECTORY, not the file: save() is an atomic tmp+rename, and
+      // the ledger often does not exist yet at daemon startup (watching a
+      // missing path throws ENOENT and would permanently disable the feed).
+      this.storageWatcher = fs.watch(dir, { persistent: false }, (_event, filename) => {
+        if (filename && filename !== base) return // our own .tmp write, etc.
+        this.onStorageChanged()
+      })
+      this.storageWatcher.unref?.()
+    } catch {
+      this.storageWatcher = undefined
+    }
+  }
+
+  /** One storage-watcher tick: re-read the file, then notify — self-writes skipped. */
+  private onStorageChanged(): void {
+    if (!this.storagePath) return
+    let raw: string
+    try {
+      raw = fs.readFileSync(this.storagePath, 'utf-8')
+    } catch {
+      return // deleted / mid-rename: the next event retries
+    }
+    if (raw === this.lastPersistedJson) return // our own save, not a change
+    try {
+      this.state = this.load()
+    } catch {
+      return // corrupt / partially written: never crash on someone else's file
+    }
+    this.lastPersistedJson = raw
+    try {
+      this.storageWatchCallback?.()
+    } catch {
+      // A throwing subscriber must never break the watcher.
+    }
+  }
+
   dispose(): void {
     this.save()
+    // Stop converging: the daemon may be shutting down while a subscriber is
+    // still attached, and a callback into a half-disposed manager is noise.
+    try {
+      this.storageWatcher?.close()
+    } catch {
+      // already closed
+    }
+    this.storageWatcher = undefined
+    // Refcounted ledger authority: drop this process's hold so a later process
+    // (or the same one re-constructed with the same storagePath) can claim it.
+    // Mirrors the deployed build — only when this instance actually writes.
+    if (this.persist && this.storagePath) {
+      releaseLedgerAuthority(this.storagePath)
+    }
   }
 
   // ── helpers ──
@@ -957,7 +1258,7 @@ export class TaskSpaceManager {
       createdAt: new Date(space.createdAt).toISOString(),
       lastActiveAt: new Date(space.lastActiveAt).toISOString(),
       tabIds: space.tabs.map((t) => t.pageId),
-      tabGroupId: space.tabGroupId,
+      ...(space.windowId !== undefined ? { windowId: space.windowId } : {}),
     }
   }
 
@@ -966,6 +1267,67 @@ export class TaskSpaceManager {
       if (space.tabs.some((t) => t.pageId === pageId)) return space
     }
     return undefined
+  }
+
+  /** The ledger ref that claims a pageId, whichever space holds it. */
+  private refForPage(pageId: number): TabRef | undefined {
+    for (const space of Object.values(this.state.spaces)) {
+      const ref = space.tabs.find((t) => t.pageId === pageId)
+      if (ref) return ref
+    }
+    return undefined
+  }
+
+  /**
+   * M2 follow-up — does this ledger ref actually DESCRIBE this live tab?
+   *
+   * M2 moved the ledger's stored identity onto the browser's own `tabId`, but
+   * the guards kept keying on `pageId` alone — and `pageId` is a per-connection
+   * counter. So a ref whose tab is gone could name whatever tab a NEW
+   * connection handed that number to: the QuickBI misbinding, reachable as a
+   * PRIVILEGE problem (the agent is allowed to read a stranger's tab, and
+   * `classifyTabsForAgent` even labels it `mine` and hands back its url).
+   *
+   *   true      — a comparable anchor (tabId / targetId) agrees
+   *   false     — POSITIVE disagreement: every anchor the two have in common
+   *               differs, so this is not the tab the ref describes
+   *   undefined — nothing to judge with (the ref or the live tab carries no
+   *               anchor at all): keep the legacy ledger-only decision
+   *
+   * Only anchors present on BOTH sides are compared — a gateway that reports
+   * one kind and not the other must not be read as a disagreement. The rule is
+   * deliberately asymmetric: refuse on positive evidence, never on absence of
+   * information (a flaky browser must not lock the agent out of its own tabs).
+   */
+  private refDescribesLiveTab(
+    ref: TabRef,
+    live: TabLike,
+  ): boolean | undefined {
+    const comparable: Array<[number | string, number | string]> = []
+    if (ref.tabId !== undefined && live.tabId !== undefined) {
+      comparable.push([ref.tabId, live.tabId])
+    }
+    if (ref.targetId !== undefined && live.targetId !== undefined) {
+      comparable.push([ref.targetId, live.targetId])
+    }
+    if (comparable.length === 0) return undefined
+    return comparable.some(([a, b]) => a === b)
+  }
+
+  /**
+   * Live corroboration for one pageId. Returns the live tab when it could be
+   * read, `undefined` when there is nothing to judge with (no gateway, or a
+   * list that cannot be read) — never throws.
+   */
+  private async liveTabForPage(pageId: number): Promise<TabLike | undefined> {
+    const gw = this.gateway
+    if (!gw) return undefined
+    try {
+      const live = await gw.listTabs()
+      return live.find((t) => t.pageId === pageId)
+    } catch {
+      return undefined
+    }
   }
 
   private spacesOwnedBy(owner: string): SpaceRecord[] {
@@ -1009,6 +1371,11 @@ export class TaskSpaceManager {
     if (space.ownership !== 'agent') {
       throw this.userControlling(space)
     }
+  }
+
+  /** The space's tab set changed — one signal, the frame carries the rest. */
+  private emitTabsChanged(space: SpaceRecord): void {
+    this.emit('space.tabs_changed', space, { urls: space.tabs.length })
   }
 
   private emit(
@@ -1072,17 +1439,12 @@ export class TaskSpaceManager {
   }
 
   async listSpaces(owner: string): Promise<SpaceInfo[]> {
-    // D5 — lazy reconcile before answering (human tab-group edits → ledger),
-    // scoped to this owner's spaces. No gateway → no-op.
-    await this.reconcileTabGroups(this.gateway, owner)
     return this.spacesOwnedBy(owner)
       .map((s) => this.toInfo(s))
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
   }
 
   async currentSpace(owner: string): Promise<SpaceInfo | undefined> {
-    // D5 — lazy reconcile before answering (human tab-group edits → ledger).
-    await this.reconcileTabGroups(this.gateway, owner)
     const id = this.state.currentSpaceByOwner[owner]
     if (!id) return undefined
     const space = this.state.spaces[id]
@@ -1117,7 +1479,7 @@ export class TaskSpaceManager {
     owner: string,
     spaceId: string,
     url: string,
-    opts?: { background?: boolean; windowId?: number; tabGroupId?: string },
+    opts?: { background?: boolean; windowId?: number },
     gateway?: SpaceTabGateway,
   ): Promise<number> {
     return (await this.openTabWithReuse(owner, spaceId, url, opts, gateway))
@@ -1143,6 +1505,64 @@ export class TaskSpaceManager {
    * switched to (best-effort activate) and `reused: true` is returned — no
    * duplicate is opened.
    */
+  /**
+   * P7-A — the next durable label for a space: `p<N>` with N one past the
+   * highest label ever used here. Monotonic, so a label never silently points
+   * at a different tab after a close.
+   */
+  private nextLabel(space: SpaceRecord): string {
+    let max = 0
+    for (const tab of space.tabs) {
+      const match = /^p(\d+)$/.exec(tab.label ?? '')
+      if (match) max = Math.max(max, Number(match[1]))
+    }
+    return `p${max + 1}`
+  }
+
+  /**
+   * P7-A — listing a space's tabs is an agent-only view.
+   *
+   * ego blocks `tabs()` outright while the user controls the space ("browser
+   * commands are paused"); hub's browser-level `tabs` tool already redacts such
+   * tabs to identity-only, but this space-scoped view would otherwise hand back
+   * urls and titles for a space the agent does not currently control.
+   */
+  async assertTabListingAllowed(owner: string, spaceId: string): Promise<void> {
+    const space = this.requireSpace(spaceId)
+    this.requireOwned(owner, space)
+    this.assertAgentCanAct(owner, space)
+  }
+
+  /** P7-A — resolve a durable page label inside a space (live tabs only). */
+  async pageByLabel(
+    owner: string,
+    spaceId: string,
+    label: string,
+  ): Promise<SpaceTabInfo | undefined> {
+    await this.assertTabListingAllowed(owner, spaceId)
+    const tabs = await this.listTabs(spaceId)
+    return tabs.find((tab) => tab.label === label)
+  }
+
+  /**
+   * P7-H1 — is the ledger's window still there? Cannot verify (no windowList,
+   * or the list call failed) → trust the ledger, exactly like the old group
+   * wiring did: never duplicate-create on a flaky browser.
+   */
+  private async windowAlive(
+    gw: SpaceTabGateway,
+    windowId: number,
+  ): Promise<boolean> {
+    if (!gw.windowList) return true
+    try {
+      const windows = await gw.windowList()
+      if (!Array.isArray(windows)) return true
+      return windows.some((w) => w?.windowId === windowId)
+    } catch {
+      return true
+    }
+  }
+
   async openTabWithReuse(
     owner: string,
     spaceId: string,
@@ -1150,7 +1570,6 @@ export class TaskSpaceManager {
     opts?: {
       background?: boolean
       windowId?: number
-      tabGroupId?: string
       reuse?: TabUrlReuseMode
     },
     gateway?: SpaceTabGateway,
@@ -1165,9 +1584,6 @@ export class TaskSpaceManager {
         { spaceId },
       )
     }
-    // D5 — lazy reconcile before opening, so human tab-group edits (拖入/拖出)
-    // are reflected in the ledger before URL-reuse matching runs.
-    await this.reconcileTabGroups(gw, owner)
     const reuse = opts?.reuse === undefined ? 'exact' : opts.reuse
     if (reuse !== false) {
       const matched = await this.matchReusableTab(space, url, reuse, gw)
@@ -1181,22 +1597,87 @@ export class TaskSpaceManager {
         space.lastActiveAt = this.now()
         this.save()
         this.recordTabOp(matched)
-        return { pageId: matched, reused: true }
+        const matchedRef = space.tabs.find((t) => t.pageId === matched)
+        return {
+          pageId: matched,
+          reused: true,
+          ...(matchedRef?.label !== undefined ? { label: matchedRef.label } : {}),
+          ...(matchedRef?.targetId !== undefined
+            ? { targetId: matchedRef.targetId }
+            : {}),
+        }
       }
     }
-    const targetId = await gw.newTab(url, {
-      background: opts?.background ?? true,
-      windowId: opts?.windowId,
-      tabGroupId: opts?.tabGroupId,
-    })
+    // P7-H1 — place the tab in the space's OWN window. Chromium's
+    // createWindow always brings exactly one tab, so a space's first tab
+    // creates the window WITH itself (no stray about:blank); later tabs join it
+    // by windowId. No window support on this gateway → legacy shared window.
+    let windowId = opts?.windowId
+    if (
+      windowId === undefined &&
+      space.windowId !== undefined &&
+      (await this.windowAlive(gw, space.windowId))
+    ) {
+      windowId = space.windowId
+    }
+    let targetId: string | number | undefined
+    let createdWindow = false
+    if (windowId === undefined && gw.windowCreate) {
+      const created = await gw.windowCreate({ url })
+      if (created && typeof created.windowId === 'number') {
+        windowId = created.windowId
+        space.windowId = created.windowId
+        createdWindow = true
+        this.save()
+      }
+    }
+    if (!createdWindow) {
+      // Either the window already existed (add the tab to it) or this gateway
+      // has no window support at all (legacy shared window).
+      targetId = await gw.newTab(url, {
+        background: opts?.background ?? true,
+        ...(windowId !== undefined ? { windowId } : {}),
+      })
+    }
     let pageId: number | undefined
     let stableTargetId: string | undefined
+    let nativeTabId: number | undefined
+    let placedWindow: number | undefined = windowId
+    // Resolve the fresh tab from the live list for EVERY creation path, not
+    // just the one that returns a targetId string: this single observation is
+    // where the ledger picks up the browser's own tab identity (`tabId`) and
+    // the window the tab actually landed in — neither of which a gateway's
+    // return value can express. One extra local list call per tab creation.
+    let liveTabs: TabLike[] = []
+    try {
+      liveTabs = await gw.listTabs()
+    } catch {
+      liveTabs = []
+    }
+    const fresh =
+      typeof targetId === 'string'
+        ? liveTabs.find((t) => t.targetId === targetId)
+        : windowId === undefined
+          ? undefined
+          : liveTabs.find(
+              (t) =>
+                t.windowId === windowId &&
+                !space.tabs.some((x) => x.pageId === t.pageId),
+            )
     if (typeof targetId === 'number') {
+      // Numeric gateway: the returned number IS the page id (no targetId to
+      // match on). The live list is still consulted for tabId/windowId.
       pageId = targetId
+      const observed = liveTabs.find((t) => t.pageId === targetId)
+      stableTargetId = observed?.targetId
+      nativeTabId = observed?.tabId
+      placedWindow = observed?.windowId ?? placedWindow
     } else {
-      stableTargetId = targetId
-      const tabs = await gw.listTabs()
-      pageId = tabs.find((t) => t.targetId === targetId)?.pageId
+      stableTargetId =
+        fresh?.targetId ?? (typeof targetId === 'string' ? targetId : undefined)
+      nativeTabId = fresh?.tabId
+      pageId = fresh?.pageId
+      placedWindow = fresh?.windowId ?? placedWindow
     }
     if (pageId === undefined) {
       throw new SpaceGuardError(
@@ -1208,25 +1689,30 @@ export class TaskSpaceManager {
     space.tabs = space.tabs.filter((t) => t.pageId !== pageId)
     // Fresh tabs are pending restore: the next daemon/MCP start reconciles them
     // (re-attach if still open, re-open by URL if gone) exactly once. The
-    // stable targetId rides along so restart reconciliation cannot misbind.
-    space.tabs.push({ pageId, targetId: stableTargetId, url, title: undefined, restored: false })
+    // native tabId and the stable targetId ride along so restart
+    // reconciliation cannot misbind.
+    space.tabs.push({
+      pageId,
+      ...(nativeTabId !== undefined ? { tabId: nativeTabId } : {}),
+      targetId: stableTargetId,
+      url,
+      title: undefined,
+      restored: false,
+      label: this.nextLabel(space),
+      openedBy: 'agent',
+      ...(placedWindow !== undefined ? { windowId: placedWindow } : {}),
+    })
     space.lastActiveAt = this.now()
     this.save()
+    this.emitTabsChanged(space)
     this.recordTabOp(pageId)
-    // D5 — 正向自动接线：确保 group 存在，然后把新 tab 入组。Best-effort：
-    // 浏览器不支持 tab group / 跨连接 pageId 解析失败时 log.warn 不阻断，
-    // tab 归属与现有行为不受影响。
-    try {
-      const groupId = await this.ensureSpaceGroup(space, gw)
-      if (groupId && gw.tabGroupAddTabs) {
-        await gw.tabGroupAddTabs(groupId, [pageId])
-      }
-    } catch (err) {
-      console.warn(
-        `[hub-spaces] tab-group wiring skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
-      )
+    const created = space.tabs.find((t) => t.pageId === pageId)
+    return {
+      pageId,
+      reused: false,
+      ...(created?.label !== undefined ? { label: created.label } : {}),
+      ...(created?.targetId !== undefined ? { targetId: created.targetId } : {}),
     }
-    return { pageId, reused: false }
   }
 
   /** List tabs attributed to the space; externally-closed tabs are pruned from the ledger. */
@@ -1244,31 +1730,57 @@ export class TaskSpaceManager {
         live = []
       }
     }
+    // M2: the native tabId is the first-class lookup — it is the browser's own
+    // identity and the only anchor that exists for every live tab, even one
+    // recorded without a targetId.
+    const liveByTab = new Map<number, TabLike>()
+    for (const t of live) {
+      if (t.tabId !== undefined) liveByTab.set(t.tabId, t)
+    }
     if (live.length > 0) {
-      // Cross-process prune guard: a tab stays when its stable targetId is
+      // Cross-process prune guard: a tab stays when its stable identity is
       // live, or when its pageId is live AND the url agrees (a stranger
       // holding the renumbered id must not keep the ledger entry alive).
       const liveByTarget = new Set(live.map((t) => t.targetId).filter(Boolean))
       const liveById = new Map(live.map((t) => [t.pageId, t]))
       const before = space.tabs.length
       space.tabs = space.tabs.filter((t) => {
+        if (t.tabId !== undefined && liveByTab.has(t.tabId)) return true
         if (t.targetId && liveByTarget.has(t.targetId)) return true
         const li = liveById.get(t.pageId)
         return !!li && !!t.url && !!li.url && this.sameRestoreUrl(li.url) === this.sameRestoreUrl(t.url)
       })
       if (space.tabs.length !== before) {
+        // Drop telemetry with the refs that just went away. pageId is a
+        // per-connection counter, so a leaked entry would attach its ops/ageMs
+        // to whatever tab is handed that number NEXT — and that telemetry is
+        // exactly what the tab-hygiene / wedged-tab decisions read.
+        const kept = new Set(space.tabs.map((t) => t.pageId))
+        for (const ref of Object.values(this.state.spaces).flatMap((sp) => sp.tabs)) {
+          kept.add(ref.pageId)
+        }
+        for (const pageId of [...this.tabHealth.keys()]) {
+          if (!kept.has(pageId)) this.clearTabStats(pageId)
+        }
         space.lastActiveAt = this.now()
         this.save()
+        this.emitTabsChanged(space)
       }
     }
     return space.tabs.map((ref) => {
       const liveInfo =
+        (ref.tabId !== undefined ? liveByTab.get(ref.tabId) : undefined) ??
         (ref.targetId
           ? live.find((t) => t.targetId === ref.targetId)
-          : undefined) ?? live.find((t) => t.pageId === ref.pageId)
+          : undefined) ??
+        live.find((t) => t.pageId === ref.pageId)
       const health = this.tabHealthFor(ref.pageId)
+      const nativeTabId = liveInfo?.tabId ?? ref.tabId
       return {
         pageId: ref.pageId,
+        ...(ref.label !== undefined ? { label: ref.label } : {}),
+        ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
+        ...(nativeTabId !== undefined ? { tabId: nativeTabId } : {}),
         targetId: liveInfo?.targetId ?? ref.targetId,
         url: liveInfo?.url ?? ref.url,
         title: liveInfo?.title ?? ref.title,
@@ -1276,6 +1788,98 @@ export class TaskSpaceManager {
         ...(health ? { ops: health.ops, ageMs: health.ageMs } : {}),
       }
     })
+  }
+
+  /**
+   * P7-A follow-up — the space's tabs *as they are in the window*, including
+   * the ones the ledger does not know.
+   *
+   * Why this exists: `listTabs()` answers "what does the ledger hold", which is
+   * the right question for guards and for `finish`, but it is the wrong answer
+   * for an agent standing in its own space — a tab the user dragged into the
+   * space window is invisible there, so it can neither be adopted nor reported.
+   * ego's `task.tabs()` returns managed AND unmanaged rows for exactly this
+   * reason; this is hub's equivalent, with two deliberate differences:
+   *
+   *   1. unmanaged rows are identity-only (see `UnmanagedTabInfo`) — P1-5;
+   *   2. the boundary is the ledger's window, and when that cannot be resolved
+   *      we return ledger rows ONLY (`scope: 'ledger-only'`) instead of
+   *      falling back to "every live tab in the browser".
+   *
+   * The managed rows come from `listTabs()`, so the same cross-process prune
+   * guard applies to them; the unmanaged rows are read-only observations and
+   * never enter the ledger (only `adopt` does that).
+   */
+  async listTabsWithUnmanaged(
+    spaceId: string,
+    gateway?: SpaceTabGateway,
+  ): Promise<SpaceWindowTabs> {
+    const managed = await this.listTabs(spaceId, gateway)
+    const space = this.requireSpace(spaceId)
+    const gw = gateway ?? this.gateway
+    let live: TabLike[] = []
+    if (gw) {
+      try {
+        live = await gw.listTabs()
+      } catch {
+        live = []
+      }
+    }
+    // Window resolution, most-trusted first:
+    //   1. the ledger's own windowId, but ONLY while some live tab still
+    //      reports it — a stale id must not scope the listing to a window that
+    //      has been recycled onto a stranger;
+    //   2. otherwise the live window of one of OUR tabs (the ledger id drifted,
+    //      e.g. the browser restarted and the space was re-attached).
+    // No live tab carries a windowId at all → the gateway predates the window
+    // family → degrade instead of inventing a boundary.
+    const reportsWindows = live.some((t) => t.windowId !== undefined)
+    let windowId: number | undefined
+    if (reportsWindows) {
+      if (
+        space.windowId !== undefined &&
+        live.some((t) => t.windowId === space.windowId)
+      ) {
+        windowId = space.windowId
+      } else {
+        const managedTargets = new Set(
+          managed.map((t) => t.targetId).filter((v): v is string => !!v),
+        )
+        const managedIds = new Set(managed.map((t) => t.pageId))
+        windowId = live.find(
+          (t) =>
+            (t.targetId !== undefined && managedTargets.has(t.targetId)) ||
+            managedIds.has(t.pageId),
+        )?.windowId
+      }
+    }
+    if (windowId === undefined) {
+      return {
+        tabs: managed,
+        ...(space.windowId !== undefined ? { windowId: space.windowId } : {}),
+        scope: 'ledger-only',
+      }
+    }
+    const knownTargets = new Set(
+      managed.map((t) => t.targetId).filter((v): v is string => !!v),
+    )
+    const knownIds = new Set(managed.map((t) => t.pageId))
+    const unmanaged: UnmanagedTabInfo[] = live
+      .filter((t) => t.windowId === windowId)
+      .filter(
+        (t) =>
+          !knownIds.has(t.pageId) &&
+          !(t.targetId !== undefined && knownTargets.has(t.targetId)),
+      )
+      .map((t) => ({
+        unmanaged: true as const,
+        pageId: t.pageId,
+        ...(t.targetId !== undefined ? { targetId: t.targetId } : {}),
+        ...(t.isActive !== undefined ? { isActive: t.isActive } : {}),
+      }))
+    // Ledger rows first (stable order), then the strangers by pageId.
+    unmanaged.sort((a, b) => a.pageId - b.pageId)
+    return { tabs: [...managed, ...unmanaged], windowId, scope: 'window' }
   }
 
   /**
@@ -1301,21 +1905,6 @@ export class TaskSpaceManager {
       this.closeTabBestEffort(gw, ref).then(
         () => { clearTimeout(timer); resolve() },
         () => { clearTimeout(timer); resolve() }, // best-effort: errors are already swallowed inside
-      )
-    })
-  }
-
-  /** P1: bound the tab-group close the same way. */
-  private async tabGroupCloseWithDeadline(
-    gw: SpaceTabGateway,
-    tabGroupId: string,
-  ): Promise<void> {
-    const CLOSE_GROUP_DEADLINE_MS = 10_000
-    return new Promise<void>((resolve, _reject) => {
-      const timer = setTimeout(() => resolve(), CLOSE_GROUP_DEADLINE_MS)
-      gw.tabGroupClose?.(tabGroupId).then(
-        () => { clearTimeout(timer); resolve() },
-        () => { clearTimeout(timer); resolve() },
       )
     })
   }
@@ -1384,8 +1973,12 @@ export class TaskSpaceManager {
       }
     }
     space.tabs = space.tabs.filter((t) => t.pageId !== pageId)
+    // P7-H2 — Chromium destroys a window with its last tab, so a space that
+    // just lost its final tab no longer has one; the next open_tab recreates it.
+    if (space.tabs.length === 0) delete space.windowId
     space.lastActiveAt = this.now()
     this.save()
+    this.emitTabsChanged(space)
     this.clearTabStats(pageId)
   }
 
@@ -1411,7 +2004,12 @@ export class TaskSpaceManager {
           { spaceId },
         )
       }
-      for (const ref of [...space.tabs]) {
+      // P7-H2 — a space that owns a whole window collapses to ONE closeWindow:
+      // Chromium takes the window's tabs with it. Only when the window holds
+      // nothing but this space's tabs — a window the user dragged a tab into is
+      // closed tab by tab instead, so their tab survives.
+      const windowClosed = await this.closeSpaceWindow(space, gw)
+      for (const ref of windowClosed ? [] : [...space.tabs]) {
         // Best-effort: stale pageIds fall back to exact-URL matching against
         // the live tab list (bug #8); a still-failing close is skipped and the
         // ledger entry is dropped below regardless. P1 (space.close hang):
@@ -1426,23 +2024,8 @@ export class TaskSpaceManager {
           )
         }
       }
-      // D5 — 关组（连 tab 一起，已有语义）。Best-effort：失败继续，账本清理照旧。
-      if (space.tabGroupId && gw.tabGroupClose) {
-        try {
-          await this.tabGroupCloseWithDeadline(gw, space.tabGroupId)
-        } catch (err) {
-          console.warn(
-            `[hub-spaces] tab-group close skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
-          )
-        }
-      }
     }
     delete this.state.spaces[spaceId]
-    // Persist a close tombstone so merge-on-save in any process (including
-    // this one) never resurrects the space from another process's stale copy.
-    const deleted = new Set(this.state.deletedSpaces ?? [])
-    deleted.add(spaceId)
-    this.state.deletedSpaces = [...deleted]
     if (this.state.currentSpaceByOwner[space.owner] === spaceId) {
       const next = this.spacesOwnedBy(space.owner).sort(
         (a, b) => b.lastActiveAt - a.lastActiveAt,
@@ -1452,6 +2035,457 @@ export class TaskSpaceManager {
     }
     this.save()
     this.emit('space.closed', space)
+  }
+
+  /**
+   * P7-A — remember which tab the user is on at the handoff boundary.
+   *
+   * Best-effort by design: the live active tab of the space's window when the
+   * gateway can tell us, else the space's last-active ledger tab. No gateway →
+   * nothing is captured and `userPage()` stays empty (never guessed).
+   */
+  private async captureHandoffPage(space: SpaceRecord): Promise<void> {
+    const gw = this.gateway
+    let captured: SpaceRecord['handoffPage']
+    if (gw) {
+      try {
+        const live = await gw.listTabs()
+        const inWindow =
+          space.windowId === undefined
+            ? []
+            : live.filter((t) => t.windowId === space.windowId)
+        const active = inWindow.find((t) => t.isActive === true) ?? inWindow[0]
+        if (active) {
+          const ref = space.tabs.find((t) => t.pageId === active.pageId)
+          captured = {
+            pageId: active.pageId,
+            ...(ref?.label !== undefined ? { label: ref.label } : {}),
+            ...(active.url !== undefined ? { url: active.url } : {}),
+            ...(active.title !== undefined ? { title: active.title } : {}),
+          }
+        }
+      } catch {
+        // fall through to the ledger-based capture below
+      }
+    }
+    if (!captured) {
+      const last = [...space.tabs].sort(
+        (a, b) => (b.restored ? 1 : 0) - (a.restored ? 1 : 0),
+      )[0]
+      if (last) {
+        captured = {
+          pageId: last.pageId,
+          ...(last.label !== undefined ? { label: last.label } : {}),
+          ...(last.url !== undefined ? { url: last.url } : {}),
+          ...(last.title !== undefined ? { title: last.title } : {}),
+        }
+      }
+    }
+    if (captured) space.handoffPage = captured
+  }
+
+  /**
+   * P7-C bridge — a read-only snapshot of EVERY space for the browser-side UI.
+   *
+   * Deliberately owner-agnostic: the Space overview is a browser surface, not an
+   * agent, and ego's overview lists every space in the browser. It carries
+   * names/ownership/tab counts plus a compact per-tab summary, and nothing here
+   * is actionable — every mutation still goes through the guarded tool faces.
+   * `unowned` is hub's stand-in for ego's user-owned space: tabs the ledger does
+   * not know (the user's own browsing).
+   */
+  async uiSnapshot(opts?: {
+    /** Opt in to the bounded live probe (`unowned` counts + `windows`). */
+    probe?: boolean
+    gateway?: SpaceTabGateway
+  }): Promise<{
+    generatedAt: string
+    spaces: Array<
+      SpaceInfo & {
+        tabCount: number
+        tabs: Array<{
+          pageId: number
+          label?: string
+          url: string
+          title?: string
+          openedBy?: TabOrigin
+        }>
+      }
+    >
+    /** Tabs the ledger does not know (the user's). `probed:false` = not asked
+     *  for a live look, so the count is 0 by absence of information, not by
+     *  measurement. */
+    unowned: { tabCount: number; probed: boolean }
+    /**
+     * M4 — one row per live browser window, which is how the Space overview
+     * renders its grid: `spaceId` present → that space's card; absent → a
+     * **user window** card.
+     *
+     * This is the whole point of not making every window a ledger record: the
+     * card is SYNTHESIZED from a window enumeration the browser already gives
+     * us, so the ledger never has to hold a row — let alone any content — for
+     * a window the agent was never given. Counts only: no url/title of a tab
+     * the ledger does not own ever crosses this boundary.
+     *
+     * Empty when the probe was not asked for; `windowsProbed` says which.
+     */
+    windows: Array<{
+      windowId: number
+      tabCount: number
+      /** The ledger space bound to this window, when there is one. */
+      spaceId?: string
+      spaceName?: string
+      isActive?: boolean
+      isVisible?: boolean
+      /** Live tabs in this window the ledger does not know (count only). */
+      unmanagedTabCount: number
+    }>
+    windowsProbed: boolean
+  }> {
+    const spaces = Object.values(this.state.spaces)
+      .sort((a, b) => a.createdAt - b.createdAt)
+      .map((space) => ({
+        ...this.toInfo(space),
+        tabCount: space.tabs.length,
+        tabs: space.tabs.map((tab) => ({
+          pageId: tab.pageId,
+          ...(tab.label !== undefined ? { label: tab.label } : {}),
+          url: tab.url,
+          ...(tab.title !== undefined ? { title: tab.title } : {}),
+          ...(tab.openedBy !== undefined ? { openedBy: tab.openedBy } : {}),
+        })),
+      }))
+    let unownedTabCount = 0
+    let probed = false
+    let windows: Array<{
+      windowId: number
+      tabCount: number
+      spaceId?: string
+      spaceName?: string
+      isActive?: boolean
+      isVisible?: boolean
+      unmanagedTabCount: number
+    }> = []
+    // The live probe is OPT-IN and bounded: this feeds a UI endpoint, and a
+    // browser that is slow (or still connecting) must never hang the request.
+    // The ledger part above is instant and is what the overview needs.
+    const gw = opts?.probe === true ? (opts.gateway ?? this.gateway) : undefined
+    if (gw) {
+      probed = true
+      // Bounded: a slow (or still connecting) browser must never hang the
+      // request — every probed field degrades to its "no information" value.
+      const bounded = <T,>(p: Promise<T>, fallback: T): Promise<T> =>
+        Promise.race([
+          p.catch(() => fallback),
+          new Promise<T>((resolve) =>
+            setTimeout(() => resolve(fallback), UI_SNAPSHOT_PROBE_TIMEOUT_MS),
+          ),
+        ])
+      try {
+        // M2 — the ownership set is keyed on BOTH anchors: pageId is only
+        // meaningful within one connection, tabId within one browser run, and
+        // a tab is "known" when either says so.
+        const ownedPages = new Set(
+          Object.values(this.state.spaces).flatMap((s) =>
+            s.tabs.map((t) => t.pageId),
+          ),
+        )
+        const ownedTabIds = new Set(
+          Object.values(this.state.spaces).flatMap((s) =>
+            s.tabs.map((t) => t.tabId).filter((v): v is number => v !== undefined),
+          ),
+        )
+        const isKnown = (t: TabLike): boolean =>
+          ownedPages.has(t.pageId) ||
+          (t.tabId !== undefined && ownedTabIds.has(t.tabId))
+        const live = await bounded(gw.listTabs(), [] as TabLike[])
+        unownedTabCount = live.filter((t) => !isKnown(t)).length
+
+        // M4 — window grid rows. A window is "a space's" only when the ledger
+        // binds it; everything else is a user window, by absence of a claim.
+        if (gw.windowList) {
+          const win = await bounded(
+            gw.windowList(),
+            [] as Awaited<ReturnType<NonNullable<SpaceTabGateway['windowList']>>>,
+          )
+          const byWindow = new Map<string, { spaceId: string; spaceName: string }>()
+          for (const space of Object.values(this.state.spaces)) {
+            if (space.windowId === undefined) continue
+            byWindow.set(String(space.windowId), {
+              spaceId: space.id,
+              spaceName: space.name,
+            })
+          }
+          const unmanagedByWindow = new Map<number, number>()
+          for (const t of live) {
+            if (t.windowId === undefined || isKnown(t)) continue
+            unmanagedByWindow.set(
+              t.windowId,
+              (unmanagedByWindow.get(t.windowId) ?? 0) + 1,
+            )
+          }
+          windows = win.map((w) => {
+            const bound = byWindow.get(String(w.windowId))
+            return {
+              windowId: w.windowId,
+              tabCount:
+                typeof w.tabCount === 'number'
+                  ? w.tabCount
+                  : live.filter((t) => t.windowId === w.windowId).length,
+              ...(bound ? { spaceId: bound.spaceId, spaceName: bound.spaceName } : {}),
+              ...(w.isActive !== undefined ? { isActive: w.isActive } : {}),
+              ...(w.isVisible !== undefined ? { isVisible: w.isVisible } : {}),
+              unmanagedTabCount: unmanagedByWindow.get(w.windowId) ?? 0,
+            }
+          })
+        }
+      } catch {
+        unownedTabCount = 0
+        windows = []
+      }
+    }
+    return {
+      generatedAt: new Date().toISOString(),
+      spaces,
+      unowned: { tabCount: unownedTabCount, probed },
+      windows,
+      windowsProbed: probed && windows.length > 0,
+    }
+  }
+
+  /**
+   * P7-A — the tab the user was on at the handoff boundary (ego `userPage()`).
+   *
+   * Agent-only, like every other read of a space the agent does not control:
+   * ego pauses browser commands outright while the user is in charge, so this
+   * answers only once the agent has the space back. Returns undefined when
+   * nothing was captured — never a guess.
+   */
+  async userPage(
+    owner: string,
+    spaceId: string,
+  ): Promise<SpaceRecord['handoffPage']> {
+    await this.assertTabListingAllowed(owner, spaceId)
+    const space = this.requireSpace(spaceId)
+    return space.handoffPage
+  }
+
+  /** P7-A — outcome of waitForControl (a timeout is a result, not an error). */
+  async waitForControl(
+    owner: string,
+    spaceId: string,
+    opts?: { interval?: number; timeout?: number; signal?: AbortSignal },
+  ): Promise<{
+    spaceId: string
+    ownership: SpaceOwnership
+    waitedMs: number
+    timedOut: boolean
+  }> {
+    const interval = Math.max(100, opts?.interval ?? 500)
+    const timeout = Math.min(Math.max(1_000, opts?.timeout ?? 60_000), 300_000)
+    const started = Date.now()
+    for (;;) {
+      // Cross-process truth is the ledger file: another process (the user's
+      // takeover, a CLI call) writes it, so a poll re-reads it. In-process
+      // events could shorten the first hop, but the ledger stays authoritative.
+      this.refreshLedgerIfPresent()
+      const space = this.state.spaces[spaceId]
+      if (!space) {
+        throw new SpaceGuardError(
+          'space-not-found',
+          `space ${spaceId} no longer exists (it was closed while waiting)`,
+          { spaceId },
+        )
+      }
+      this.requireOwned(owner, space)
+      if (space.ownership === 'agent') {
+        return {
+          spaceId,
+          ownership: space.ownership,
+          waitedMs: Date.now() - started,
+          timedOut: false,
+        }
+      }
+      const elapsed = Date.now() - started
+      if (elapsed >= timeout) {
+        return { spaceId, ownership: space.ownership, waitedMs: elapsed, timedOut: true }
+      }
+      if (opts?.signal?.aborted) {
+        throw new SpaceGuardError(
+          'user-controlling',
+          `waitForControl aborted while the user controls space "${space.name}" (${spaceId})`,
+          { spaceId },
+        )
+      }
+      await this.sleep(Math.min(interval, timeout - elapsed), opts?.signal)
+    }
+  }
+
+  /**
+   * Re-read the ledger when it is actually on disk. A manager that never
+   * persisted (persist:false, no file yet) must NOT be wiped by a reload.
+   */
+  private refreshLedgerIfPresent(): void {
+    if (!this.storagePath) return
+    try {
+      if (fs.existsSync(this.storagePath)) this.reload()
+    } catch {
+      // A transient read failure keeps the in-memory view.
+    }
+  }
+
+  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      const onAbort = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  /**
+   * P7-A — finish a task space with a REQUIRED retention policy (ego `finish`).
+   *
+   * `keep` is `'all'` or an explicit list of durable labels; everything else
+   * the space manages is closed. Tabs the ledger does not know (the user's) are
+   * never candidates — the loop only ever walks ledger refs. The space leaves
+   * the ledger only when nothing remains to keep, which is ego's rule ("an empty
+   * list closes the space when no protected tabs remain").
+   */
+  async finishSpace(
+    owner: string,
+    spaceId: string,
+    keep: 'all' | string[],
+    gateway?: SpaceTabGateway,
+  ): Promise<FinishReceipt> {
+    const space = this.requireSpace(spaceId)
+    this.requireOwned(owner, space)
+    this.assertAgentCanAct(owner, space)
+    const gw = gateway ?? this.gateway
+    const keepAll = keep === 'all'
+    const requested = keepAll ? [] : keep
+    for (const label of requested) {
+      if (!space.tabs.some((t) => t.label === label)) {
+        throw new SpaceGuardError(
+          'page-not-in-space',
+          `no tab labelled ${label} in space ${spaceId}`,
+          { spaceId, hint: 'labels come from space.list_tabs / space.open_tab' },
+        )
+      }
+    }
+    const kept = keepAll ? space.tabs : space.tabs.filter(
+      (t) => t.label !== undefined && requested.includes(t.label),
+    )
+    const toClose = keepAll ? [] : space.tabs.filter((t) => !kept.includes(t))
+    // Count the user's tabs before anything closes (best-effort: needs a live
+    // list and a known window).
+    let preservedUnmanagedCount = 0
+    if (space.windowId !== undefined && gw) {
+      try {
+        const owned = new Set(space.tabs.map((t) => t.pageId))
+        preservedUnmanagedCount = (await gw.listTabs()).filter(
+          (t) => t.windowId === space.windowId && !owned.has(t.pageId),
+        ).length
+      } catch {
+        preservedUnmanagedCount = 0
+      }
+    }
+    if (!gw && toClose.length > 0) {
+      throw new SpaceGuardError(
+        'no-gateway',
+        'finish needs a browser gateway to close the tabs it does not keep',
+        { spaceId, hint: 'pass keep:"all" to close only the ledger, or run under the hub daemon' },
+      )
+    }
+    let windowClosed = false
+    if (
+      gw &&
+      toClose.length > 0 &&
+      toClose.length === space.tabs.length
+    ) {
+      // Nothing is kept: the window (when entirely ours) goes in one call.
+      windowClosed = await this.closeSpaceWindow(space, gw)
+    }
+    if (!windowClosed && gw) {
+      for (const ref of toClose) {
+        try {
+          await this.closeTabWithDeadline(gw, ref)
+        } catch (err) {
+          console.warn(
+            `[hub-spaces] finish: tab close skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
+          )
+        }
+      }
+    }
+    const closedLabels = toClose
+      .map((t) => t.label)
+      .filter((l): l is string => l !== undefined)
+    space.tabs = windowClosed ? [] : kept
+    space.lastActiveAt = this.now()
+    const closedSpace = space.tabs.length === 0
+    // A surviving space changed its tab set; a closing one gets space.closed.
+    if (!closedSpace) this.emitTabsChanged(space)
+    if (closedSpace) {
+      delete this.state.spaces[spaceId]
+      if (this.state.currentSpaceByOwner[space.owner] === spaceId) {
+        const next = this.spacesOwnedBy(space.owner).sort(
+          (a, b) => b.lastActiveAt - a.lastActiveAt,
+        )[0]
+        if (next) this.state.currentSpaceByOwner[space.owner] = next.id
+        else delete this.state.currentSpaceByOwner[space.owner]
+      }
+    }
+    this.save()
+    for (const ref of toClose) this.clearTabStats(ref.pageId)
+    if (closedSpace) this.emit('space.closed', space)
+    return {
+      spaceId,
+      closedSpace,
+      keptLabels: space.tabs
+        .map((t) => t.label)
+        .filter((l): l is string => l !== undefined),
+      closedLabels,
+      preservedUnmanagedCount,
+    }
+  }
+
+  /**
+   * P7-H2 — close the space's own window when it is ENTIRELY ours.
+   *
+   * Returns true when the window was closed (its tabs went with it, so the
+   * caller must not close them again). Refuses — falling back to per-tab
+   * closes — when the window is unknown, holds a tab that is not ours, or when
+   * liveness cannot be verified: killing a user tab to save a round trip is
+   * never the right trade.
+   */
+  private async closeSpaceWindow(
+    space: SpaceRecord,
+    gw: SpaceTabGateway,
+  ): Promise<boolean> {
+    const windowId = space.windowId
+    if (windowId === undefined || !gw.windowClose) return false
+    const owned = new Set(space.tabs.map((t) => t.pageId))
+    try {
+      const live = await gw.listTabs()
+      const foreign = live.filter(
+        (t) => t.windowId === windowId && !owned.has(t.pageId),
+      )
+      if (foreign.length > 0) return false
+    } catch {
+      return false
+    }
+    try {
+      await gw.windowClose(windowId)
+      delete space.windowId
+      return true
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -1510,6 +2544,40 @@ export class TaskSpaceManager {
       )
     }
     const oldTabs = [...space.tabs]
+    const previousWindowId = space.windowId
+    // P7-H2 — will the window outlive the closes?
+    //
+    // Decided from the tab list BEFORE closing, on purpose. A liveness check
+    // AFTER the closes races with Chromium's asynchronous window destruction:
+    // under load the window is still there when we look, we keep its id, and
+    // the reopen then aims at a window that is about to disappear (observed as
+    // an intermittent live-smoke failure). The deterministic question is
+    // "is anything in that window besides our tabs?" — if yes the window
+    // survives and the reopen MUST stay in it (dropping the id would strand the
+    // user's window as an orphan the guard will not let the agent clean up); if
+    // no, the last close takes the window with it and the id must go first.
+    let windowHasForeignTab = false
+    if (gw.windowList && previousWindowId !== undefined) {
+      try {
+        const live = await gw.listTabs()
+        const ours = (tab: TabLike): boolean =>
+          oldTabs.some(
+            (ref) =>
+              ref.pageId === tab.pageId ||
+              (ref.tabId !== undefined && ref.tabId === tab.tabId) ||
+              (ref.targetId !== undefined && ref.targetId === tab.targetId),
+          )
+        windowHasForeignTab = live.some(
+          (tab) => tab.windowId === previousWindowId && !ours(tab),
+        )
+      } catch {
+        // Cannot see the window's contents: fall back to "it dies with its last
+        // tab", which is the safe side — a fresh window always works, while a
+        // stale id makes the reopen fail outright.
+        windowHasForeignTab = false
+      }
+    }
+    if (!windowHasForeignTab) delete space.windowId
     // 1. Close every tab (best-effort). A failed close leaves the tab alive;
     //    the exact-mode reopen below then reuses it instead of duplicating it.
     for (const ref of oldTabs) {
@@ -1518,6 +2586,34 @@ export class TaskSpaceManager {
         this.clearTabStats(ref.pageId)
       } catch {
         // Continue closing the rest.
+      }
+    }
+    // Closing is asynchronous on the browser side, and the reopen below asks
+    // for `reuse: 'exact'` — so reopening immediately can find a tab that is
+    // still on its way out and "reuse" it: no fresh window is created, and the
+    // space comes back with NO window binding (observed intermittently:
+    // `windowId` was `undefined` after a recycle). Wait, bounded, for the
+    // closes to land. A tab still alive after that is a genuine close failure,
+    // and then the reuse fallback is exactly right (no duplicate).
+    if (oldTabs.length > 0 && gw.listTabs) {
+      const deadline = Date.now() + 1500
+      for (;;) {
+        let live: TabLike[] = []
+        try {
+          live = await gw.listTabs()
+        } catch {
+          break // cannot see: do not stall the recycle
+        }
+        const stillThere = live.some((tab) =>
+          oldTabs.some(
+            (ref) =>
+              ref.pageId === tab.pageId ||
+              (ref.tabId !== undefined && ref.tabId === tab.tabId) ||
+              (ref.targetId !== undefined && ref.targetId === tab.targetId),
+          ),
+        )
+        if (!stillThere || Date.now() > deadline) break
+        await this.sleep(50)
       }
     }
     // 2. Reopen each URL. First occurrence uses exact reuse (finds nothing new
@@ -1552,6 +2648,28 @@ export class TaskSpaceManager {
     // 3. Drop ledger refs that were not reopened (failed reopens / stale).
     const reopened = new Set(tabs.map((t) => t.newPageId))
     space.tabs = space.tabs.filter((t) => reopened.has(t.pageId))
+    // Whatever path the reopen took (fresh window / reused tab), the ledger
+    // must say where the tabs ACTUALLY are. Without this a reused tab left
+    // `windowId` undefined and the space lost its window binding.
+    try {
+      const live = await gw.listTabs()
+      const windows = new Set(
+        live
+          .filter((tab) =>
+            space.tabs.some(
+              (ref) =>
+                ref.pageId === tab.pageId ||
+                (ref.tabId !== undefined && ref.tabId === tab.tabId) ||
+                (ref.targetId !== undefined && ref.targetId === tab.targetId),
+            ),
+          )
+          .map((tab) => tab.windowId)
+          .filter((w): w is number => w !== undefined),
+      )
+      if (windows.size === 1) space.windowId = [...windows][0]
+    } catch {
+      // Best-effort: an unreadable list leaves the id as it was.
+    }
     space.lastActiveAt = this.now()
     this.save()
     this.emit('space.tabs_recycled', space, { urls: tabs.length })
@@ -1574,7 +2692,7 @@ export class TaskSpaceManager {
    *
    * The synchronous part is authoritative and fast: scan this.state.spaces,
    * evict expired ones (spaces delete + owner current-pointer clear +
-   * deletedSpaces tombstone), and save() — only when something was actually
+   * record removal), and save() — only when something was actually
    * evicted. The browser close for Tier 2 is best-effort and fire-and-forget
    * (any failure is logged, never blocks, never affects the ledger); with no
    * gateway only the ledger is evicted and the tabs remain as ordinary
@@ -1587,7 +2705,6 @@ export class TaskSpaceManager {
     const now = this.now()
     const evicted: ReapEviction[] = []
     const evictedSpaces = new Map<string, SpaceRecord>()
-    const deleted = new Set(this.state.deletedSpaces ?? [])
     let changed = false
     for (const space of Object.values(this.state.spaces)) {
       if (space.ownership === 'user') continue
@@ -1621,8 +2738,6 @@ export class TaskSpaceManager {
       evictedSpaces.set(space.id, space)
       // Ledger eviction (authoritative, synchronous).
       delete this.state.spaces[space.id]
-      deleted.add(space.id)
-      this.state.deletedSpaces = [...deleted]
       if (this.state.currentSpaceByOwner[space.owner] === space.id) {
         delete this.state.currentSpaceByOwner[space.owner]
       }
@@ -1650,22 +2765,15 @@ export class TaskSpaceManager {
     return { evicted }
   }
 
-  /** D8 — best-effort close of a reaped space's tabs + tab group (never throws). */
+  /** D8 — best-effort close of a reaped space's tabs (never throws). */
   private async reapCloseTabs(
     gw: SpaceTabGateway,
     space: SpaceRecord,
   ): Promise<void> {
+    // P7-H2 — the TTL reaper closes the window when it is entirely ours.
+    if (await this.closeSpaceWindow(space, gw)) return
     for (const ref of space.tabs) {
       await this.closeTabBestEffort(gw, ref)
-    }
-    if (space.tabGroupId && gw.tabGroupClose) {
-      try {
-        await gw.tabGroupClose(space.tabGroupId)
-      } catch (err) {
-        console.warn(
-          `[hub-spaces] tab-group close skipped for reaped space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
-        )
-      }
     }
   }
 
@@ -1712,6 +2820,13 @@ export class TaskSpaceManager {
       .filter((s) => s.ownership === 'agent')
       .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
     for (const space of spaces) {
+      // P7-H1 — liveness-check the ledger's window ONCE per space (a dead id
+      // must not be handed to newTab, and must not survive the round).
+      const spaceWindowId =
+        space.windowId !== undefined &&
+        (await this.windowAlive(gw, space.windowId))
+          ? space.windowId
+          : undefined
       const next: TabRef[] = []
       // D8 — did this round actually change the space? A refresh of
       // lastActiveAt is allowed only when at least one ref went
@@ -1719,6 +2834,68 @@ export class TaskSpaceManager {
       // not keep an idle space "fresh" forever or the TTL reaper never fires.
       let touched = false
       for (const ref of space.tabs) {
+        // 0. Native tab id — the browser's OWN identity (Chromium SessionID),
+        //    immutable for the life of the tab. Checked before targetId
+        //    because it is the one anchor that exists for EVERY live tab:
+        //    a ref recorded without a targetId (or by a gateway that does not
+        //    report one) still reconciles instead of falling through to the
+        //    url heuristic. Unique within one browser run only — see 3/4 below.
+        const byTabId =
+          ref.tabId !== undefined
+            ? live.find((t) => t.tabId === ref.tabId && !used.has(t.pageId))
+            : undefined
+        if (byTabId && (await adoptable(byTabId))) {
+          used.add(byTabId.pageId)
+          next.push({
+            pageId: byTabId.pageId,
+            tabId: byTabId.tabId ?? ref.tabId,
+            // Same tab (matched by native id), so the ref's own targetId is
+            // still this tab's when the live list does not report one.
+            targetId: byTabId.targetId ?? ref.targetId,
+            url: byTabId.url ?? ref.url,
+            title: byTabId.title ?? ref.title,
+            restored: true,
+            // P7-A — the durable label and origin survive reconciliation.
+            ...(ref.label !== undefined ? { label: ref.label } : {}),
+            ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
+          })
+          if (!ref.restored || byTabId.pageId !== ref.pageId) {
+            reconciled++
+            touched = true
+          }
+          continue
+        }
+        // 0b. M3 — the browser says which PERSISTED tab this live tab came
+        //     from. This is the only cross-restart evidence that exists; when
+        //     the browser does not report it, every live tab simply fails this
+        //     check and the URL strategies below run exactly as before.
+        const byRestoredFrom =
+          ref.tabId !== undefined
+            ? live.find(
+                (t) =>
+                  t.restoredFromTabId === ref.tabId && !used.has(t.pageId),
+              )
+            : undefined
+        if (byRestoredFrom && (await adoptable(byRestoredFrom))) {
+          used.add(byRestoredFrom.pageId)
+          next.push({
+            pageId: byRestoredFrom.pageId,
+            // The live tab's CURRENT native id — the old one is dead.
+            ...(byRestoredFrom.tabId !== undefined
+              ? { tabId: byRestoredFrom.tabId }
+              : {}),
+            targetId: byRestoredFrom.targetId ?? ref.targetId,
+            url: byRestoredFrom.url ?? ref.url,
+            title: byRestoredFrom.title ?? ref.title,
+            restored: true,
+            // P7-A — the durable label and origin survive a restart.
+            ...(ref.label !== undefined ? { label: ref.label } : {}),
+            ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
+          })
+          reconciled++
+          touched = true
+          continue
+        }
         // 1a. Stable targetId match — the cross-process anchor. pageId is a
         //     per-connection sequence number and MUST NOT reconcile a ledger
         //     on its own: a new connection renumbers tabs, and binding by the
@@ -1734,10 +2911,14 @@ export class TaskSpaceManager {
           used.add(byTarget.pageId)
           next.push({
             pageId: byTarget.pageId,
+            tabId: byTarget.tabId ?? ref.tabId,
             targetId: byTarget.targetId,
             url: byTarget.url ?? ref.url,
             title: byTarget.title ?? ref.title,
             restored: true,
+            // P7-A — the durable label and origin survive reconciliation.
+            ...(ref.label !== undefined ? { label: ref.label } : {}),
+            ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
           })
           if (!ref.restored || byTarget.pageId !== ref.pageId) {
             reconciled++
@@ -1760,10 +2941,14 @@ export class TaskSpaceManager {
           used.add(liveById.pageId)
           next.push({
             pageId: ref.pageId,
+            tabId: liveById.tabId ?? ref.tabId,
             targetId: liveById.targetId ?? ref.targetId,
             url: liveById.url ?? ref.url,
             title: liveById.title ?? ref.title,
             restored: true,
+            // P7-A — the durable label and origin survive reconciliation.
+            ...(ref.label !== undefined ? { label: ref.label } : {}),
+            ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
           })
           if (!ref.restored) {
             reconciled++
@@ -1784,10 +2969,14 @@ export class TaskSpaceManager {
           used.add(byUrl.pageId)
           next.push({
             pageId: byUrl.pageId,
+            tabId: byUrl.tabId ?? ref.tabId,
             targetId: byUrl.targetId ?? ref.targetId,
             url: ref.url,
             title: ref.title ?? byUrl.title,
             restored: true,
+            // P7-A — the durable label and origin survive reconciliation.
+            ...(ref.label !== undefined ? { label: ref.label } : {}),
+            ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
           })
           if (!ref.restored) {
             reconciled++
@@ -1808,8 +2997,14 @@ export class TaskSpaceManager {
           continue
         }
         // 4. Pending → re-open by URL (background tab, no targetId persisted).
+        //    P7-H1: reopen INTO the space's own window when it still exists —
+        //    otherwise a restart would quietly migrate the space to the shared
+        //    window. `spaceWindowId` is the liveness-checked value.
         try {
-          const targetId = await gw.newTab(ref.url, { background: true })
+          const targetId = await gw.newTab(ref.url, {
+            background: true,
+            ...(spaceWindowId !== undefined ? { windowId: spaceWindowId } : {}),
+          })
           let pageId: number | undefined
           if (typeof targetId === 'number') pageId = targetId
           else {
@@ -1820,12 +3015,21 @@ export class TaskSpaceManager {
             used.add(pageId)
             const reopenedTargetId =
               typeof targetId === 'string' ? targetId : undefined
+            const reopened = live.find((t) => t.pageId === pageId)
             next.push({
               pageId,
+              // A reopened tab is a NEW tab: it gets a new native id, and the
+              // ref's old one must NOT be carried over (that would be a
+              // confident misbinding on the next round).
+              ...(reopened?.tabId !== undefined ? { tabId: reopened.tabId } : {}),
               targetId: reopenedTargetId ?? ref.targetId,
               url: ref.url,
               title: ref.title,
               restored: true,
+              // P7-A — labels and origin survive a restart.
+              ...(ref.label !== undefined ? { label: ref.label } : {}),
+              ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
+              ...(spaceWindowId !== undefined ? { windowId: spaceWindowId } : {}),
             })
             reconciled++
             touched = true
@@ -1834,24 +3038,32 @@ export class TaskSpaceManager {
           // Skip unrecoverable tabs.
         }
       }
-      space.tabs = next
-      // D5 — 幂等重建：restore 时确保 group 存在（浏览器重启丢了 group 则按账本
-      // 重建），并把本空间 reconcile 出的 tab 批量入组（best-effort；已有 group
-      // 时 addTabs 对已在组内的 tab 是 no-op）。这样后续 sync 的「拖出移除」
-      // 不会把 restore 刚恢复的 tab 误删。
-      try {
-        const groupId = await this.ensureSpaceGroup(space, gw)
-        if (groupId && gw.tabGroupAddTabs && next.length > 0) {
-          await gw.tabGroupAddTabs(
-            groupId,
-            next.map((t) => t.pageId),
-          )
+      // P7-H1 — re-bind the space's window from the tabs we just reconciled.
+      // Window ids do not survive a browser restart, so the ledger value is
+      // advisory: refresh it from the live tabs, and drop it when the window is
+      // gone (the next open_tab recreates it lazily).
+      const liveByPage = new Map(live.map((t) => [t.pageId, t]))
+      let reboundWindow: number | undefined
+      for (const ref of next) {
+        const win = liveByPage.get(ref.pageId)?.windowId
+        if (win !== undefined) {
+          ref.windowId = win
+          reboundWindow ??= win
         }
-      } catch (err) {
-        console.warn(
-          `[hub-spaces] tab-group restore wiring skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
-        )
       }
+      if (reboundWindow !== undefined) space.windowId = reboundWindow
+      else if (spaceWindowId === undefined) delete space.windowId
+
+      space.tabs = next
+      // Refs dropped by this pass (stale / unrecoverable) must not leave their
+      // telemetry behind for the next tab that inherits the pageId.
+      const stillOurs = new Set(
+        Object.values(this.state.spaces).flatMap((sp) => sp.tabs.map((t) => t.pageId)),
+      )
+      for (const pageId of [...this.tabHealth.keys()]) {
+        if (!stillOurs.has(pageId)) this.clearTabStats(pageId)
+      }
+      if (reconciled > 0) this.emitTabsChanged(space)
       // Mark the space restored so the pending list is empty for the next
       // daemon/MCP start (idempotent restarts never duplicate tabs).
       space.restoredAt = this.now()
@@ -1966,225 +3178,6 @@ export class TaskSpaceManager {
     }
   }
 
-  // ── D5 (2026-08-03): space ↔ tab group 双向同步 ──
-
-  /**
-   * 正向接线：确保 space 在浏览器里有一个 tab group（title=space 名，
-   * color=deterministicColor(space.id)）。
-   *
-   * - space.tabGroupId 已存在且 group 还活着 → 直接返回（不重建、不改名/色，
-   *   尊重人类对 group 的呈现修改）。
-   * - space.tabGroupId 缺失或 group 已消失 → `tabGroupCreate`（带上 space 当前
-   *   账本 pageId，使重建的 group 立刻包含该 space 的 tab），创建成功后把 groupId
-   *   写账本并 best-effort 补上确定性颜色（CDP createTabGroup 不带 color）。
-   * - 全部 best-effort：浏览器不支持 / 调用失败 → 返回 undefined，绝不影响 tab 归属。
-   */
-  private async ensureSpaceGroup(
-    space: SpaceRecord,
-    gw: SpaceTabGateway,
-  ): Promise<string | undefined> {
-    if (!gw.tabGroupCreate) return undefined
-    // An empty space has nothing to group — creating an empty tab group is
-    // pointless (and can be rejected by the browser). The group is created on
-    // the next openTab, which passes the fresh tab into tabGroupCreate.
-    if (space.tabs.length === 0) return space.tabGroupId
-    if (space.tabGroupId) {
-      let exists = false
-      try {
-        const groups = (await gw.tabGroupList?.()) ?? []
-        exists = Array.isArray(groups) && groups.some(
-          (g) => (g as LiveTabGroup)?.groupId === space.tabGroupId,
-        )
-      } catch {
-        // Cannot verify the group — trust the ledger (never duplicate-create
-        // when the group list is unavailable).
-        return space.tabGroupId
-      }
-      if (exists) return space.tabGroupId
-      // Group is gone (e.g. human closed it) → recreate below.
-    }
-    try {
-      const created = await gw.tabGroupCreate(
-        space.tabs.map((t) => t.pageId),
-        space.name,
-      )
-      if (!created?.groupId) return undefined
-      space.tabGroupId = created.groupId
-      // CDP createTabGroup has no color param — apply the deterministic color
-      // best-effort right after creation (this is OUR group, not a human edit).
-      try {
-        await gw.tabGroupUpdate?.(created.groupId, {
-          color: deterministicColor(space.id),
-        })
-      } catch {
-        // Color is cosmetic — never block group wiring on it.
-      }
-      this.save()
-      return created.groupId
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * D5 v2 反向同步（P1-7 方向 B，2026-08-24）：人类拖拽 → 事件，不写账本。
-   *
-   * 账本唯一权威；Chrome tab group 降级为「可选视觉投影 + 拖拽检测信号」。
-   * 只处理「已建过 group」的 space：tabGroupId 存在，或 live group 能按
-   * (title=space.name, color=deterministicColor(space.id)) 匹配到。规则：
-   *   a. group 成员相比上一轮基线新增 pageId → emit `tab.dragged_in`
-   *      （带 pageId/url/ledgerSpaceId——账本归属不变；归属变更唯一合法路径
-   *      是显式 transferTab()）。
-   *   b. group 成员相比基线移除 pageId → emit `tab.dragged_out`（账本不动）。
-   *   c. 人类改 group 名/色 → 不反写（这里绝不调用 tabGroupUpdate）。
-   *   d. group 被删 → 本次跳过（基线保留），由下一次 openTabWithReuse /
-   *      restore 的 ensureSpaceGroup 自动重建。
-   * 基线（lastGroupMembership）是进程内存：冷启动第一轮只记基线不发事件
-   * （重启不得把全世界重放成「变更」）；之后每轮 diff。无 gateway / 浏览器不
-   * 支持 tab group → no-op。内部只读 gateway 的 tabGroupList/listTabs 并 emit
-   * 事件，绝不调用其它 manager 方法 —— 不会递归触发 sync。owner 可选：触发点
-   * 传 owner 只处理该 owner 的 space；不传则处理全部已建 group 的 space。
-   */
-  private async reconcileTabGroups(
-    gw: SpaceTabGateway | undefined,
-    owner?: string,
-  ): Promise<{ draggedIn: number; draggedOut: number }> {
-    if (!gw?.tabGroupList || !gw.listTabs) return { draggedIn: 0, draggedOut: 0 }
-    // Best-effort bound: never let a slow/unreachable browser drag the lazy
-    // trigger paths (currentSpace/listSpaces/openTabWithReuse/guard) down.
-    // A timed-out pass simply does not reconcile this round; the next call
-    // retries. (No cancellation available through CDP; a late inner pass may
-    // still emit its drag signals — signals are idempotent observations.)
-    try {
-      return await Promise.race([
-        this.reconcileTabGroupsUnbounded(gw, owner),
-        new Promise<{ draggedIn: number; draggedOut: number }>((resolve) => {
-          setTimeout(() => resolve({ draggedIn: 0, draggedOut: 0 }), TAB_GROUP_SYNC_TIMEOUT_MS)
-        }),
-      ])
-    } catch {
-      return { draggedIn: 0, draggedOut: 0 }
-    }
-  }
-
-  private async reconcileTabGroupsUnbounded(
-    gw: SpaceTabGateway,
-    owner?: string,
-  ): Promise<{ draggedIn: number; draggedOut: number }> {
-    let groups: unknown[] = []
-    let live: TabLike[] = []
-    try {
-      groups = await gw.tabGroupList()
-    } catch {
-      return { draggedIn: 0, draggedOut: 0 }
-    }
-    try {
-      live = await gw.listTabs()
-    } catch {
-      return { draggedIn: 0, draggedOut: 0 }
-    }
-    if (!Array.isArray(groups)) return { draggedIn: 0, draggedOut: 0 }
-
-    // tabId → pageId 反查表（group.tabIds 是 tabId；pageId 来自 listTabs）。
-    const pageIdByTabId = new Map<string | number, number>()
-    for (const t of live) {
-      if (t.tabId !== undefined && t.pageId !== undefined) {
-        pageIdByTabId.set(t.tabId, t.pageId)
-      }
-    }
-    const liveById = new Map(live.map((t) => [t.pageId, t]))
-
-    let draggedIn = 0
-    let draggedOut = 0
-    const candidates = Object.values(this.state.spaces).filter(
-      (s) => owner === undefined || s.owner === owner,
-    )
-    for (const space of candidates) {
-      const group = this.spaceTabGroup(space, groups)
-      if (!group) continue // 无 group 的 space 不处理
-      const groupPageIds = new Set<number>()
-      for (const tabId of group.tabIds ?? []) {
-        const pageId = pageIdByTabId.get(tabId)
-        if (pageId !== undefined) groupPageIds.add(pageId)
-      }
-
-      // D5 v2 (P1-7 方向 B)：与上一轮基线 diff 出「成员变化」→ 发事件，账本
-      // 一律不动。冷启动（无基线）只记录本轮为基线，不把全世界重放成变更。
-      const baseline = this.lastGroupMembership.get(space.id)
-      if (baseline !== undefined) {
-        const ledgerSpaceOfPage = new Map<number, string>()
-        for (const other of Object.values(this.state.spaces)) {
-          for (const t of other.tabs) ledgerSpaceOfPage.set(t.pageId, other.id)
-        }
-        for (const pageId of groupPageIds) {
-          if (baseline.has(pageId)) continue
-          // Own wiring is not a drag signal: openTab/restore project ledger
-          // tabs into the group, and that membership change comes from us.
-          if (ledgerSpaceOfPage.get(pageId) === space.id) continue
-          this.emit('tab.dragged_in', space, {
-            pageId,
-            url: liveById.get(pageId)?.url,
-            ledgerSpaceId: ledgerSpaceOfPage.get(pageId),
-          })
-          draggedIn++
-        }
-        for (const pageId of baseline) {
-          if (groupPageIds.has(pageId)) continue
-          this.emit('tab.dragged_out', space, {
-            pageId,
-            url: liveById.get(pageId)?.url,
-            ledgerSpaceId: ledgerSpaceOfPage.get(pageId),
-          })
-          draggedOut++
-        }
-      }
-      this.lastGroupMembership.set(space.id, new Set(groupPageIds))
-    }
-    return { draggedIn, draggedOut }
-  }
-
-  /**
-   * 找 space 对应的 live group：先按 tabGroupId，再按 (title, color) 匹配。
-   * 返回 undefined 表示该 space 没有（可识别的）group —— 调用方跳过。
-   * 按 title/color 匹配成功时把发现的 groupId 写账本（后续 ensureSpaceGroup
-   * 与 sync 就能直接按 id 校验）。
-   */
-  private spaceTabGroup(
-    space: SpaceRecord,
-    groups: unknown[],
-  ): LiveTabGroup | undefined {
-    const byId = groups.find(
-      (g) => (g as LiveTabGroup)?.groupId === space.tabGroupId,
-    ) as LiveTabGroup | undefined
-    if (byId) return byId
-    if (space.tabGroupId) return undefined // 账本说有此 group，但已消失 → 跳过
-    const byMeta = groups.find(
-      (g) =>
-        (g as LiveTabGroup)?.title === space.name &&
-        (g as LiveTabGroup)?.color === deterministicColor(space.id),
-    ) as LiveTabGroup | undefined
-    if (byMeta?.groupId) {
-      space.tabGroupId = byMeta.groupId
-      this.save()
-    }
-    return byMeta
-  }
-
-  /**
-   * D5 — 公开反向同步入口：读 gateway 的 tab group + live tabs，与 space 账本
-   * diff（group 内新增归属 / 拖出移除 / 改名不反写 / 组删重建留待 ensure）。
-   * 无 gateway 或浏览器不支持 tab group → no-op 返回 {0,0}。
-   */
-  /**
-   * D5 v2 (P1-7 方向 B)：对账 tab group 成员变化 → 返回本轮发出的拖拽信号
-   * 计数（事件经 SpaceEventBus 发给订阅者；账本不动）。
-   */
-  async syncWithTabGroups(
-    gateway?: SpaceTabGateway,
-  ): Promise<{ draggedIn: number; draggedOut: number }> {
-    return this.reconcileTabGroups(gateway ?? this.gateway)
-  }
-
   // ── ownership state machine (3.2) ──
 
   /** agent → agentDelegatedToUser (agent requests handoff). */
@@ -2199,6 +3192,8 @@ export class TaskSpaceManager {
       return this.toInfo(space)
     }
     if (space.ownership === 'agent') {
+      // P7-A — capture the user's tab at the boundary BEFORE handing over.
+      await this.captureHandoffPage(space)
       space.ownership = 'agentDelegatedToUser'
       space.lastActiveAt = this.now()
       this.save()
@@ -2219,6 +3214,8 @@ export class TaskSpaceManager {
       )
     }
     if (space.ownership === 'user') return this.toInfo(space)
+    // P7-A — refresh the boundary capture as the user actually takes over.
+    await this.captureHandoffPage(space)
     space.ownership = 'user'
     space.lastActiveAt = this.now()
     this.save()
@@ -2307,9 +3304,18 @@ export class TaskSpaceManager {
 
   /** Reject a single page that is not in (or not agent-operable within) the agent's space. */
   async assertPageControllable(owner: string, pageId: number): Promise<void> {
-    // D5 — lazy reconcile before the guard: 视觉边界=归属边界。人类把 tab 拖进
-    // space 的 group 后，agent 就能操作它；拖出后则不再可控。无 gateway 跳过。
-    await this.reconcileTabGroups(this.gateway, owner)
+    return this.assertPageControllableWith(owner, pageId)
+  }
+
+  /**
+   * The body of the check, with the live list injectable so a batch pays for
+   * ONE browser round trip instead of one per page.
+   */
+  private async assertPageControllableWith(
+    owner: string,
+    pageId: number,
+    live?: TabLike[],
+  ): Promise<void> {
     if (!this.isolationActive(owner)) throw this.noSpaceError(owner)
     const space = this.spaceForPage(pageId)
     if (!space || space.owner !== owner) {
@@ -2319,6 +3325,26 @@ export class TaskSpaceManager {
         { pageId },
       )
     }
+    // M2 follow-up: the ledger entry alone is not proof — pageId is a
+    // per-connection number, so corroborate it against the live browser before
+    // granting control. A browser we cannot read leaves the legacy ledger-only
+    // decision in place (never lock the agent out on absence of information).
+    const ref = this.refForPage(pageId)
+    if (ref) {
+      const liveTab = live
+        ? live.find((t) => t.pageId === pageId)
+        : await this.liveTabForPage(pageId)
+      if (liveTab && this.refDescribesLiveTab(ref, liveTab) === false) {
+        throw new SpaceGuardError(
+          'page-not-in-space',
+          `page ${pageId} is not the tab your space recorded (the id was renumbered onto another tab); list your tabs again`,
+          {
+            pageId,
+            hint: 'page ids are per-connection — re-read them with tabs action="list"',
+          },
+        )
+      }
+    }
     this.assertAgentCanAct(owner, space)
   }
 
@@ -2326,8 +3352,20 @@ export class TaskSpaceManager {
     owner: string,
     pageIds: number[],
   ): Promise<void> {
+    if (pageIds.length === 0) return
+    if (!this.isolationActive(owner)) throw this.noSpaceError(owner)
+    // One live read for the whole batch; a browser we cannot read degrades to
+    // the ledger-only decision exactly like the single-page path.
+    let live: TabLike[] | undefined
+    if (pageIds.length > 1 && this.gateway) {
+      try {
+        live = await this.gateway.listTabs()
+      } catch {
+        live = undefined
+      }
+    }
     for (const pageId of pageIds) {
-      await this.assertPageControllable(owner, pageId)
+      await this.assertPageControllableWith(owner, pageId, live)
     }
   }
 
@@ -2354,7 +3392,10 @@ export class TaskSpaceManager {
     const ownedIds = new Set(this.spacesOwnedBy(owner).map((s) => s.id))
     return tabs.filter((tab) => {
       const space = this.spaceForPage(tab.pageId)
-      return space !== undefined && ownedIds.has(space.id)
+      if (space === undefined || !ownedIds.has(space.id)) return false
+      // M2 follow-up: same corroboration, free here — the live tab is in hand.
+      const ref = space.tabs.find((t) => t.pageId === tab.pageId)
+      return !ref || this.refDescribesLiveTab(ref, tab) !== false
     })
   }
 
@@ -2377,6 +3418,15 @@ export class TaskSpaceManager {
     if (!this.isolationActive(owner)) return []
     return tabs.map((tab) => {
       const space = this.spaceForPage(tab.pageId)
+      // M2 follow-up: a stale pageId must not be reported as the caller's own
+      // tab — that both grants control AND defeats the P1-5 redaction below
+      // (a mismatched ref made a stranger's tab come back as `mine` WITH its
+      // url/title). A positive mismatch falls through to the 'user' bucket:
+      // identity only.
+      const ref = space?.tabs.find((t) => t.pageId === tab.pageId)
+      if (space && ref && this.refDescribesLiveTab(ref, tab) === false) {
+        return { pageId: tab.pageId, ownership: 'user' as const }
+      }
       if (!space) {
         return { pageId: tab.pageId, ownership: 'user' as const }
       }
@@ -2399,6 +3449,7 @@ export class TaskSpaceManager {
     pageId: number,
     url?: string,
     targetId?: string,
+    tabId?: number,
   ): Promise<boolean> {
     const currentId = this.state.currentSpaceByOwner[owner]
     if (!currentId) return false
@@ -2411,22 +3462,165 @@ export class TaskSpaceManager {
     if (holder && holder.id !== space.id) return false
     this.assertAgentCanAct(owner, space)
     if (space.tabs.some((t) => t.pageId === pageId)) return true
-    space.tabs.push({ pageId, targetId, url: url ?? 'about:blank', restored: false })
+    space.tabs.push({
+      pageId,
+      ...(tabId !== undefined ? { tabId } : {}),
+      targetId,
+      url: url ?? 'about:blank',
+      restored: false,
+      label: this.nextLabel(space),
+      openedBy: 'agent',
+    })
     space.lastActiveAt = this.now()
     this.save()
+    this.emitTabsChanged(space)
     return true
   }
 
   /**
-   * P1-7 方向 B (D5 v2) — explicit tab ownership transfer. Since dragging
-   * only emits tab.dragged_in/out signals (the group is a visual projection,
-   * the ledger is authoritative), this is the ONLY path that moves a page
-   * between spaces' ledgers. The owner must own BOTH spaces involved (a
-   * cross-owner transfer would be tab theft — a dragged_in signal with a
-   * foreign ledgerSpaceId is exactly the case orchestration must escalate,
-   * not automate). Claiming an UNOWNED tab (e.g. a human tab dragged into
-   * the group) is allowed: to-space only. Projects the moved tab into the
-   * destination group (best-effort, like openTab's D5 wiring).
+   * P7-A — adopt an unowned tab into a space (ego `adopt`).
+   *
+   * The tab must be LIVE and belong to no space yet (P1-6: at most one owner).
+   * Origin is stamped `unknown`: adopting brings a tab under management, it does
+   * not make the tab ours — ego keeps `openedBy` immutable for exactly this
+   * reason, and the finish/release rules treat `unknown` as user-owned.
+   */
+  async adoptTab(
+    owner: string,
+    pageId: number,
+    opts?: { spaceId?: string; as?: string },
+  ): Promise<SpaceTabInfo> {
+    const spaceId = opts?.spaceId ?? this.state.currentSpaceByOwner[owner]
+    if (!spaceId) {
+      throw new SpaceGuardError(
+        'no-space',
+        `agent ${owner} has no space; create one first (space.create / 'hub space create <name>')`,
+        { hint: 'adopt brings a tab into a space, so there must be one' },
+      )
+    }
+    const space = this.requireSpace(spaceId)
+    this.requireOwned(owner, space)
+    this.assertAgentCanAct(owner, space)
+    const holder = this.spaceForPage(pageId)
+    if (holder) {
+      if (holder.id !== space.id) {
+        throw new SpaceGuardError(
+          'page-not-in-space',
+          `page ${pageId} already belongs to space ${holder.id}`,
+          { pageId, spaceId: holder.id, hint: 'a page belongs to at most one space' },
+        )
+      }
+      const already = (await this.listTabs(space.id)).find(
+        (t) => t.pageId === pageId,
+      )
+      if (already) return already // idempotent
+    }
+    const gw = this.gateway
+    if (!gw) {
+      throw new SpaceGuardError(
+        'no-gateway',
+        'adopt needs a browser gateway to verify the tab is live',
+        { spaceId },
+      )
+    }
+    let live: TabLike[] = []
+    try {
+      live = await gw.listTabs()
+    } catch {
+      live = []
+    }
+    const tab = live.find((t) => t.pageId === pageId)
+    if (!tab) {
+      throw new SpaceGuardError(
+        'tab-resolve-failed',
+        `page ${pageId} is not a live tab in this browser`,
+        { pageId, spaceId, hint: 'list tabs first (tabs view=all) and adopt one of those ids' },
+      )
+    }
+    const label = opts?.as ?? this.nextLabel(space)
+    if (space.tabs.some((t) => t.label === label)) {
+      throw new SpaceGuardError(
+        'label-taken',
+        `label ${label} is already used in space ${space.id}`,
+        { spaceId, pageId, hint: 'pick another label, or omit `as` to take the next free one' },
+      )
+    }
+    space.tabs.push({
+      pageId,
+      ...(tab.tabId !== undefined ? { tabId: tab.tabId } : {}),
+      targetId: tab.targetId,
+      url: tab.url ?? 'about:blank',
+      title: tab.title,
+      restored: true,
+      label,
+      openedBy: 'unknown',
+      ...(tab.windowId !== undefined ? { windowId: tab.windowId } : {}),
+    })
+    space.lastActiveAt = this.now()
+    this.save()
+    this.emitTabsChanged(space)
+    const info = (await this.listTabs(space.id)).find((t) => t.pageId === pageId)
+    if (!info) {
+      throw new SpaceGuardError('tab-resolve-failed', `adopted page ${pageId} vanished`, { pageId, spaceId })
+    }
+    return info
+  }
+
+  /**
+   * P7-A — hand a tab back to the user WITHOUT closing it (ego `release`).
+   *
+   * Only unknown-origin tabs may be released. An agent-created tab is ours to
+   * close, and ego refuses the call outright ("page p2 was created by the agent;
+   * close it instead of releasing it") — that refusal is what stops an agent
+   * from quietly dumping its own mess on the user.
+   */
+  async releaseTab(
+    owner: string,
+    spaceId: string,
+    target: { pageId?: number; label?: string },
+  ): Promise<SpaceTabInfo> {
+    const space = this.requireSpace(spaceId)
+    this.requireOwned(owner, space)
+    this.assertAgentCanAct(owner, space)
+    const ref =
+      target.label !== undefined
+        ? space.tabs.find((t) => t.label === target.label)
+        : space.tabs.find((t) => t.pageId === target.pageId)
+    if (!ref) {
+      throw new SpaceGuardError(
+        'page-not-in-space',
+        `no tab ${target.label ?? target.pageId} in space ${space.id}`,
+        { spaceId, ...(target.pageId !== undefined ? { pageId: target.pageId } : {}) },
+      )
+    }
+    if (ref.openedBy === 'agent') {
+      throw new SpaceGuardError(
+        'tab-agent-owned',
+        `page ${ref.pageId}${ref.label ? ` (${ref.label})` : ''} was created by the agent; close it instead of releasing it`,
+        { spaceId, pageId: ref.pageId, hint: 'use space.close_tab for tabs the agent opened' },
+      )
+    }
+    space.tabs = space.tabs.filter((t) => t.pageId !== ref.pageId)
+    space.lastActiveAt = this.now()
+    this.save()
+    this.emitTabsChanged(space)
+    this.clearTabStats(ref.pageId)
+    return {
+      pageId: ref.pageId,
+      ...(ref.label !== undefined ? { label: ref.label } : {}),
+      ...(ref.openedBy !== undefined ? { openedBy: ref.openedBy } : {}),
+      url: ref.url,
+      title: ref.title,
+    }
+  }
+
+  /**
+   * P1-7 方向 B — explicit tab ownership transfer. This is the ONLY path that
+   * moves a page between spaces' ledgers (D-P9 removed the tab-group
+   * projection, so nothing implicit moves ownership any more). The owner must
+   * own BOTH spaces involved (a cross-owner transfer would be tab theft —
+   * escalate instead of automating it). Claiming an UNOWNED tab (e.g. a human
+   * tab the user hands over) is allowed: to-space only.
    */
   async transferTab(
     owner: string,
@@ -2434,7 +3628,11 @@ export class TaskSpaceManager {
   ): Promise<{
     fromSpaceId: string | null
     toSpaceId: string
-    projected: boolean
+    /** P7-H2 outcome of the physical cross-window move. Absent = not attempted
+     *  (same window, no moveTab on the gateway, or a pure claim). */
+    moved?: boolean
+    /** Why the physical move failed, when it did. */
+    moveError?: string
   }> {
     const toId =
       opts.toSpaceId ?? this.state.currentSpaceByOwner[owner]
@@ -2448,17 +3646,60 @@ export class TaskSpaceManager {
     const to = this.requireSpace(toId)
     this.requireOwned(owner, to)
     this.assertAgentCanAct(owner, to)
-    if (to.tabs.some((t) => t.pageId === opts.pageId)) {
-      // Already there — idempotent no-op (still project below for repair).
-      const projected = await this.projectIntoGroup(to, opts.pageId)
-      return { fromSpaceId: null, toSpaceId: to.id, projected }
+
+    // M2 on the WRITE path — resolve the caller's pageId to the LIVE tab
+    // before touching the ledger.
+    //
+    // `pageId` is a per-connection counter and it drifts (a fresh CDP session
+    // renumbers live tabs), so the ledger's own copy of it goes stale while the
+    // tab is still open. Matching the ref by pageId then misses it entirely:
+    // the call looks like "claim an unowned tab", the source space is never
+    // emptied, and the ledger gains a second entry for a tab it already owns.
+    // The live tab's NATIVE anchors are what identify the ref.
+    const gw = this.gateway
+    let live: TabLike[] = []
+    if (gw) {
+      try {
+        live = await gw.listTabs()
+      } catch {
+        live = []
+      }
     }
-    const from = this.spaceForPage(opts.pageId)
-    const existing = from?.tabs.find((t) => t.pageId === opts.pageId)
+    const liveTab = live.find((t) => t.pageId === opts.pageId)
+    const matchesLive = (t: TabRef): boolean =>
+      liveTab !== undefined &&
+      ((liveTab.tabId !== undefined && t.tabId === liveTab.tabId) ||
+        (liveTab.targetId !== undefined && t.targetId === liveTab.targetId))
+
+    if (to.tabs.some((t) => t.pageId === opts.pageId || matchesLive(t))) {
+      // Already there — idempotent no-op.
+      return { fromSpaceId: null, toSpaceId: to.id }
+    }
+    // Prefer the identity match; fall back to the raw pageId so a ref whose tab
+    // is already closed can still be moved between spaces (pure bookkeeping).
+    let from: SpaceRecord | undefined
+    let existing: TabRef | undefined
+    if (liveTab) {
+      for (const candidate of Object.values(this.state.spaces)) {
+        const ref = candidate.tabs.find(matchesLive)
+        if (ref) {
+          from = candidate
+          existing = ref
+          break
+        }
+      }
+    }
+    if (!from) {
+      from = this.spaceForPage(opts.pageId)
+      existing = from?.tabs.find((t) => t.pageId === opts.pageId)
+    }
+    // The pageId the ledger should carry from here on: the live one when we
+    // have it, so a renumber self-heals instead of leaving a stale number.
+    const effectivePageId = liveTab?.pageId ?? opts.pageId
     if (from) {
       this.requireOwned(owner, from)
       this.assertAgentCanAct(owner, from)
-      from.tabs = from.tabs.filter((t) => t.pageId !== opts.pageId)
+      from.tabs = from.tabs.filter((t) => t !== existing)
       from.lastActiveAt = this.now()
     }
     // Claim with the stable identity when the gateway knows this tab: the
@@ -2466,52 +3707,97 @@ export class TaskSpaceManager {
     // about:blank fallback (a pageId-only entry gets pruned by listTabs'
     // cross-process guard when the ids drift).
     let claimedTargetId = existing?.targetId
+    let claimedTabId = existing?.tabId
     let claimedUrl = existing?.url
-    const gw = this.gateway
-    if (gw && (claimedTargetId === undefined || !claimedUrl || claimedUrl === 'about:blank')) {
-      try {
-        const live = await gw.listTabs()
-        const li = live.find((t) => t.pageId === opts.pageId)
-        if (li) {
-          claimedTargetId = claimedTargetId ?? li.targetId
-          if (li.url && (!claimedUrl || claimedUrl === 'about:blank')) claimedUrl = li.url
-        }
-      } catch {
-        // best-effort: fall back to the legacy claim shape below
+    let claimedWindowId = existing?.windowId
+    const sawLive = liveTab !== undefined
+    if (liveTab) {
+      claimedTargetId = claimedTargetId ?? liveTab.targetId
+      claimedTabId = claimedTabId ?? liveTab.tabId
+      if (liveTab.url && (!claimedUrl || claimedUrl === 'about:blank')) {
+        claimedUrl = liveTab.url
       }
+      claimedWindowId = liveTab.windowId ?? claimedWindowId
+    }
+    // A pageId that is in no space AND not live is NOT a tab to claim — it is
+    // a stale number. Fabricating a ref for it produced a phantom ledger entry
+    // (about:blank, no anchors) whose pageId could later be renumbered onto a
+    // STRANGER's tab, which the guards would then treat as ours. Refuse
+    // instead: pageIds are per-connection, so a caller must re-read them.
+    if (!from && !existing && !sawLive) {
+      throw new SpaceGuardError(
+        'tab-resolve-failed',
+        `page ${opts.pageId} is not a live tab and is in no space; refusing to claim a stale page id`,
+        {
+          pageId: opts.pageId,
+          spaceId: to.id,
+          hint: 'page ids are per-connection — re-read them with tabs action="list"',
+        },
+      )
     }
     to.tabs.push({
-      pageId: opts.pageId,
+      pageId: effectivePageId,
+      ...(claimedTabId !== undefined ? { tabId: claimedTabId } : {}),
       targetId: claimedTargetId,
       url: claimedUrl ?? 'about:blank',
       title: existing?.title,
       restored: true, // the browser tab is live by construction (drag/claim)
+      // M2 — where the tab ACTUALLY is right now. The cross-window move below
+      // may overwrite it; when the move fails this is the truth, and leaving
+      // it unset left the ref with no window at all.
+      ...(claimedWindowId !== undefined ? { windowId: claimedWindowId } : {}),
+      // P7-A — keep the label when the target space does not use it yet,
+      // otherwise mint a fresh one (labels are per space).
+      label:
+        existing?.label !== undefined &&
+        !to.tabs.some((t) => t.label === existing.label)
+          ? existing.label
+          : this.nextLabel(to),
+      // Origin is immutable: a tab that was not provably ours stays 'unknown'.
+      openedBy: existing?.openedBy ?? 'unknown',
     })
     to.lastActiveAt = this.now()
     this.save()
-    const projected = await this.projectIntoGroup(to, opts.pageId)
-    return { fromSpaceId: from?.id ?? null, toSpaceId: to.id, projected }
-  }
-
-  /** D5 forward wiring for transferTab — best-effort group projection. */
-  private async projectIntoGroup(
-    space: SpaceRecord,
-    pageId: number,
-  ): Promise<boolean> {
-    const gw = this.gateway
-    if (!gw) return false
-    try {
-      const groupId = await this.ensureSpaceGroup(space, gw)
-      if (groupId && gw.tabGroupAddTabs) {
-        await gw.tabGroupAddTabs(groupId, [pageId])
-        return true
+    // Both ends of a transfer changed their tab set.
+    this.emitTabsChanged(to)
+    if (from) this.emitTabsChanged(from)
+    // P7-H2 — the physical tab follows the ownership transfer: a space's window
+    // is its boundary (P7-H1), so a tab left behind would sit in a window that
+    // no longer owns it. Best-effort — a gateway without moveTab keeps the old
+    // behaviour, and the ledger is authoritative either way.
+    let moved: boolean | undefined
+    let moveError: string | undefined
+    if (
+      gw?.moveTab &&
+      to.windowId !== undefined &&
+      from !== undefined &&
+      from.windowId !== to.windowId
+    ) {
+      try {
+        await gw.moveTab(effectivePageId, to.windowId)
+        const movedRef = to.tabs.find((t) => t.pageId === effectivePageId)
+        if (movedRef) movedRef.windowId = to.windowId
+        this.save()
+        moved = true
+      } catch (err) {
+        // Ownership already moved in the ledger, but the browser did not
+        // follow. That is a REAL outcome the caller must be able to see (the
+        // tab now sits in a window that no longer owns it) — so report it
+        // instead of swallowing it, and keep the ref pointing at the window
+        // the tab is actually in.
+        moved = false
+        moveError = (err as Error)?.message ?? String(err)
+        console.warn(
+          `[hub-spaces] transferTab: physical move failed for page ${opts.pageId}: ${moveError}`,
+        )
       }
-    } catch (err) {
-      console.warn(
-        `[hub-spaces] transfer projection skipped for space ${space.id}: ${(err as Error)?.message ?? String(err)}`,
-      )
     }
-    return false
+    return {
+      fromSpaceId: from?.id ?? null,
+      toSpaceId: to.id,
+      ...(moved !== undefined ? { moved } : {}),
+      ...(moveError !== undefined ? { moveError } : {}),
+    }
   }
 
   /**
@@ -2544,18 +3830,5 @@ export class TaskSpaceManager {
   /** The space a page belongs to (if any). */
   async spaceIdForPage(pageId: number): Promise<string | undefined> {
     return this.spaceForPage(pageId)?.id
-  }
-
-  /** tab_groups 3.4: current space → title (space name) + deterministic color. */
-  async currentSpaceGroupMeta(
-    owner: string,
-  ): Promise<{ spaceId?: string; title?: string; color?: string }> {
-    const current = await this.currentSpace(owner)
-    if (!current) return {}
-    return {
-      spaceId: current.id,
-      title: current.name,
-      color: deterministicColor(current.id),
-    }
   }
 }

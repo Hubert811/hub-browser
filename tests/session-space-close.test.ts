@@ -30,28 +30,19 @@ function tempLedger(prefix: string): string {
 
 function sweepGateway(opts?: {
   closed?: number[]
-  closedGroups?: string[]
 }): SpaceTabGateway {
   const closed = opts?.closed ?? []
-  const closedGroups = opts?.closedGroups ?? []
   return {
     newTab: async () => 1,
     listTabs: async () => [] as TabLike[],
     closeTab: async (target) => {
       closed.push(Number(target))
     },
-    tabGroupList: async () => [],
-    tabGroupCreate: async () => ({ groupId: 'g-1', tabIds: [], title: '' }),
-    tabGroupAddTabs: async () => {},
-    tabGroupUpdate: async () => ({}),
-    tabGroupClose: async (groupId) => {
-      closedGroups.push(groupId)
-    },
   }
 }
 
 describe('closeSpacesOwnedBy (P2-1 unit face)', () => {
-  it('closes every space of the owner — tabs, group, ledger, tombstone — and only theirs', async () => {
+  it('closes every space of the owner — tabs, ledger, tombstone — and only theirs', async () => {
     const ledger = tempLedger('hub-sess-unit-')
     const gw = sweepGateway()
     const manager = new TaskSpaceManager({ storagePath: ledger, gateway: gw })
@@ -59,9 +50,8 @@ describe('closeSpacesOwnedBy (P2-1 unit face)', () => {
     const mine2 = await manager.create('mcp:probe:s1', 'task two')
     const other = await manager.create('other-agent', 'not mine')
     const closedTabs: number[] = []
-    const closedGroups: string[] = []
     // Wire spy gateway for the close calls.
-    const spyGw = sweepGateway({ closed: closedTabs, closedGroups: closedGroups })
+    const spyGw = sweepGateway({ closed: closedTabs })
     await manager.recordTabForCurrentSpace('mcp:probe:s1', 11, 'https://a.example/1')
     await manager.recordTabForCurrentSpace('mcp:probe:s1', 12, 'https://a.example/2')
     await manager.recordTabForCurrentSpace('other-agent', 99, 'https://b.example/')
@@ -73,7 +63,10 @@ describe('closeSpacesOwnedBy (P2-1 unit face)', () => {
     // Ledger: owner's spaces gone with tombstones, other's intact.
     const state = JSON.parse(readFileSync(ledger, 'utf-8'))
     expect(Object.keys(state.spaces)).toEqual([other.id])
-    expect((state.deletedSpaces ?? []).sort()).toEqual([mine1.id, mine2.id].sort())
+    // v4 (M5) drops `deletedSpaces` — the daemon is the single writer, so the
+    // merge-on-save tombstone list has nothing left to guard against. What
+    // matters is that the swept spaces are GONE from the persisted ledger.
+    expect(state.deletedSpaces).toBeUndefined()
   })
 
   it('keep:true evicts the ledger but leaves tabs open (review semantics)', async () => {
@@ -89,7 +82,7 @@ describe('closeSpacesOwnedBy (P2-1 unit face)', () => {
     expect(closedTabs).toEqual([])
     const state = JSON.parse(readFileSync(ledger, 'utf-8'))
     expect(Object.keys(state.spaces)).toEqual([])
-    expect((state.deletedSpaces ?? []).length).toBe(1)
+    expect(state.deletedSpaces).toBeUndefined()
   })
 
   it('an owner with no spaces is a no-op', async () => {
@@ -168,7 +161,8 @@ async function runSessionScenario(mode: string): Promise<void> {
   )
   if (mode === 'default') {
     expect(swept).toBe(true)
-    expect((readLedger(ledger).deletedSpaces ?? []).length).toBeGreaterThanOrEqual(1)
+    // v4: no tombstone list is written any more — the space is simply gone.
+    expect(readLedger(ledger).deletedSpaces).toBeUndefined()
   } else {
     // off: the space survives the disconnect (D8 TTL remains the backstop).
     expect(swept).toBeUndefined()

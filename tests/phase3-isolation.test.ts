@@ -281,36 +281,30 @@ describe('Phase 3.3 dual-identity isolation (unit)', () => {
     expect(textOf(passed)).not.toContain('is not in your space')
   })
 
-  it('两个独立 manager 共享一个账本 (模拟两个 MCP 进程): 隔离成立 + 账本不被覆盖 + close 不复活', async () => {
+  it('one process = one ledger authority: a second manager shares the claim; isolation still holds', async () => {
+    // M5 (space-ledger-architecture.md): the daemon owns the ledger and is its
+    // ONLY writer, so merge-on-save is gone — that mechanism existed solely to
+    // survive a second writer PROCESS. `claimLedgerAuthority` is refcounted per
+    // process, so several managers in one process are one authority and each
+    // `save()` writes its own in-memory state. What must still hold is the
+    // ISOLATION contract: one owner never sees or controls another's tabs.
     const ledger = tempLedger()
     const gwA = createFakeGateway(100)
     const gwB = createFakeGateway(200)
     const managerA = new TaskSpaceManager({ storagePath: ledger, gateway: gwA.gateway })
     const managerB = new TaskSpaceManager({ storagePath: ledger, gateway: gwB.gateway })
 
-    // A 进程: create space + open tab.
+    // A: create space + open tab. B: same, with its own view of the ledger.
     const aSpace = await managerA.create('agent-a', 'alice-work')
     const aTab = await managerA.openTab('agent-a', aSpace.id, 'https://a.example')
-    // B 进程: 各自 create space + open tab (B 启动时账本里已经有 A 的 space).
     const bSpace = await managerB.create('agent-b', 'bob-work')
     const bTab = await managerB.openTab('agent-b', bSpace.id, 'https://b.example')
 
-    // 合并写入: 共享账本同时保留两个进程的 space (不再 last-writer-wins 互相覆盖).
-    const raw = JSON.parse(readFileSync(ledger, 'utf-8')) as {
-      spaces: Record<string, { owner: string }>
-      currentSpaceByOwner: Record<string, string>
-    }
-    expect(raw.spaces[aSpace.id]).toBeTruthy()
-    expect(raw.spaces[bSpace.id]).toBeTruthy()
-    expect(raw.currentSpaceByOwner['agent-a']).toBe(aSpace.id)
-    expect(raw.currentSpaceByOwner['agent-b']).toBe(bSpace.id)
+    // Each owner sees exactly its own space.
+    expect((await managerA.listSpaces('agent-a')).map((s) => s.id)).toEqual([aSpace.id])
+    expect((await managerB.listSpaces('agent-b')).map((s) => s.id)).toEqual([bSpace.id])
 
-    // B 的 space.list 只含自己的 space (即使 B 的内存里有 A 的 space).
-    const bSpaces = await managerB.listSpaces('agent-b')
-    expect(bSpaces.map((s) => s.id)).toEqual([bSpace.id])
-    expect(bSpaces.map((s) => s.id)).not.toContain(aSpace.id)
-
-    // B (fresh, 未 reload) 的 tabs 过滤: 只有自己的标签.
+    // B's tab filtering: only its own tab, whatever else is live.
     const bTabList = await managerB.filterTabsForAgent('agent-b', [
       { pageId: aTab, url: 'https://a.example' },
       { pageId: bTab, url: 'https://b.example' },
@@ -318,7 +312,7 @@ describe('Phase 3.3 dual-identity isolation (unit)', () => {
     ])
     expect(bTabList.map((t) => t.pageId)).toEqual([bTab])
 
-    // B 控制 A 的 page 被拒 (fresh 与 reload 两种内存状态).
+    // B can never control A's page — fresh state or after re-reading the file.
     await expect(
       managerB.assertPageControllable('agent-b', aTab),
     ).rejects.toMatchObject({ code: 'page-not-in-space' })
@@ -333,14 +327,11 @@ describe('Phase 3.3 dual-identity isolation (unit)', () => {
     ])
     expect(bTabsAfterReload.map((t) => t.pageId)).toEqual([bTab])
 
-    // A 对自己的 space 正常; A 关闭 space 后, B reload 也看不到它 (tombstone 跨进程生效).
+    // A closing its own space never touches B's view of its own space.
     await managerA.closeSpace('agent-a', aSpace.id, { keep: true })
-    managerB.reload()
-    const bAfterClose = await managerB.listSpaces('agent-b')
-    expect(bAfterClose.map((s) => s.id)).toEqual([bSpace.id])
-    const raw2 = JSON.parse(readFileSync(ledger, 'utf-8')) as {
-      spaces: Record<string, unknown>
-    }
-    expect(raw2.spaces[aSpace.id]).toBeUndefined()
+    expect((await managerB.listSpaces('agent-b')).map((s) => s.id)).toEqual([bSpace.id])
+
+    managerA.dispose()
+    managerB.dispose()
   })
 })

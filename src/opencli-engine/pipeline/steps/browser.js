@@ -67,6 +67,7 @@ export async function stepSnapshot(page, params, _data, _args) {
         compact: typeof opts.compact === 'boolean' ? opts.compact : false,
         maxDepth: typeof opts.max_depth === 'number' ? opts.max_depth : undefined,
         raw: typeof opts.raw === 'boolean' ? opts.raw : false,
+        root: typeof opts.root === 'string' ? opts.root : undefined,
     });
 }
 export async function stepEvaluate(page, params, data, args) {

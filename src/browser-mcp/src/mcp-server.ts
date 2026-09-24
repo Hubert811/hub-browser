@@ -104,7 +104,6 @@ export function createBrowserMcpServer(
     provider,
     {
       defaultWindowId: options.defaultWindowId,
-      defaultTabGroupId: options.defaultTabGroupId,
     },
     {
       ...(options.registration ?? {}),

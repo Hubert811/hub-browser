@@ -42,7 +42,6 @@ type RegisterFn = (
 
 export interface BrowserToolDefaults {
   defaultWindowId?: number
-  defaultTabGroupId?: string
 }
 
 interface BrowserToolLogger {
@@ -331,7 +330,6 @@ export function registerBrowserTools(
           ...logBase,
           args: summarizeBrowserToolArgs(args),
           defaultWindowId: defaults.defaultWindowId,
-          defaultTabGroupId: defaults.defaultTabGroupId,
         })
         options.onToolExecutionStart?.(lifecycleEvent)
         try {
@@ -389,7 +387,6 @@ export function registerBrowserTools(
             page,
             pageFor,
             defaultWindowId: defaults.defaultWindowId,
-            defaultTabGroupId: defaults.defaultTabGroupId,
             signal: extra?.signal,
             identity,
             spaces: options.spaces,

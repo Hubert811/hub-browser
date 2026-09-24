@@ -64,6 +64,11 @@ const RUNTIME = join(PROJECT_ROOT, RUNTIME_BASE);
 
 const DAEMON_PORT = parseInt(process.env.HUB_DAEMON_PORT ?? '9300', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.HUB_DAEMON_IDLE_TIMEOUT ?? '300000', 10); // 5 min
+// P7-C push feed (GET /spaces/stream): coalesce a burst of ledger writes (one
+// open_tab emits several events) into one frame, and keep an otherwise idle
+// SSE connection honest through a comment heartbeat.
+const SPACE_STREAM_DEBOUNCE_MS = 50;
+const SPACE_STREAM_HEARTBEAT_MS = 25000;
 
 // Bug #26 (round 2): every agent consumes hub output through a PIPE, and
 // process.exit() right after process.stdout.write drops >64KB still queued.
@@ -315,6 +320,11 @@ if (process.env.HUB_DAEMON === 'true') {
   let factory = null;
   let idleTimer = null;
   let discoveryDone = false;
+  /**
+   * P7-C — live SSE subscribers (GET /spaces/stream). Declared before
+   * resetIdleTimer so the idle guard can see them: an open stream IS activity.
+   */
+  const spaceStreamClients = new Set();
 
   async function getFactory() {
     if (!factory) {
@@ -328,6 +338,66 @@ if (process.env.HUB_DAEMON === 'true') {
     return factory;
   }
 
+  // ── P7 space authority: ONE manager per daemon process ────────────
+  // Architecture: docs/specs/space-ledger-architecture.md (decision L1). The
+  // ledger's authority is THIS PROCESS, not the JSON file. Every consumer
+  // inside the daemon — the /mcp sessions, the /spaces feed, the SSE stream,
+  // the startup restore — shares one TaskSpaceManager, so "who owns this tab"
+  // has exactly one answer in memory and there is exactly one writer per
+  // process. (Cross-process writers — a `hub --mcp` stdio process, a CLI
+  // invocation — still reconcile through the file; unifying them is the M5
+  // step, not this one.)
+  //
+  // Before this, every MCP session built its own manager and /spaces built a
+  // throwaway one per request: N in-memory truths over one file, which is
+  // exactly why the ledger needed locks, merge-on-save and tombstones.
+  let spaceManager = null;
+  let spaceManagerPromise = null;
+  async function getSpaceManager() {
+    if (spaceManager) return spaceManager;
+    if (!spaceManagerPromise) {
+      spaceManagerPromise = (async () => {
+        const { TaskSpaceManager, gatewayFromProvider, defaultStoragePath, setProcessSpaceManager } =
+          await import(`${RUNTIME}/space/task-space-manager.js`);
+        const manager = new TaskSpaceManager({
+          storagePath: process.env.HUB_SPACES_FILE || defaultStoragePath(),
+          // The daemon's singleton factory is the shared browser connection
+          // (same one /command uses). Resolved lazily: building the manager
+          // must never force a browser connect, because /spaces is a
+          // ledger-only read that has to answer even with no browser running.
+          gateway: gatewayFromProvider({
+            connect: async (opts) => (await getFactory()).connect(opts),
+          }),
+        });
+        // Publish it: `/command` runs cli.js IN THIS PROCESS, and cli.js's
+        // loadSpaceManager() picks this up instead of building a second view.
+        // Without this the daemon would be a two-writer process and its own
+        // memory would go stale against its own commands.
+        setProcessSpaceManager(manager);
+        spaceManager = manager;
+        // Convergence with the writers that are still outside this process (a
+        // `hub --mcp` stdio server, a CLI invocation). They keep the file
+        // honest; this keeps the daemon's memory honest about them. Deleted
+        // once every writer goes through the daemon (M5).
+        manager.watchStorage(() => {
+          for (const client of spaceStreamClients) {
+            try {
+              client.notify?.();
+            } catch {
+              /* a dead subscriber must not break the watcher */
+            }
+          }
+        });
+        return manager;
+      })();
+      // A failed construction must not poison every later caller.
+      spaceManagerPromise.catch(() => {
+        spaceManagerPromise = null;
+      });
+    }
+    return spaceManagerPromise;
+  }
+
   // Phase 3 A: daemon startup + first successful browser connection trigger a
   // best-effort space restore. restore() is idempotent (persisted restored
   // markers), so a daemon restart never duplicates tabs that are still open in
@@ -336,17 +406,7 @@ if (process.env.HUB_DAEMON === 'true') {
   async function ensureSpacesRestored() {
     if (spacesRestored) return;
     try {
-      const {
-        TaskSpaceManager,
-        gatewayFromPage,
-        defaultStoragePath,
-      } = await import(`${RUNTIME}/space/task-space-manager.js`);
-      const factory = await getFactory();
-      const page = await factory.connect();
-      const manager = new TaskSpaceManager({
-        storagePath: process.env.HUB_SPACES_FILE || defaultStoragePath(),
-        gateway: gatewayFromPage(page),
-      });
+      const manager = await getSpaceManager();
       const restored = await manager.restore();
       spacesRestored = true;
       if (restored > 0) {
@@ -396,6 +456,13 @@ if (process.env.HUB_DAEMON === 'true') {
 
   function resetIdleTimer() {
     if (idleTimer) clearTimeout(idleTimer);
+    // P7-C — an open SSE subscriber is a live consumer: the Space overview must
+    // not lose its feed because nobody issued a command for 5 minutes. The
+    // timer is re-armed by the last viewer's cleanup.
+    if (spaceStreamClients.size > 0) {
+      idleTimer = null;
+      return;
+    }
     idleTimer = setTimeout(async () => {
       process.stderr.write('[hub-daemon] idle timeout, exiting\n');
       // F17: close every claw working-period session this daemon started so
@@ -546,12 +613,180 @@ if (process.env.HUB_DAEMON === 'true') {
     }));
   }
 
+  /**
+   * P7-C bridge — read-only space state for the browser UI (GET /spaces).
+   *
+   * The Space overview runs in the browser, where no MCP client exists, so this
+   * is the smallest feed that unblocks it. Ledger-only by default: the request
+   * never touches CDP and can never hang on a slow browser. `?windows=1` opts
+   * into the bounded live probe that adds the per-window grid rows (M4). Always
+   * answers: a failure is a 500, never a silent hang.
+   */
+  async function handleSpacesSnapshot(res, opts = {}) {
+    try {
+      const manager = await getSpaceManager();
+      const snapshot = await manager.uiSnapshot(
+        opts.windows === true ? { probe: true } : undefined,
+      );
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.setHeader('cache-control', 'no-store');
+      res.end(JSON.stringify(snapshot));
+    } catch (err) {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ error: err?.message ?? String(err) }));
+    }
+  }
+
+  /**
+   * P7-C push feed — Server-Sent Events over the daemon's space event bus
+   * (GET /spaces/stream).
+   *
+   * Frame contract:
+   *   event: spaces
+   *   data: { "reason": <SpaceEvent|null>, "snapshot": <uiSnapshot> }
+   *
+   * The first frame carries the current state with `reason: null`, so a
+   * subscriber renders immediately and never has to poll once to catch up;
+   * every later frame is a ledger change, coalesced. `reason` is what happened,
+   * `snapshot` is what is — the client can animate off the former and render
+   * off the latter without an incremental state machine.
+   *
+   * A change written by a writer OUTSIDE this process (a `hub --mcp` stdio
+   * server, a direct CLI invocation) is not on this process's bus; the storage
+   * watcher calls `client.notify()` for those, which pushes a
+   * `space.ledger_reloaded` reason.
+   *
+   * Same trust posture as /spaces: localhost-only, deliberately no CORS
+   * headers, so an arbitrary web page cannot read the user's space/tab list.
+   */
+  async function handleSpacesStream(req, res, opts = {}) {
+    let manager;
+    try {
+      manager = await getSpaceManager();
+    } catch (err) {
+      res.statusCode = 500;
+      res.setHeader('content-type', 'application/json; charset=utf-8');
+      res.end(JSON.stringify({ error: err?.message ?? String(err) }));
+      return;
+    }
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/event-stream; charset=utf-8');
+    res.setHeader('cache-control', 'no-store');
+    res.setHeader('connection', 'keep-alive');
+    res.setHeader('x-accel-buffering', 'no');
+    res.flushHeaders?.();
+
+    // `?windows=1` mirrors GET /spaces: every frame then carries the per-window
+    // grid rows (M4). It costs one BOUNDED CDP read per frame, so it stays
+    // opt-in — a ledger-only subscriber never touches the browser.
+    const probe = opts.windows === true;
+
+    let closed = false;
+    let pending = null;
+    let lastEvent = null;
+    let heartbeat = null;
+
+    const writeFrame = async (reason) => {
+      if (closed) return;
+      try {
+        const snapshot = await manager.uiSnapshot(probe ? { probe: true } : undefined);
+        if (closed) return;
+        res.write(`event: spaces\ndata: ${JSON.stringify({ reason, snapshot })}\n\n`);
+      } catch {
+        // A snapshot failure must never kill the stream: the next change (or
+        // the heartbeat) keeps the connection honest.
+      }
+    };
+    const schedule = (event) => {
+      if (closed) return;
+      lastEvent = event;
+      if (pending) return;
+      pending = setTimeout(() => {
+        pending = null;
+        const reason = lastEvent;
+        lastEvent = null;
+        void writeFrame(reason);
+      }, SPACE_STREAM_DEBOUNCE_MS);
+      pending.unref?.();
+    };
+
+    const client = {
+      res,
+      // External-writer hook wired by getSpaceManager()'s storage watcher.
+      notify: () => schedule({ type: 'space.ledger_reloaded' }),
+      get heartbeat() {
+        return heartbeat;
+      },
+    };
+    spaceStreamClients.add(client);
+    // An open stream is activity: re-arm (and, while it lives, suppress) the
+    // daemon's idle retirement.
+    resetIdleTimer();
+
+    void writeFrame(null);
+    const unsubscribe = manager.events?.onAny(schedule);
+
+    heartbeat = setInterval(() => {
+      if (closed) return;
+      try {
+        res.write(': ping\n\n');
+      } catch {
+        cleanup();
+      }
+    }, SPACE_STREAM_HEARTBEAT_MS);
+    heartbeat.unref?.();
+
+    function cleanup() {
+      if (closed) return;
+      closed = true;
+      try {
+        unsubscribe?.();
+      } catch {
+        /* bus already gone */
+      }
+      if (pending) clearTimeout(pending);
+      if (heartbeat) clearInterval(heartbeat);
+      spaceStreamClients.delete(client);
+      try {
+        res.end();
+      } catch {
+        /* already gone */
+      }
+      // Last viewer left → the daemon may retire on idle again.
+      resetIdleTimer();
+    }
+
+    req.on('close', cleanup);
+    req.on('error', cleanup);
+    res.on('error', cleanup);
+  }
+
   const server = createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json');
 
     if (req.method === 'GET' && req.url === '/health') {
       res.end(JSON.stringify({ status: 'ok' }));
       resetIdleTimer();
+      return;
+    }
+
+    // ── /spaces — P7-C bridge: read-only space state for the browser UI ──
+    if (req.method === 'GET' && req.url?.split('?')[0] === '/spaces') {
+      resetIdleTimer();
+      // ?windows=1 opts into the bounded live probe (M4 window grid rows).
+      const wantWindows = /[?&]windows=1(?:&|$)/.test(req.url ?? '');
+      void handleSpacesSnapshot(res, { windows: wantWindows });
+      return;
+    }
+
+    // ── /spaces/stream — P7-C push feed (SSE) ────────────────────────
+    // Same data as /spaces, pushed on every ledger change instead of polled.
+    // Held open: the daemon does not idle-retire while a viewer is attached.
+    if (req.method === 'GET' && req.url?.split('?')[0] === '/spaces/stream') {
+      const wantWindows = /[?&]windows=1(?:&|$)/.test(req.url ?? '');
+      void handleSpacesStream(req, res, { windows: wantWindows });
       return;
     }
 

@@ -104,11 +104,11 @@ export const tabs = defineTool({
         const targetId = await ctx.page.newTab(args.url ?? 'about:blank', {
           background: args.background,
           windowId: ctx.defaultWindowId,
-          tabGroupId: ctx.defaultTabGroupId,
         })
         const pages = (await ctx.page.tabs()) as unknown as Array<{
           pageId: number
           targetId?: string
+          tabId?: number
         }>
         const info = pages.find((p) => p.targetId === targetId)
         const page = info?.pageId ?? targetId
@@ -122,11 +122,15 @@ export const tabs = defineTool({
           // `tabs new` while the current space is user-held). ownerOf key
           // (convoId ?? agentId) — a bare agentId would look up the wrong
           // current space for MCP clientInfo identities (P1-5 漏网).
+          // M2: pass the native tabId + targetId through, so the ledger entry
+          // is anchored on the browser's own identity from the first write.
           await ctx.spaces
             .recordTabForCurrentSpace(
               ownerOf(ctx.identity),
               page,
               args.url ?? 'about:blank',
+              info?.targetId,
+              info?.tabId,
             )
             .catch(() => {})
         }

@@ -10,6 +10,7 @@
 import { z } from 'zod'
 import {
   SpaceGuardError,
+  isUnmanagedTab,
   ownerOf,
   type SpaceIdentity,
   type TaskSpaceManager,
@@ -178,7 +179,7 @@ export const space_open_tab = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
-    const { pageId, reused } = await manager.openTabWithReuse(
+    const { pageId, reused, label } = await manager.openTabWithReuse(
       ownerOf(identity),
       spaceId,
       args.url,
@@ -189,9 +190,9 @@ export const space_open_tab = defineTool({
     )
     return textResult(
       reused
-        ? `reused page ${pageId} in space ${spaceId}`
-        : `opened page ${pageId} in space ${spaceId}`,
-      { pageId, spaceId, reused },
+        ? `reused page ${pageId}${label ? ` (${label})` : ''} in space ${spaceId}`
+        : `opened page ${pageId}${label ? ` (${label})` : ''} in space ${spaceId}`,
+      { pageId, spaceId, reused, ...(label !== undefined ? { label } : {}) },
     )
   },
 })
@@ -205,16 +206,51 @@ export const space_list_tabs = defineTool({
   handler: async (args, ctx) => {
     const { manager, identity } = requireSpaces(ctx)
     const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
+    // P7-A — listing is an agent-only view: ego blocks `tabs()` outright while
+    // the user controls the space, and this space-scoped view would otherwise
+    // hand back urls/titles the browser-level `tabs` tool already redacts.
+    await manager.assertTabListingAllowed(ownerOf(identity), spaceId)
     const tabs = await manager.listTabs(spaceId)
     const text = tabs.length
       ? tabs
           .map(
             (t) =>
-              `[${t.pageId}] ${t.url}${t.title ? ` (${t.title})` : ''}`,
+              `[${t.label ?? t.pageId}] ${t.url}${t.title ? ` (${t.title})` : ''}${t.openedBy === 'unknown' ? ' [not ours]' : ''}`,
           )
           .join('\n')
       : '(no tabs in this space)'
     return textResult(text, { spaceId, tabs, count: tabs.length })
+  },
+})
+
+export const space_page = defineTool({
+  name: 'space.page',
+  description:
+    'Resolve a durable page label (`p1`, `p2`, …) to the live tab in a task space. Labels survive process restarts and re-attach to the same tab, so prefer them over pageIds when a handle must outlive one command. Returns pageId + url + origin; unknown labels are reported instead of guessed.',
+  input: z.object({
+    spaceId: spaceIdArg,
+    label: z.string().describe('Durable page label from space.open_tab / space.list_tabs.'),
+  }),
+  annotations: { title: 'Resolve a space page label', readOnlyHint: true },
+  handler: async (args, ctx) => {
+    const { manager, identity } = requireSpaces(ctx)
+    const spaceId = await resolveSpaceId(manager, identity, args.spaceId)
+    const tab = await manager.pageByLabel(ownerOf(identity), spaceId, args.label)
+    if (!tab) {
+      return errorResult(
+        `space.page: no live tab labelled ${args.label} in space ${spaceId}`,
+      )
+    }
+    return textResult(
+      `[${tab.label ?? args.label}] page ${tab.pageId} ${tab.url}${tab.title ? ` (${tab.title})` : ''}`,
+      {
+        spaceId,
+        pageId: tab.pageId,
+        label: tab.label ?? args.label,
+        url: tab.url,
+        ...(tab.openedBy !== undefined ? { openedBy: tab.openedBy } : {}),
+      },
+    )
   },
 })
 
